@@ -73,18 +73,46 @@ def project_for_current_workspace():
     if fb:
         search_roots.append(fb.parent)
 
+    exact_matches = []
+    legacy_matches = []
+    seen_runtimes = set()
     for search_root in search_roots:
         for runtime in sorted(search_root.glob("*/.roundtable/runtime.json")):
+            runtime_key = str(runtime.resolve())
+            if runtime_key in seen_runtimes:
+                continue
+            seen_runtimes.add(runtime_key)
             try:
                 data = json.loads(runtime.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            if (ws_id and data.get("workspace_id") == ws_id) or (
-                ws_ref and data.get("workspace_ref") == ws_ref
-            ):
-                root = runtime.parent.parent
-                if is_project_root(root):
-                    return root
+            runtime_ws_id = data.get("workspace_id")
+            root = runtime.parent.parent
+            if not is_project_root(root):
+                continue
+            if runtime_ws_id:
+                if ws_id and runtime_ws_id == ws_id:
+                    exact_matches.append(root)
+                continue
+            if ws_ref and data.get("workspace_ref") == ws_ref:
+                legacy_matches.append(root)
+
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        projects = ", ".join(str(root) for root in exact_matches)
+        raise SystemExit(
+            f"roundtable: multiple projects match caller workspace UUID {ws_id}: {projects}; "
+            "set ROUNDTABLE_PROJECT_DIR explicitly"
+        )
+    if len(legacy_matches) == 1:
+        return legacy_matches[0]
+    if len(legacy_matches) > 1:
+        projects = ", ".join(str(root) for root in legacy_matches)
+        raise SystemExit(
+            f"roundtable: multiple legacy projects match caller workspace ref {ws_ref}: {projects}; "
+            "set ROUNDTABLE_PROJECT_DIR explicitly"
+        )
     return None
 
 
@@ -136,13 +164,34 @@ def caller_cmux_context(identify, tree=None):
     return {}
 
 
+def caller_workspace_ref(identify, tree=None):
+    """Return only the real cmux caller's workspace ref.
+
+    GUI focus is deliberately excluded: focused/active describe what the user is
+    looking at, not which workspace launched the calling process.
+    """
+    return caller_cmux_context(identify, tree).get("workspace_ref") or ""
+
+
 def current_workspace_ref(identify, tree=None):
+    """Return caller/focused/active workspace for read-only display paths only."""
     for source in (identify or {}, tree or {}):
         for key in ("caller", "focused", "active"):
             value = source.get(key) or {}
             if value.get("workspace_ref"):
                 return value.get("workspace_ref")
     return ""
+
+
+def workspace_by_id(tree, workspace_id):
+    """Find a cmux workspace by its stable UUID, returning (window, workspace)."""
+    if not workspace_id:
+        return None, None
+    for window in (tree or {}).get("windows", []):
+        for workspace in window.get("workspaces", []):
+            if (workspace.get("id") or workspace.get("workspace_id")) == workspace_id:
+                return window, workspace
+    return None, None
 
 
 def iter_ledgers(msg_dir):

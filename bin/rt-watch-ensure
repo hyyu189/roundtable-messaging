@@ -118,7 +118,7 @@ try:
 except Exception as exc:
     fail(f"rt-watch-ensure: cmux identify failed; cannot start watcher surface: {exc}")
 
-caller = identify.get("caller") or identify.get("focused") or {}
+caller = identify.get("caller") or {}
 workspace = caller.get("workspace_ref")
 pane = caller.get("pane_ref")
 if not workspace or not pane:

@@ -11,7 +11,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _rtlib import caller_cmux_context, current_workspace_ref, find_project_root, load_agents_doc
+from _rtlib import (
+    caller_cmux_context,
+    caller_workspace_ref,
+    find_project_root,
+    load_agents_doc,
+    workspace_by_id,
+)
 
 TOOL_DIR = Path(__file__).resolve().parent
 
@@ -27,7 +33,11 @@ def parse_args():
     parser = argparse.ArgumentParser(prog="rt-refresh")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--bind", metavar="WORKSPACE_REF", help="persistently bind this project to a cmux workspace ref")
-    group.add_argument("--bind-current", action="store_true", help="persistently bind this project to the caller/current workspace")
+    group.add_argument(
+        "--bind-current",
+        action="store_true",
+        help="persistently bind this project to the real caller workspace",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +178,7 @@ def workspaces_by_title(tree, title):
 
 def binding_record(workspace, source):
     return {
+        "workspace_id": workspace.get("id") or workspace.get("workspace_id"),
         "ref": workspace.get("ref"),
         "title": workspace.get("title") or "",
         "source": source,
@@ -183,32 +194,43 @@ def bound_workspace(tree, identify, existing, args):
         return window, workspace, binding_record(workspace, "--bind")
 
     if args.bind_current:
-        ref = current_workspace_ref(identify, tree)
+        ref = caller_workspace_ref(identify, tree)
         if not ref:
-            raise SystemExit("rt-refresh: could not identify caller/current cmux workspace for --bind-current")
-        window, workspace = workspace_by_ref(tree, ref)
+            raise SystemExit("rt-refresh: --bind-current requires a real cmux caller workspace")
+        caller = caller_cmux_context(identify, tree)
+        caller_id = caller.get("workspace_id")
+        if caller_id:
+            window, workspace = workspace_by_id(tree, caller_id)
+        else:
+            window, workspace = workspace_by_ref(tree, ref)
         if workspace is None:
-            raise SystemExit(f"rt-refresh: caller/current workspace not found in cmux tree: {ref}")
+            raise SystemExit(f"rt-refresh: caller workspace not found in cmux tree: {ref}")
         return window, workspace, binding_record(workspace, "--bind-current")
 
     existing_binding = existing.get("workspace_binding") or {}
-    existing_ref = existing_binding.get("ref")
+    existing_id = existing_binding.get("workspace_id") or existing.get("workspace_id")
+    existing_ref = existing_binding.get("ref") or existing.get("workspace_ref")
 
-    # cmux's `surface.list` (rt-refresh's authoritative kind source) ignores its
-    # workspace argument and always returns the CALLER's focused workspace. So the
-    # only workspace rt-refresh can map correctly is the one the caller is actually
-    # in. When the caller is inside a cmux workspace, prefer it: a stored binding
-    # that points elsewhere is stale (agents moved / the old workspace was
-    # repurposed) and would otherwise be mapped against the focused workspace's
-    # bindings, silently producing a garbage agent map. Fall back to the stored
-    # binding / title-rebind / project scoring only when the caller has no workspace
-    # context (e.g. a detached rt-watch or cron refresh). Explicit --bind/--bind-current
-    # above still override this.
-    caller_ref = current_workspace_ref(identify, tree)
+    # A real caller may legitimately move the project to another workspace, so it
+    # can still trigger caller-rebind. GUI focused/active state is never caller
+    # identity. Without a real caller, resolve only the persisted UUID (or a legacy
+    # ref when no UUID exists) and fail closed if that identity is gone.
+    caller = caller_cmux_context(identify, tree)
+    caller_ref = caller_workspace_ref(identify, tree)
     if caller_ref:
-        caller_window, caller_workspace = workspace_by_ref(tree, caller_ref)
+        caller_id = caller.get("workspace_id")
+        if caller_id:
+            caller_window, caller_workspace = workspace_by_id(tree, caller_id)
+        else:
+            caller_window, caller_workspace = workspace_by_ref(tree, caller_ref)
         if caller_workspace is not None:
-            if existing_ref and existing_ref != caller_ref:
+            caller_workspace_id = caller_workspace.get("id") or caller_workspace.get("workspace_id")
+            binding_matches = (
+                caller_workspace_id == existing_id
+                if existing_id
+                else bool(existing_ref and caller_workspace.get("ref") == existing_ref)
+            )
+            if (existing_id or existing_ref) and not binding_matches:
                 print(
                     f"rt-refresh: project was bound to {existing_ref} "
                     f"({existing_binding.get('title', '')!r}) but caller is in {caller_ref} "
@@ -216,30 +238,32 @@ def bound_workspace(tree, identify, existing, args):
                     f"rebinding to {caller_ref}. Use --bind {existing_ref} to force the old binding.",
                     file=sys.stderr,
                 )
-            source = "existing" if existing_ref == caller_ref else "caller-rebind"
+            source = "existing" if binding_matches else "caller-rebind"
             return caller_window, caller_workspace, binding_record(caller_workspace, source)
+        raise SystemExit(f"rt-refresh: caller workspace not found in cmux tree: {caller_ref}")
+
+    if existing_id:
+        window, workspace = workspace_by_id(tree, existing_id)
+        if workspace is not None:
+            return window, workspace, binding_record(workspace, "existing")
+        raise SystemExit(
+            f"rt-refresh: stored workspace UUID binding not found: {existing_id}; "
+            "refusing to rebind without a real cmux caller (use --bind explicitly)"
+        )
 
     if existing_ref:
         window, workspace = workspace_by_ref(tree, existing_ref)
         if workspace is not None:
             return window, workspace, binding_record(workspace, "existing")
-
-    existing_title = existing_binding.get("title")
-    title_matches = workspaces_by_title(tree, existing_title)
-    if len(title_matches) == 1:
-        window, workspace = title_matches[0]
-        print(
-            f"rt-refresh: rebound workspace binding by title {existing_title!r}: {existing_ref} -> {workspace.get('ref')}",
-            file=sys.stderr,
-        )
-        return window, workspace, binding_record(workspace, "title-rebind")
-    if len(title_matches) > 1:
-        print(
-            f"rt-refresh: workspace binding title {existing_title!r} is ambiguous; falling back to project scoring",
-            file=sys.stderr,
+        raise SystemExit(
+            f"rt-refresh: stored legacy workspace ref binding not found: {existing_ref}; "
+            "refusing to rebind without a real cmux caller (use --bind explicitly)"
         )
 
-    return None, None, None
+    raise SystemExit(
+        "rt-refresh: no real cmux caller and no stored workspace binding; "
+        "use --bind <workspace-ref> from this context"
+    )
 
 
 def project_workspace(tree, identify, exact_title=""):
@@ -294,7 +318,7 @@ def build_kind_map(agents_doc):
     return kind_map
 
 
-def surface_meta(workspace_ref):
+def surface_meta(workspace_ref, workspace_id):
     """ref -> {kind, checkpoint_id, cwd, title} for every TERMINAL surface in the workspace.
 
     `kind` comes from cmux's authoritative resume_binding (claude|codex|hermes-agent),
@@ -302,16 +326,32 @@ def surface_meta(workspace_ref):
     (pre-first-turn) and non-agent surfaces have kind=None and get resolved later by an
     optional screen-banner probe.
 
-    NOTE: as of cmux 0.64.x, `surface.list` ignores its `workspace` argument (ref, UUID,
-    and index all return the caller's *focused* workspace). So this metadata only lines up
-    with `workspace_ref` when that workspace is the caller's focused one — which is why
-    bound_workspace() prefers the caller's workspace for default refreshes.
+    NOTE: as of cmux 0.64.x, `surface.list` can ignore its `workspace` argument and
+    return the GUI-focused workspace. The response's own UUID/ref must therefore match
+    the bound target before any runtime state is rewritten.
     """
     try:
         data = run_json("cmux", "rpc", "surface.list", json.dumps({"workspace": workspace_ref}))
     except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
-        print(f"rt-refresh: surface.list failed ({exc}); agent map will be empty", file=sys.stderr)
-        return {}
+        print(f"rt-refresh: surface.list failed ({exc})", file=sys.stderr)
+        return {}, False
+
+    actual_id = data.get("workspace_id") or data.get("id")
+    actual_ref = data.get("workspace_ref") or data.get("ref")
+    identity_matches = (
+        actual_id == workspace_id
+        if workspace_id
+        else bool(actual_ref and actual_ref == workspace_ref)
+    )
+    if not identity_matches:
+        print(
+            "rt-refresh: surface.list returned a different workspace "
+            f"(id={actual_id!r}, ref={actual_ref!r}) than the bound target "
+            f"(id={workspace_id!r}, ref={workspace_ref!r})",
+            file=sys.stderr,
+        )
+        return {}, False
+
     out = {}
     for surface in data.get("surfaces", []):
         if surface.get("type") != "terminal":
@@ -327,7 +367,7 @@ def surface_meta(workspace_ref):
             "cwd": binding.get("cwd") or surface.get("requested_working_directory"),
             "title": surface.get("title") or "",
         }
-    return out
+    return out, True
 
 
 def load_agent_config():
@@ -489,16 +529,12 @@ def atomic_write_json(path, data):
 
 def main():
     args = parse_args()
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     tree = run_json("cmux", "tree", "--all", "--json", "--id-format", "both")
     identify = run_json("cmux", "identify", "--json", "--id-format", "both")
     existing = read_existing_runtime()
     caller = caller_cmux_context(identify, tree)
     window, workspace, workspace_binding = bound_workspace(tree, identify, existing, args)
-    if workspace is None:
-        window, workspace, caller = project_workspace(tree, identify, configured_workspace_title())
 
     surfaces = []
     for pane in workspace.get("panes", []):
@@ -520,7 +556,17 @@ def main():
                 }
             )
 
-    meta_by_ref = surface_meta(workspace.get("ref"))
+    workspace_id = workspace.get("id") or workspace.get("workspace_id")
+    meta_by_ref, meta_trusted = surface_meta(workspace.get("ref"), workspace_id)
+    if not meta_trusted:
+        raise SystemExit(
+            "rt-refresh: refusing to rewrite runtime without authoritative surface metadata; "
+            "run from a real caller in the bound workspace"
+        )
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
     instances_cfg, detect_cfg = load_agent_config()
     agents_doc = load_agents_doc(ROOT, "rt-refresh") if ROOT else {}
     kind_map = build_kind_map(agents_doc)
@@ -564,7 +610,7 @@ def main():
             "project": str(ROOT),
             "updated_at": utc_now(),
             "workspace_ref": workspace.get("ref"),
-            "workspace_id": workspace.get("id") or caller.get("workspace_id"),
+            "workspace_id": workspace_id,
             "workspace_title": workspace.get("title"),
             "window_ref": (window or {}).get("ref") or caller.get("window_ref"),
             "caller": caller,
