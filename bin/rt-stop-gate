@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# rt-stop-gate [agent] — Stop-hook gatekeeper for rt-messaging v2 (Claude/Codex
+# hook形态兼容:exit 2 + stderr = block reason;exit 0 = allow)。
+# Blocks the agent from going idle when (a) its project inbox has undrained
+# mail, or (b) no live rt-wait-inbox tripwire is armed. Outside roundtable
+# projects it is a no-op. One block per stop cycle (respects stop_hook_active).
+set -u
+agent=${1:-claude}
+input=$(cat 2>/dev/null || true)
+
+# Never double-block within one stop cycle (avoids block loops).
+case "$input" in *'"stop_hook_active":true'*|*'"stop_hook_active": true'*) exit 0 ;; esac
+
+dir=${CLAUDE_PROJECT_DIR:-$PWD}
+while [ "$dir" != "/" ] && [ ! -f "$dir/.roundtable/agents.yaml" ]; do dir=$(dirname "$dir"); done
+[ -f "$dir/.roundtable/agents.yaml" ] || exit 0
+grep -q "^  $agent:" "$dir/.roundtable/agents.yaml" 2>/dev/null || exit 0
+
+inbox="$dir/.roundtable/inbox/$agent"
+
+if [ -d "$inbox/new" ] && [ -n "$(ls "$inbox/new" 2>/dev/null)" ]; then
+  echo "roundtable inbox has undrained mail: $(ls "$inbox/new" | tr '\n' ' '). Drain it now: read each file, act/ack (rt-ack <ids>), then mv to $inbox/cur/, then re-arm the tripwire (run in background: rt-wait-inbox $agent 30)." >&2
+  exit 2
+fi
+
+for marker in "$inbox"/.armed-*; do
+  [ -e "$marker" ] || continue
+  pid=${marker##*.armed-}
+  if kill -0 "$pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$marker"
+done
+
+echo "no live inbox tripwire for '$agent' in $dir. Arm it before stopping: run as a harness-tracked background process: rt-wait-inbox $agent 30" >&2
+exit 2

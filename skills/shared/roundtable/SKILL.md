@@ -32,6 +32,33 @@ agents restart and move.
 Run them from a project root (a dir with `.roundtable/agents.yaml`). Outside one,
 set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT` to point at a fallback project.
 
+## Delivery v2: maildir + tripwire (dual-write period active since 2026-07-15)
+
+`rt-say` now writes every message to
+`<project>/.roundtable/inbox/<to>/new/<msgid>.md` **and** sends the legacy
+keyboard nudge. The same message arriving twice (nudge text + maildir file) is
+expected — dedupe by msgid. `--no-nudge` = maildir only; `--legacy-nudge-only`
+= old behavior.
+
+**Receiving (drain protocol)** — when woken by a tripwire or told the inbox has
+mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack` the ids
+(comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm** the
+tripwire before going idle.
+
+**Arming (Claude)** — run as a harness-tracked background process at the end of
+any turn in a roundtable project:
+
+```bash
+rt-wait-inbox claude 30    # via run_in_background; exits when mail lands (or 30min heartbeat)
+```
+
+Its exit re-invokes you automatically — no keyboard, no human input. A Stop
+hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
+tripwire; follow its stderr instruction, it is self-explanatory. Hermes arms
+the same script via `terminal(background=true, notify_on_complete=true)`.
+Codex delivery currently arrives via the nudge path (its wake bridge lands in
+Phase 3).
+
 ## Sending
 
 Standard send sequence: **refresh → resolve → send**.
