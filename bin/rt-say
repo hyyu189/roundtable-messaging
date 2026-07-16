@@ -21,13 +21,38 @@ STATE_DIR = ROOT / ".roundtable"
 RUNTIME = STATE_DIR / "runtime.json"
 LOCK_DIR = STATE_DIR / "locks"
 MSG_DIR = STATE_DIR / "messages"
+INBOX_DIR = STATE_DIR / "inbox"
 LEDGER_LOCK = LOCK_DIR / "ledger.lock"
 LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3, "acked": 4}
+AGENT_COMPONENT_RE = re.compile(r"^[a-z0-9#_-]+$")
 
 
 def usage():
-    print("usage: rt-say [--verbose] <agent-or-instance> <kind> <body...>", file=sys.stderr)
+    print(
+        "usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] "
+        "<agent-or-instance> <kind> <body...>",
+        file=sys.stderr,
+    )
     raise SystemExit(2)
+
+
+def print_help():
+    print(
+        """usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] <agent-or-instance> <kind> <body...>
+
+Deliver a roundtable message. By default the message is written atomically to
+.roundtable/inbox/<to>/new/ and then sent through the legacy cmux nudge path.
+
+options:
+  --no-nudge           write maildir only; do not inject text or press keys
+  --legacy-nudge-only  use only the legacy cmux nudge path; do not write maildir
+  --verbose            print route and submit details
+  -h, --help           show this help
+
+During the dual-write period, inbox and nudge delivery of the same message is
+expected. Receivers deduplicate using the msgid in the header and filename.
+"""
+    )
 
 
 def utc_now():
@@ -56,6 +81,112 @@ def acquire_lock(path, timeout=None):
 
 def release_lock(path):
     shutil.rmtree(path, ignore_errors=True)
+
+
+def configured_target(root, target, *, required=True, runtime=None):
+    """Resolve a configured target to (base agent, concrete instance)."""
+    doc = load_agents_doc(root, "rt-say")
+    agents = doc.get("agents") or {}
+    for base, config in agents.items():
+        base_name = str(base).lower()
+        instances = config.get("instances") if isinstance(config, dict) else None
+        if not instances:
+            instances = [{"id": base_name}]
+        instance_names = []
+        for instance in instances:
+            if isinstance(instance, str):
+                instance_name = instance.lower()
+            else:
+                instance_name = str((instance or {}).get("id") or base_name).lower()
+            instance_names.append(instance_name)
+            if instance_name == target:
+                return base_name, instance_name
+        if base_name == target:
+            if len(instance_names) == 1:
+                return base_name, instance_names[0]
+            raise SystemExit(
+                f"rt-say: {target} has multiple instances; use one of: "
+                + ", ".join(instance_names)
+            )
+    if not required and target in ((runtime or {}).get("agents") or {}):
+        return target, target
+    raise SystemExit(f"rt-say: unknown agent or instance: {target}")
+
+
+def validate_agent_component(value, label):
+    if not AGENT_COMPONENT_RE.fullmatch(value):
+        raise SystemExit(f"rt-say: invalid {label} agent component: {value}")
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def ensure_inbox_gitignore():
+    """Atomically install the inbox-local ignore rule, repairing partial files."""
+    ignore_path = INBOX_DIR / ".gitignore"
+    tmp_path = INBOX_DIR / f".gitignore.tmp.{os.getpid()}.{time.time_ns()}"
+    created_tmp = False
+    try:
+        descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created_tmp = True
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write("*\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, ignore_path)
+        created_tmp = False
+        fsync_directory(INBOX_DIR)
+    except OSError:
+        if created_tmp:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def publish_maildir(target, msg_id, content):
+    """Publish one immutable maildir message via tmp -> new atomic rename."""
+    validate_agent_component(target, "inbox target")
+    filename = f"{msg_id}.md"
+    if Path(filename).name != filename or "/" in filename or "\x00" in filename:
+        raise SystemExit(f"rt-say: invalid inbox message filename: {filename}")
+
+    target_dir = INBOX_DIR / target
+    tmp_dir = target_dir / "tmp"
+    new_dir = target_dir / "new"
+    cur_dir = target_dir / "cur"
+    tmp_path = tmp_dir / filename
+    new_path = new_dir / filename
+    created_tmp = False
+    try:
+        for path in (tmp_dir, new_dir, cur_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        ensure_inbox_gitignore()
+        descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created_tmp = True
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if new_path.exists():
+            raise FileExistsError(f"destination already exists: {new_path}")
+        os.rename(tmp_path, new_path)
+        created_tmp = False
+        fsync_directory(new_dir)
+    except OSError as error:
+        if created_tmp:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise SystemExit(f"rt-say: failed to publish inbox message {msg_id}: {error}") from error
+    return new_path
 
 
 def read_runtime(refresh=False):
@@ -292,10 +423,20 @@ def steer_prefix(target, status, submit_cfg):
 
 def main():
     args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print_help()
+        return
+
     verbose = False
     if "--verbose" in args:
         verbose = True
         args = [arg for arg in args if arg != "--verbose"]
+    no_nudge = "--no-nudge" in args
+    legacy_nudge_only = "--legacy-nudge-only" in args
+    if no_nudge and legacy_nudge_only:
+        print("rt-say: --no-nudge and --legacy-nudge-only are mutually exclusive", file=sys.stderr)
+        raise SystemExit(2)
+    args = [arg for arg in args if arg not in {"--no-nudge", "--legacy-nudge-only"}]
     if len(args) < 2:
         usage()
     target = args[0].lower()
@@ -311,34 +452,34 @@ def main():
     LOCK_DIR.mkdir(exist_ok=True)
     MSG_DIR.mkdir(exist_ok=True)
 
-    runtime = read_runtime()
-    sender = infer_sender(runtime)
+    validate_agent_component(target, "target")
+    if no_nudge:
+        target_agent, target_instance = configured_target(ROOT, target)
+        sender = os.environ.get("RT_FROM", "").lower()
+        if not sender:
+            runtime = read_runtime()
+            sender = infer_sender(runtime)
+    else:
+        runtime = read_runtime()
+        sender = infer_sender(runtime)
+        target_agent, target_instance = configured_target(
+            ROOT,
+            target,
+            required=False,
+            runtime=runtime,
+        )
     if not sender:
         raise SystemExit("rt-say: could not infer sender from current cmux surface; set RT_FROM")
-    route = parse_resolve(target)
-    # Re-read runtime AFTER resolve — rt-resolve may have refreshed the map.
-    # All guards must run against this single post-resolve snapshot.
-    runtime = read_runtime()
-    guard_route_in_runtime(runtime, route)
-    target_agent = route.get("agent", target)
-    # Verify the resolved surface actually belongs to the target agent.
-    # Multi-instance: rt-resolve reports agent=<base>, but runtime keys by
-    # instance id (e.g. codex#1, codex-build). Accept both base and instance.
-    route_surface = route.get("surface")
-    resolved_names = {route.get("agent"), route.get("instance"), target}
-    agents = runtime.get("agents") or {}
-    for name, agent_data in agents.items():
-        if agent_data.get("surface_ref") == route_surface and name not in resolved_names:
-            raise SystemExit(
-                f"rt-say: route mismatch — target '{target}' resolved to surface {route_surface} "
-                f"but that surface belongs to agent '{name}'. Run rt-refresh then rt-resolve {target} to fix."
-            )
-    if sender == target_agent and os.environ.get("RT_ALLOW_SELF_SEND", "0") != "1":
+    sender = str(sender).lower()
+    validate_agent_component(sender, "sender")
+    if no_nudge:
+        _sender_agent, sender_instance = configured_target(ROOT, sender)
+        is_self_send = sender_instance == target_instance
+    else:
+        is_self_send = sender in {target_agent, target_instance}
+    if is_self_send and os.environ.get("RT_ALLOW_SELF_SEND", "0") != "1":
         raise SystemExit(f"rt-say: refusing self-send from {sender} to {target}")
 
-    status = route.get("status", "unknown")
-    submit_cfg = load_submit_config(ROOT)
-    submit = submit_policy(target_agent, status, submit_cfg)
     refs = [ref for ref in os.environ.get("RT_ACK_REFS", "").split(",") if ref] if ack_mode else []
     if kind == "sync-ack" and not refs:
         for part in body_arg.split():
@@ -349,21 +490,91 @@ def main():
     if ack_mode and body == "":
         body = None
 
+    msg_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{sender}-to-{target}-{os.getpid()}"
+    from_tag = sender.upper()
+    to_tag = target.upper()
+    header = f"[{from_tag}→{to_tag} {kind} id={msg_id}]"
+    mail_text = header + (f" {body_arg}" if body_arg else "")
+    rendered = f"{header} {body_arg}".rstrip()
+
+    if not legacy_nudge_only:
+        publish_maildir(target, msg_id, mail_text)
+
+    if no_nudge:
+        route = {"workspace": None, "surface": None, "pane": None}
+        submit = "none"
+        send_text = terminal_single_line(rendered)
+        pending = base_record(
+            msg_id,
+            sender,
+            target,
+            kind,
+            body,
+            rendered,
+            send_text,
+            route,
+            submit,
+            refs,
+            "pending",
+            "rt-say",
+        )
+        append_ledger(sender, pending)
+        if verbose:
+            print(f"sent id={msg_id} from={sender} to={target} delivery=maildir submit=none")
+        else:
+            print(f"sent {msg_id}")
+        return
+
+    # Everything below is the legacy nudge path. Maildir publication above is
+    # the fact-source commit and must survive any runtime/route/nudge failure.
+    runtime = read_runtime()
+    route = parse_resolve(target)
+    # Re-read runtime AFTER resolve — rt-resolve may have refreshed the map.
+    # All guards must run against this single post-resolve snapshot.
+    runtime = read_runtime()
+    guard_route_in_runtime(runtime, route)
+    resolved_target_agent = route.get("agent", target)
+    if resolved_target_agent != target_agent:
+        raise SystemExit(
+            f"rt-say: configured target '{target}' resolved as unexpected agent "
+            f"'{resolved_target_agent}'"
+        )
+    resolved_target_instance = route.get("instance", target)
+    if (
+        sender in {resolved_target_agent, resolved_target_instance}
+        and os.environ.get("RT_ALLOW_SELF_SEND", "0") != "1"
+    ):
+        raise SystemExit(f"rt-say: refusing self-send from {sender} to {target}")
+    # Verify the resolved surface actually belongs to the target agent.
+    # Multi-instance: rt-resolve reports agent=<base>, but runtime keys by
+    # instance id (e.g. codex#1, codex-build). Accept both base and instance.
+    route_surface = route.get("surface")
+    resolved_names = {resolved_target_agent, route.get("instance"), target}
+    agents = runtime.get("agents") or {}
+    for name, agent_data in agents.items():
+        if agent_data.get("surface_ref") == route_surface and name not in resolved_names:
+            raise SystemExit(
+                f"rt-say: route mismatch — target '{target}' resolved to surface {route_surface} "
+                f"but that surface belongs to agent '{name}'. Run rt-refresh then rt-resolve {target} to fix."
+            )
+    status = route.get("status", "unknown")
+    submit_cfg = load_submit_config(ROOT)
+    submit = submit_policy(target_agent, status, submit_cfg)
+    send_text = terminal_single_line(rendered)
+    if steer_prefix(target_agent, status, submit_cfg):
+        send_text = f"/steer {send_text}"
+
     send_lock = LOCK_DIR / f"send-{target}.lock"
     acquire_lock(send_lock)
     try:
-        meta = {"pid": os.getpid(), "from": sender, "to": target, "created_at": utc_now()}
+        meta = {
+            "pid": os.getpid(),
+            "from": sender,
+            "to": target,
+            "created_at": utc_now(),
+            "msg_id": msg_id,
+        }
         (send_lock / "meta.json").write_text(json.dumps(meta, ensure_ascii=False) + "\n")
-
-        msg_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{sender}-to-{target}-{os.getpid()}"
-        meta["msg_id"] = msg_id
-        (send_lock / "meta.json").write_text(json.dumps(meta, ensure_ascii=False) + "\n")
-        from_tag = sender.upper()
-        to_tag = target.upper()
-        rendered = f"[{from_tag}→{to_tag} {kind} id={msg_id}] {body_arg}".rstrip()
-        send_text = terminal_single_line(rendered)
-        if steer_prefix(target_agent, status, submit_cfg):
-            send_text = f"/steer {send_text}"
 
         pending = base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, "pending", "rt-say")
         append_ledger(sender, pending)

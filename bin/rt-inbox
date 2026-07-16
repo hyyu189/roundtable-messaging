@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from _rtlib import LIFECYCLE_ORDINAL, current_records, find_project_root, read_records, run_json
@@ -13,6 +14,13 @@ ROOT = find_project_root("rt-inbox")
 STATE_DIR = ROOT / ".roundtable"
 RUNTIME = STATE_DIR / "runtime.json"
 MSG_DIR = STATE_DIR / "messages"
+INBOX_DIR = STATE_DIR / "inbox"
+AGENT_COMPONENT_RE = re.compile(r"^[a-z0-9#_-]+$")
+MAIL_HEADER_RE = re.compile(
+    r"^\[(?P<from>[a-z0-9#_-]+)→(?P<to>[a-z0-9#_-]+) "
+    r"(?P<kind>[^\s\]]+) id=(?P<msg_id>[^\s\]]+)\](?: (?P<body>.*))?$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def parse_args():
@@ -65,22 +73,115 @@ def truncate(value, width=80):
     return text[: width - 3] + "..."
 
 
+def refs_from_record(record):
+    refs = list(record.get("refs") or [])
+    if refs:
+        return refs
+    for part in one_line(record.get("body", "")).split():
+        if part.startswith("refs="):
+            return [ref for ref in part.removeprefix("refs=").split(",") if ref]
+    return []
+
+
+def mail_timestamp(msg_id, path):
+    timestamp = msg_id.split("-", 1)[0]
+    try:
+        parsed = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except ValueError:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+
+
+def read_maildir_records():
+    records = []
+    if not INBOX_DIR.is_dir():
+        return records
+    for target_dir in sorted(INBOX_DIR.iterdir()):
+        if not target_dir.is_dir() or not AGENT_COMPONENT_RE.fullmatch(target_dir.name):
+            continue
+        target = target_dir.name.lower()
+        new_dir = target_dir / "new"
+        if not new_dir.is_dir():
+            continue
+        for path in sorted(new_dir.glob("*.md")):
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            match = MAIL_HEADER_RE.fullmatch(content)
+            if not match:
+                continue
+            parsed = match.groupdict()
+            msg_id = parsed["msg_id"]
+            to_agent = parsed["to"].lower()
+            if path.stem != msg_id or to_agent != target:
+                continue
+            body = parsed.get("body") or ""
+            record = {
+                "schema": "roundtable.maildir_message.v1",
+                "msg_id": msg_id,
+                "event_id": "",
+                "ts": mail_timestamp(msg_id, path),
+                "from": parsed["from"].lower(),
+                "to": to_agent,
+                "kind": parsed["kind"],
+                "body": body,
+                "rendered_text": content,
+                "send_text": None,
+                "workspace_ref": None,
+                "surface_ref": None,
+                "pane_ref": None,
+                "submit": "none",
+                "lifecycle": "new",
+                "refs": [],
+                "correlation": {},
+                "source": "maildir",
+                "maildir_path": str(path),
+                "delivery_sources": ["maildir"],
+            }
+            if record["kind"] == "sync-ack":
+                record["refs"] = refs_from_record(record)
+            records.append(record)
+    return records
+
+
 def visible_records(agent, include_all):
-    all_records = read_records(MSG_DIR)
+    ledger_records = read_records(MSG_DIR)
+    maildir_records = read_maildir_records()
     acked_refs = set()
-    for record in all_records:
+    for record in ledger_records:
+        if (
+            record.get("msg_id")
+            and LIFECYCLE_ORDINAL.get(record.get("lifecycle"), -1)
+            >= LIFECYCLE_ORDINAL["acked"]
+        ):
+            acked_refs.add(record["msg_id"])
+    for record in [*ledger_records, *maildir_records]:
         if record.get("kind") != "sync-ack":
             continue
-        refs = list(record.get("refs") or [])
-        if not refs:
-            for part in one_line(record.get("body", "")).split():
-                if part.startswith("refs="):
-                    refs.extend(ref for ref in part.removeprefix("refs=").split(",") if ref)
-                    break
-        acked_refs.update(refs)
+        acked_refs.update(refs_from_record(record))
 
-    records = list(current_records(all_records).values())
-    records.sort(key=lambda item: item.get("ts", ""))
+    records = []
+    for ledger_record in current_records(ledger_records).values():
+        record = dict(ledger_record)
+        record["delivery_source"] = "ledger"
+        record["delivery_sources"] = ["ledger"]
+        records.append(record)
+    for maildir_record in maildir_records:
+        record = dict(maildir_record)
+        record["delivery_source"] = "maildir"
+        record["delivery_sources"] = ["maildir"]
+        records.append(record)
+
+    records.sort(
+        key=lambda item: (
+            item.get("ts", ""),
+            item.get("msg_id", ""),
+            item.get("delivery_source", ""),
+        )
+    )
     visible = []
     for record in records:
         if (record.get("to") or "").lower() != agent:
@@ -97,11 +198,13 @@ def visible_records(agent, include_all):
 
 def print_text(records):
     for record in records:
+        sources = "+".join(record.get("delivery_sources") or ["ledger"])
         print(
             f"{record.get('msg_id', '')}  "
             f"{record.get('from', '')}  "
             f"{record.get('kind', '')}  "
             f"{record.get('lifecycle', '')}  "
+            f"[{sources}]  "
             f"{truncate(record.get('body', ''))}"
         )
 

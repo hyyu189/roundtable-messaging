@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -50,6 +51,9 @@ project: {path}
 {title_line}agents:
   codex:
     harness: codex
+    submit:
+      idle: enter
+      busy: tab
     instances:
       - id: codex
         session_id: null
@@ -57,6 +61,9 @@ project: {path}
       screen: ["OpenAI Codex"]
   claude:
     harness: claude-code
+    submit:
+      idle: enter
+      busy: send_only
     instances:
       - id: claude
         session_id: null
@@ -64,6 +71,9 @@ project: {path}
       screen: ["Claude Code"]
   hermes:
     harness: hermes-agent
+    submit:
+      idle: enter
+      busy: steer
     instances:
       - id: hermes
         session_id: null
@@ -159,12 +169,20 @@ def fake_cmux(
 import json
 import os
 import sys
+import time
+import uuid
+from pathlib import Path
 
 args = sys.argv[1:]
 tree = json.loads(os.environ["CMUX_FAKE_TREE"])
 identify = json.loads(os.environ.get("CMUX_FAKE_IDENTIFY", "{{}}"))
 screens = json.loads(os.environ.get("CMUX_FAKE_SCREENS", "{{}}"))
 surface_payload = json.loads(os.environ.get("CMUX_FAKE_SURFACE_LIST", "{{}}"))
+trace_dir = os.environ.get("CMUX_FAKE_TRACE_DIR")
+if trace_dir:
+    trace_path = Path(trace_dir)
+    trace_path.mkdir(parents=True, exist_ok=True)
+    (trace_path / f"{{time.time_ns()}}-{{os.getpid()}}-{{uuid.uuid4().hex}}.json").write_text(json.dumps(args))
 if args[:1] == ["tree"]:
     print(json.dumps(tree))
 elif args[:1] == ["identify"]:
@@ -180,7 +198,14 @@ elif args[:1] == ["read-screen"]:
     print(screens.get(surface, ""))
 elif args[:1] == ["events"]:
     sys.exit(0)
-elif args[:1] in (["send"], ["send-key"]):
+elif args[:1] == ["send"]:
+    delay = float(os.environ.get("CMUX_FAKE_SEND_DELAY", "0"))
+    if delay:
+        time.sleep(delay)
+    if os.environ.get("CMUX_FAKE_FAIL_SEND") == "1":
+        sys.exit(70)
+    sys.exit(0)
+elif args[:1] == ["send-key"]:
     sys.exit(0)
 else:
     print("unexpected cmux args: " + " ".join(args), file=sys.stderr)
@@ -196,6 +221,10 @@ else:
         "CMUX_FAKE_SURFACE_LIST": json.dumps(surface_payload),
     }
     return env
+
+
+def read_cmux_calls(trace_dir):
+    return [json.loads(path.read_text()) for path in sorted(trace_dir.glob("*.json"))]
 
 
 def tree_with_workspaces(*workspaces):
@@ -264,6 +293,90 @@ def bound_runtime(
         binding["workspace_id"] = workspace_id
     runtime["workspace_binding"] = binding
     return runtime
+
+
+def say_project(tmp_path, *, target_status="idle"):
+    project = tmp_path / "project"
+    codex_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:1",
+        "pane_ref": "pane:1",
+        "status": "idle",
+    }
+    claude_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:2",
+        "pane_ref": "pane:2",
+        "status": target_status,
+    }
+    runtime = {
+        "schema": "roundtable.runtime.v1",
+        "project": str(project),
+        "updated_at": "2026-06-10T00:00:00Z",
+        "workspace_ref": "workspace:1",
+        "workspace_id": "UUID-A",
+        "workspace_title": "project",
+        "window_ref": "window:1",
+        "caller": {},
+        "agents": {"codex": codex_route, "claude": claude_route},
+        "surfaces": [codex_route, claude_route],
+    }
+    state = write_project(project, runtime=runtime)
+    active = workspace(
+        "workspace:1",
+        "project",
+        "surface:1",
+        "pane:1",
+        "Codex",
+        workspace_id="UUID-A",
+    )
+    active["panes"].append(
+        {
+            "ref": "pane:2",
+            "surfaces": [
+                {
+                    "ref": "surface:2",
+                    "pane_ref": "pane:2",
+                    "type": "terminal",
+                    "title": "Claude",
+                    "selected": True,
+                    "focused": False,
+                    "here": False,
+                }
+            ],
+        }
+    )
+    env = fake_cmux(
+        tmp_path,
+        tree=tree_with_workspaces(active),
+        identify={
+            "caller": {
+                "workspace_ref": "workspace:1",
+                "workspace_id": "UUID-A",
+                "surface_ref": "surface:1",
+            }
+        },
+    )
+    trace_dir = tmp_path / "cmux-trace"
+    trace_dir.mkdir()
+    env["CMUX_FAKE_TRACE_DIR"] = str(trace_dir)
+    return project, state, env, trace_dir
+
+
+def read_ledger(state, sender="codex"):
+    path = state / "messages" / f"{sender}.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def write_mail(state, target, msg_id, sender, kind, body, folder="new"):
+    directory = state / "inbox" / target / folder
+    directory.mkdir(parents=True, exist_ok=True)
+    content = f"[{sender.upper()}→{target.upper()} {kind} id={msg_id}]"
+    if body:
+        content += f" {body}"
+    (directory / f"{msg_id}.md").write_text(content)
 
 
 def test_rt_resolve_uses_fallback_project_when_cwd_is_not_project(tmp_path):
@@ -421,11 +534,20 @@ def test_rt_inbox_lists_unacked_messages_for_inferred_agent_and_hides_acked(tmp_
         },
     ]
     ledger.write_text("".join(json.dumps(item) + "\n" for item in records))
+    write_mail(
+        state,
+        "codex",
+        "20260610T000001Z-claude-to-codex-22222",
+        "claude",
+        "fyi",
+        "already acked mail copy",
+    )
 
     proc = run_tool("rt-inbox", cwd=project, env={"RT_FROM": "codex"})
 
     assert proc.returncode == 0, proc.stderr
     assert "20260610T000000Z-claude-to-codex-11111" in proc.stdout
+    assert "20260610T000001Z-claude-to-codex-22222" not in proc.stdout
     assert "already acked" not in proc.stdout
     assert "sync-ack" not in proc.stdout
 
@@ -516,6 +638,623 @@ def test_rt_say_inbox_ack_flow_with_fake_cmux(tmp_path):
     assert ack_proc.returncode == 0, ack_proc.stderr
     after_ack = run_tool("rt-inbox", cwd=project, env={**base_env, "RT_FROM": "claude"})
     assert msg_id not in after_ack.stdout
+
+
+def test_rt_say_default_dual_writes_exact_mail_and_preserves_legacy_nudge(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    body = "line 1\nline 2  with  spaces  "
+
+    proc = run_tool("rt-say", "claude", "question", body, cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    msg_id = proc.stdout.strip().split()[-1]
+    new_file = state / "inbox" / "claude" / "new" / f"{msg_id}.md"
+    assert new_file.read_text() == f"[CODEX→CLAUDE question id={msg_id}] {body}"
+    assert list((state / "inbox" / "claude" / "tmp").iterdir()) == []
+    assert list((state / "inbox" / "claude" / "cur").iterdir()) == []
+
+    records = read_ledger(state)
+    assert [record["lifecycle"] for record in records] == ["pending", "injected", "submitted"]
+    assert all(record["msg_id"] == msg_id for record in records)
+    assert all(record["body"] == body for record in records)
+    calls = read_cmux_calls(trace_dir)
+    send_calls = [call for call in calls if call[:1] == ["send"]]
+    key_calls = [call for call in calls if call[:1] == ["send-key"]]
+    assert send_calls == [
+        [
+            "send",
+            "--workspace",
+            "workspace:1",
+            "--surface",
+            "surface:2",
+            records[0]["send_text"],
+        ]
+    ]
+    assert records[0]["send_text"] == f"[CODEX→CLAUDE question id={msg_id}] line 1 line 2 with spaces"
+    assert key_calls == [
+        ["send-key", "--workspace", "workspace:1", "--surface", "surface:2", "Enter"]
+    ]
+
+
+def test_rt_say_default_preserves_busy_submit_policy_per_harness(tmp_path):
+    cases = [
+        ("claude", "codex", "surface:2", "none", None, False),
+        ("codex", "claude", "surface:1", "Tab", "Tab", False),
+        ("hermes", "codex", "surface:3", "Enter", "Enter", True),
+    ]
+    for index, (target, sender, surface, submit, key, steer) in enumerate(cases):
+        case_dir = tmp_path / f"case-{index}"
+        project, state, env, trace_dir = say_project(
+            case_dir,
+            target_status="busy" if target == "claude" else "idle",
+        )
+        runtime_path = state / "runtime.json"
+        runtime = json.loads(runtime_path.read_text())
+        if target == "codex":
+            runtime["agents"]["codex"]["status"] = "busy"
+            env["CMUX_FAKE_IDENTIFY"] = json.dumps(
+                {"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:2"}}
+            )
+        elif target == "hermes":
+            route = {
+                "workspace_ref": "workspace:1",
+                "surface_ref": "surface:3",
+                "pane_ref": "pane:3",
+                "status": "busy",
+            }
+            runtime["agents"]["hermes"] = route
+            runtime["surfaces"].append(route)
+        runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+        proc = run_tool("rt-say", target, "fyi", "busy delivery", cwd=project, env=env)
+
+        assert proc.returncode == 0, proc.stderr
+        record = read_ledger(state, sender)[0]
+        assert record["submit"] == submit
+        assert record["send_text"].startswith("/steer ") is steer
+        calls = read_cmux_calls(trace_dir)
+        send_calls = [call for call in calls if call[:1] == ["send"]]
+        assert len(send_calls) == 1
+        assert send_calls[0][4] == surface
+        key_calls = [call for call in calls if call[:1] == ["send-key"]]
+        if key is None:
+            assert key_calls == []
+        else:
+            assert key_calls == [
+                ["send-key", "--workspace", "workspace:1", "--surface", surface, key]
+            ]
+
+
+def test_rt_say_concurrent_same_target_delivers_both_once(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    env["RT_FROM"] = "codex"
+    process_env = os.environ.copy()
+    process_env.update(env)
+
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            str(BIN / "rt-say"),
+            "--no-nudge",
+            "claude",
+            "question",
+            "first",
+        ],
+        cwd=project,
+        env=process_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second = subprocess.Popen(
+        [
+            sys.executable,
+            str(BIN / "rt-say"),
+            "--no-nudge",
+            "claude",
+            "question",
+            "second",
+        ],
+        cwd=project,
+        env=process_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=10)
+    second_stdout, second_stderr = second.communicate(timeout=10)
+
+    assert first.returncode == 0, first_stderr
+    assert second.returncode == 0, second_stderr
+    msg_ids = {first_stdout.strip().split()[-1], second_stdout.strip().split()[-1]}
+    assert len(msg_ids) == 2
+    files = list((state / "inbox" / "claude" / "new").glob("*.md"))
+    assert {path.stem for path in files} == msg_ids
+    bodies_by_id = {path.stem: path.read_text().rsplit("] ", 1)[-1] for path in files}
+    assert bodies_by_id[first_stdout.strip().split()[-1]] == "first"
+    assert bodies_by_id[second_stdout.strip().split()[-1]] == "second"
+    assert list((state / "inbox" / "claude" / "tmp").iterdir()) == []
+
+    by_id = {}
+    for record in read_ledger(state):
+        by_id.setdefault(record["msg_id"], []).append(record["lifecycle"])
+    assert set(by_id) == msg_ids
+    assert all(lifecycles == ["pending"] for lifecycles in by_id.values())
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_contended_legacy_lock_still_fails_fast_after_publishing_mail(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    env["CMUX_FAKE_SEND_DELAY"] = "0.30"
+    env["RT_FROM"] = "codex"
+    process_env = os.environ.copy()
+    process_env.update(env)
+
+    first = subprocess.Popen(
+        [sys.executable, str(BIN / "rt-say"), "claude", "question", "first legacy"],
+        cwd=project,
+        env=process_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    send_lock = state / "locks" / "send-claude.lock"
+    deadline = time.time() + 3
+    while not send_lock.exists() and first.poll() is None and time.time() < deadline:
+        time.sleep(0.01)
+    assert send_lock.exists(), "first rt-say never acquired the target send lock"
+
+    second = run_tool("rt-say", "claude", "question", "second legacy", cwd=project, env=env)
+    first_stdout, first_stderr = first.communicate(timeout=10)
+
+    assert first.returncode == 0, first_stderr
+    assert second.returncode != 0
+    assert "lock busy" in second.stderr
+    files = list((state / "inbox" / "claude" / "new").glob("*.md"))
+    assert len(files) == 2
+    assert {path.read_text().rsplit("] ", 1)[-1] for path in files} == {
+        "first legacy",
+        "second legacy",
+    }
+    first_id = first_stdout.strip().split()[-1]
+    assert {record["msg_id"] for record in read_ledger(state)} == {first_id}
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+
+
+def test_rt_say_no_nudge_uses_only_maildir_and_pending_ledger(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    env["RT_FROM"] = "codex"
+
+    proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "claude",
+        "question",
+        "mail only",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    msg_id = proc.stdout.strip().split()[-1]
+    assert (state / "inbox" / "claude" / "new" / f"{msg_id}.md").is_file()
+    assert read_cmux_calls(trace_dir) == []
+    records = read_ledger(state)
+    assert len(records) == 1
+    assert records[0]["lifecycle"] == "pending"
+    assert records[0]["submit"] == "none"
+    assert records[0]["workspace_ref"] is None
+    assert records[0]["surface_ref"] is None
+
+
+def test_rt_say_no_nudge_rejects_same_multi_instance_but_allows_sibling(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents = agents_path.read_text()
+    old_instances = """    instances:
+      - id: codex
+        session_id: null
+"""
+    new_instances = """    instances:
+      - id: codex-build
+        session_id: null
+      - id: codex-review
+        session_id: null
+"""
+    assert old_instances in agents
+    agents_path.write_text(agents.replace(old_instances, new_instances, 1))
+    env["RT_FROM"] = "codex-build"
+
+    self_proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "codex-build",
+        "fyi",
+        "self loop",
+        cwd=project,
+        env=env,
+    )
+
+    assert self_proc.returncode != 0
+    assert "refusing self-send" in self_proc.stderr
+    assert not (state / "inbox").exists()
+    assert read_ledger(state, "codex-build") == []
+
+    sibling_proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "codex-review",
+        "fyi",
+        "sibling delivery",
+        cwd=project,
+        env=env,
+    )
+    assert sibling_proc.returncode == 0, sibling_proc.stderr
+    assert len(read_ledger(state, "codex-build")) == 1
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_legacy_modes_keep_caller_first_sender_inference(tmp_path):
+    for index, flag in enumerate((None, "--legacy-nudge-only")):
+        project, state, env, _trace_dir = say_project(tmp_path / f"legacy-{index}")
+        env["RT_FROM"] = "claude"
+        args = ([flag] if flag else []) + ["claude", "fyi", "caller wins"]
+
+        proc = run_tool("rt-say", *args, cwd=project, env=env)
+
+        assert proc.returncode == 0, proc.stderr
+        assert len(read_ledger(state, "codex")) == 3
+        assert read_ledger(state, "claude") == []
+
+    project, state, env, trace_dir = say_project(tmp_path / "mail-only")
+    env["RT_FROM"] = "claude"
+    mail_only = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "hermes",
+        "fyi",
+        "explicit sender",
+        cwd=project,
+        env=env,
+    )
+    assert mail_only.returncode == 0, mail_only.stderr
+    assert len(read_ledger(state, "claude")) == 1
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_legacy_accepts_runtime_surplus_instances(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    codex_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:3",
+        "pane_ref": "pane:3",
+        "status": "idle",
+    }
+    claude_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:4",
+        "pane_ref": "pane:4",
+        "status": "idle",
+    }
+    runtime["agents"]["codex#1"] = codex_route
+    runtime["agents"]["claude#1"] = claude_route
+    runtime["surfaces"].extend([codex_route, claude_route])
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env["CMUX_FAKE_IDENTIFY"] = json.dumps(
+        {"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:3"}}
+    )
+
+    proc = run_tool("rt-say", "claude#1", "fyi", "surplus instance", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    msg_id = proc.stdout.strip().split()[-1]
+    assert (state / "inbox" / "claude#1" / "new" / f"{msg_id}.md").is_file()
+    assert len(read_ledger(state, "codex#1")) == 3
+
+    self_proc = run_tool("rt-say", "codex#1", "fyi", "must not loop", cwd=project, env=env)
+    assert self_proc.returncode != 0
+    assert "refusing self-send" in self_proc.stderr
+    assert not (state / "inbox" / "codex#1").exists()
+    assert len(read_ledger(state, "codex#1")) == 3
+
+
+def test_rt_say_rejects_ambiguous_or_unknown_target_before_mail(tmp_path):
+    ambiguous_project, ambiguous_state, ambiguous_env, ambiguous_trace = say_project(
+        tmp_path / "ambiguous"
+    )
+    agents_path = ambiguous_state / "agents.yaml"
+    agents = agents_path.read_text()
+    old_instances = """    instances:
+      - id: claude
+        session_id: null
+"""
+    new_instances = """    instances:
+      - id: claude-build
+        session_id: null
+      - id: claude-review
+        session_id: null
+"""
+    assert old_instances in agents
+    agents_path.write_text(agents.replace(old_instances, new_instances, 1))
+
+    ambiguous = run_tool(
+        "rt-say",
+        "claude",
+        "fyi",
+        "ambiguous target",
+        cwd=ambiguous_project,
+        env=ambiguous_env,
+    )
+    assert ambiguous.returncode != 0
+    assert "has multiple instances" in ambiguous.stderr
+    assert not (ambiguous_state / "inbox").exists()
+    assert read_ledger(ambiguous_state) == []
+    ambiguous_calls = read_cmux_calls(ambiguous_trace)
+    assert [
+        call
+        for call in ambiguous_calls
+        if call[:1] in (["events"], ["send"], ["send-key"])
+    ] == []
+
+    unknown_project, unknown_state, unknown_env, unknown_trace = say_project(tmp_path / "unknown")
+    unknown = run_tool(
+        "rt-say",
+        "ghost",
+        "fyi",
+        "unknown target",
+        cwd=unknown_project,
+        env=unknown_env,
+    )
+    assert unknown.returncode != 0
+    assert "unknown agent or instance" in unknown.stderr
+    assert not (unknown_state / "inbox").exists()
+    assert read_ledger(unknown_state) == []
+    unknown_calls = read_cmux_calls(unknown_trace)
+    assert [call for call in unknown_calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
+
+
+def test_rt_say_legacy_nudge_only_skips_maildir(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "question",
+        "legacy only",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (state / "inbox").exists()
+    assert [record["lifecycle"] for record in read_ledger(state)] == [
+        "pending",
+        "injected",
+        "submitted",
+    ]
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+
+
+def test_rt_say_rejects_conflicting_delivery_flags_without_side_effects(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+
+    proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "--legacy-nudge-only",
+        "claude",
+        "question",
+        "conflict",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 2
+    assert "mutually exclusive" in proc.stderr
+    assert not (state / "inbox").exists()
+    assert read_ledger(state) == []
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_nudge_failure_leaves_published_mail_and_pending_ledger(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    env["CMUX_FAKE_FAIL_SEND"] = "1"
+
+    proc = run_tool("rt-say", "claude", "question", "survive failure", cwd=project, env=env)
+
+    assert proc.returncode != 0
+    files = list((state / "inbox" / "claude" / "new").glob("*.md"))
+    assert len(files) == 1
+    records = read_ledger(state)
+    assert [record["lifecycle"] for record in records] == ["pending"]
+    assert files[0].stem == records[0]["msg_id"]
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert [call for call in calls if call[:1] == ["send-key"]] == []
+
+
+def test_rt_say_route_failure_still_leaves_published_mail(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["agents"]["claude"]["surface_ref"] = ""
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env["RT_FROM"] = "codex"
+
+    proc = run_tool("rt-say", "claude", "question", "route is broken", cwd=project, env=env)
+
+    assert proc.returncode != 0
+    files = list((state / "inbox" / "claude" / "new").glob("*.md"))
+    assert len(files) == 1
+    assert files[0].read_text().endswith("] route is broken")
+    assert read_ledger(state) == []
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
+
+
+def test_rt_say_rejects_invalid_sender_before_mail_or_keyboard_side_effects(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    env["RT_FROM"] = "../codex"
+
+    proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "claude",
+        "question",
+        "unsafe sender",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode != 0
+    assert "invalid sender agent component" in proc.stderr
+    assert not (state / "inbox").exists()
+    assert read_ledger(state) == []
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_mail_failure_prevents_ledger_and_keyboard_side_effects(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    (state / "inbox").write_text("not a directory")
+
+    proc = run_tool("rt-say", "claude", "question", "must not nudge", cwd=project, env=env)
+
+    assert proc.returncode != 0
+    assert "failed to publish inbox message" in proc.stderr
+    assert read_ledger(state) == []
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
+
+
+def test_rt_say_help_documents_dual_delivery_and_dedup(tmp_path):
+    project = tmp_path / "project"
+    write_project(project)
+
+    proc = run_tool("rt-say", "--help", cwd=project)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--no-nudge" in proc.stdout
+    assert "--legacy-nudge-only" in proc.stdout
+    assert "dual-write" in proc.stdout
+    assert "deduplicate using the msgid" in proc.stdout
+
+
+def test_rt_inbox_shows_ledger_and_maildir_copies_with_source_labels(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    both_id = "20260716T010000Z-codex-to-claude-11111"
+    ledger_id = "20260716T010001Z-codex-to-claude-22222"
+    mail_id = "20260716T010002Z-codex-to-claude-33333"
+    tmp_id = "20260716T010003Z-codex-to-claude-44444"
+    cur_id = "20260716T010004Z-codex-to-claude-55555"
+    ledger_records = [
+        {
+            "msg_id": both_id,
+            "ts": "2026-07-16T01:00:00.500Z",
+            "from": "codex",
+            "to": "claude",
+            "kind": "question",
+            "body": "both copy from ledger",
+            "lifecycle": "submitted",
+            "source": "rt-say",
+        },
+        {
+            "msg_id": ledger_id,
+            "ts": "2026-07-16T01:00:01.500Z",
+            "from": "codex",
+            "to": "claude",
+            "kind": "fyi",
+            "body": "ledger only",
+            "lifecycle": "submitted",
+            "source": "rt-say",
+        },
+    ]
+    (state / "messages" / "codex.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in ledger_records)
+    )
+    write_mail(state, "claude", both_id, "codex", "question", "both copy from maildir")
+    write_mail(state, "claude", mail_id, "codex", "directive", "mail only")
+    write_mail(state, "claude", tmp_id, "codex", "fyi", "ignore tmp", folder="tmp")
+    write_mail(state, "claude", cur_id, "codex", "fyi", "ignore cur", folder="cur")
+    ack_id = "20260716T010005Z-claude-to-codex-66666"
+    write_mail(state, "codex", ack_id, "claude", "sync-ack", f"refs={mail_id}")
+
+    current = run_tool("rt-inbox", "claude", "-f", "json", cwd=project)
+    assert current.returncode == 0, current.stderr
+    current_payload = json.loads(current.stdout)
+    assert {record["msg_id"] for record in current_payload} == {both_id, ledger_id}
+    assert len(current_payload) == 3
+
+    all_proc = run_tool("rt-inbox", "claude", "--all", "-f", "json", cwd=project)
+    assert all_proc.returncode == 0, all_proc.stderr
+    payload = json.loads(all_proc.stdout)
+    assert len(payload) == 4
+    by_id = {}
+    for record in payload:
+        by_id.setdefault(record["msg_id"], []).append(record)
+    assert set(by_id) == {both_id, ledger_id, mail_id}
+    both_records = {record["delivery_source"]: record for record in by_id[both_id]}
+    assert set(both_records) == {"ledger", "maildir"}
+    assert both_records["ledger"]["body"] == "both copy from ledger"
+    assert both_records["ledger"]["source"] == "rt-say"
+    assert both_records["ledger"]["lifecycle"] == "submitted"
+    assert both_records["maildir"]["body"] == "both copy from maildir"
+    assert both_records["maildir"]["source"] == "maildir"
+    assert both_records["maildir"]["lifecycle"] == "new"
+    assert by_id[ledger_id][0]["delivery_source"] == "ledger"
+    assert by_id[mail_id][0]["delivery_source"] == "maildir"
+
+    text_proc = run_tool("rt-inbox", "claude", "--all", cwd=project)
+    assert text_proc.returncode == 0, text_proc.stderr
+    assert "[ledger]" in text_proc.stdout
+    assert "[maildir]" in text_proc.stdout
+    assert "both copy from ledger" in text_proc.stdout
+    assert "both copy from maildir" in text_proc.stdout
+    assert tmp_id not in text_proc.stdout
+    assert cur_id not in text_proc.stdout
+
+
+def test_roundtable_gitignore_template_excludes_maildir_inbox():
+    assert "inbox/" in (ROOT / "templates" / "roundtable-gitignore.tmpl").read_text().splitlines()
+
+
+def test_rt_say_maildir_self_ignores_inbox_for_existing_git_projects(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    env["RT_FROM"] = "codex"
+    ignore_path = state / "inbox" / ".gitignore"
+    ignore_path.parent.mkdir(parents=True)
+    ignore_path.write_text("")
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+
+    proc = run_tool(
+        "rt-say",
+        "--no-nudge",
+        "claude",
+        "fyi",
+        "git hygiene",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    msg_id = proc.stdout.strip().split()[-1]
+    mail_path = state / "inbox" / "claude" / "new" / f"{msg_id}.md"
+    assert ignore_path.read_text() == "*\n"
+    relative_mail = mail_path.relative_to(project)
+    for relative_path in (relative_mail, Path(".roundtable/inbox/.gitignore")):
+        ignore_proc = subprocess.run(
+            ["git", "check-ignore", "-q", str(relative_path)],
+            cwd=project,
+            check=False,
+        )
+        assert ignore_proc.returncode == 0
 
 
 def test_rt_refresh_bind_persists_explicit_workspace(tmp_path):
