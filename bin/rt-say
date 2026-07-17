@@ -292,7 +292,13 @@ def guard_route_in_runtime(runtime, route):
 def infer_live_caller(runtime):
     caller_surface = ""
     try:
-        identity = run_json("cmux", "identify", "--json")
+        identity = json.loads(
+            subprocess.check_output(
+                ("cmux", "identify", "--json"),
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        )
         caller = identity.get("caller") if isinstance(identity, dict) else None
         caller_surface = (
             caller.get("surface_ref") if isinstance(caller, dict) else ""

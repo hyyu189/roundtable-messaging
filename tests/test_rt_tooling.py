@@ -186,6 +186,9 @@ if trace_dir:
 if args[:1] == ["tree"]:
     print(json.dumps(tree))
 elif args[:1] == ["identify"]:
+    if os.environ.get("CMUX_FAKE_FAIL_IDENTIFY") == "1":
+        print("cmux unavailable", file=sys.stderr)
+        sys.exit(69)
     print(json.dumps(identify))
 elif args[:2] == ["rpc", "surface.list"]:
     print(json.dumps(surface_payload))
@@ -1823,6 +1826,26 @@ def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_p
     assert "refusing self-send from claude to claude" in proc.stderr
     assert not (state / "inbox").exists()
     assert read_ledger(state, sender="codex") == []
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+
+
+def test_maildir_best_effort_caller_probe_failure_is_silent(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents_path.write_text(
+        agents_path.read_text().replace(
+            "  claude:\n    harness: claude-code\n",
+            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+        )
+    )
+    env.update({"RT_FROM": "codex", "CMUX_FAKE_FAIL_IDENTIFY": "1"})
+
+    proc = run_tool("rt-say", "claude", "fyi", "silent probe", cwd=project, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stderr == ""
+    assert proc.stdout.startswith("sent maildir-only ")
     calls = read_cmux_calls(trace_dir)
     assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
 

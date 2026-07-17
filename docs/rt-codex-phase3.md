@@ -123,4 +123,4 @@ ran against `/private/tmp/rt-phase3-accept-20260717` and its scratch TUI:
    daemon/socket/RPC/bridge failure matrix, unsupported-version `WARN`, and
    socket/plist drift remediation.
 
-Final verification: `100 passed` in the combined Phase 3 and tooling suite.
+Final verification: `101 passed` in the combined Phase 3 and tooling suite.
