@@ -1,0 +1,8 @@
+#!/bin/sh
+# Default test sentinel: any test that needs cmux must provide its own isolated
+# fake via PATH. Never let a missing fixture fall through to the live cmux CLI.
+if [ -n "${RT_TEST_CMUX_SENTINEL:-}" ]; then
+    printf '%s\n' "$*" >>"$RT_TEST_CMUX_SENTINEL"
+fi
+echo "cmux is disabled by the default test environment" >&2
+exit 69

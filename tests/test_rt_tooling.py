@@ -9,10 +9,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
+ISOLATED_BIN = ROOT / "tests" / "fixtures" / "bin"
+
+
+def isolated_env():
+    merged = os.environ.copy()
+    merged.update(
+        {
+            "PATH": f"{ISOLATED_BIN}:{merged.get('PATH', '')}",
+            "CMUX_SURFACE_ID": "",
+            "CODEX_THREAD_ID": "",
+            "ROUNDTABLE_PROJECT_DIR": "",
+            "RT_FALLBACK_PROJECT": "",
+            "RT_FROM": "",
+            "RT_PROJECTS_FILE": "/dev/null",
+        }
+    )
+    return merged
 
 
 def run_tool(name, *args, cwd=None, env=None):
-    merged = os.environ.copy()
+    merged = isolated_env()
     if env:
         merged.update(env)
     return subprocess.run(
@@ -27,7 +44,7 @@ def run_tool(name, *args, cwd=None, env=None):
 
 
 def run_executable(name, *args, cwd=None, env=None):
-    merged = os.environ.copy()
+    merged = isolated_env()
     if env:
         merged.update(env)
     return subprocess.run(
@@ -386,20 +403,28 @@ def test_rt_resolve_uses_fallback_project_when_cwd_is_not_project(tmp_path):
     project = tmp_path / "commons"
     runtime = runtime_for()
     runtime["project"] = str(project)
-    write_project(project, runtime=runtime)
+    state = write_project(project, runtime=runtime)
+    runtime_path = state / "runtime.json"
+    runtime_before = runtime_path.read_text()
     outside = tmp_path / "outside"
     outside.mkdir()
+    sentinel = tmp_path / "cmux-sentinel.log"
 
     proc = run_tool(
         "rt-resolve",
         "codex",
         cwd=outside,
-        env={"RT_FALLBACK_PROJECT": str(project)},
+        env={
+            "RT_FALLBACK_PROJECT": str(project),
+            "RT_TEST_CMUX_SENTINEL": str(sentinel),
+        },
     )
 
     assert proc.returncode == 0, proc.stderr
     assert "workspace=workspace:7" in proc.stdout
     assert "surface=surface:8" in proc.stdout
+    assert sentinel.read_text().splitlines() == ["identify --json --id-format both"]
+    assert runtime_path.read_text() == runtime_before
 
 
 def test_project_discovery_does_not_fallback_to_ref_when_runtime_uuid_differs(tmp_path):

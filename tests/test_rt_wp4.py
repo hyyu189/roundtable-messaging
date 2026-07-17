@@ -13,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
+ISOLATED_BIN = ROOT / "tests" / "fixtures" / "bin"
 sys.path.insert(0, str(BIN))
 
 import _rtlauncher
@@ -35,7 +36,18 @@ advisory = load_script("rt-startup-advisory", "rt_wp4_startup_advisory")
 
 def run_tool(name: str, *args: str, cwd: Path | None = None, env=None):
     merged = os.environ.copy()
-    merged["PYTHONDONTWRITEBYTECODE"] = "1"
+    merged.update(
+        {
+            "PATH": f"{ISOLATED_BIN}:{merged.get('PATH', '')}",
+            "CMUX_SURFACE_ID": "",
+            "CODEX_THREAD_ID": "",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "ROUNDTABLE_PROJECT_DIR": "",
+            "RT_FALLBACK_PROJECT": "",
+            "RT_FROM": "",
+            "RT_PROJECTS_FILE": "/dev/null",
+        }
+    )
     if env:
         merged.update(env)
     return subprocess.run(
