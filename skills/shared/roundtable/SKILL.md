@@ -19,6 +19,15 @@ the `rt-*` CLI tools. Address agents by **name**, never by surface id — the to
 resolve which surface an agent occupies and how to submit to it, and both drift as
 agents restart and move.
 
+**Rule #0 — launch every agent in its project root.** One project × one
+harness = one dedicated session = one mailbox. Every identity mechanism
+(orientation autoload, rt-tool project discovery, tripwire/inbox anchoring,
+codex thread binding) keys off the directory the agent was started in; an
+agent launched elsewhere (e.g. `~`) is anchor-less — gates no-op, binds fail,
+workarounds pile up. `rt-startup-advisory` warns about this at session start.
+A project with no open session for an agent = that agent is offline there;
+mail waits in `new/` (the mailbox is the fact source).
+
 ## Tools (on PATH via ~/.roundtable/bin/)
 
 | Tool | Purpose |
@@ -71,8 +80,12 @@ Its exit re-invokes you automatically — no keyboard, no human input. A Stop
 hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
 tripwire; follow its stderr instruction, it is self-explanatory. Hermes arms
 the same script via `terminal(background=true, notify_on_complete=true)`.
-Codex still receives the dual-mode nudge in production. Its Phase 3 wake bridge
-is ready but must not replace the live TUI until the coordinated cutover.
+**Arming (Codex)** — launch from the project root with `rt-codex` (daemon
+liveness and remote attach are handled automatically), then self-register in
+the first turn: `rt-codex-wake bind <project-root>` — the codex equivalent of
+arming the tripwire. From then on the wake bridge delivers maildir wakes with
+zero keyboard (verified E2E 2026-07-17); delivery stays `dual` during the
+observation period.
 
 **Replacing a tripwire: kill by marker, NEVER by name.** Other projects run
 tripwires under the same process name; `pkill -f rt-wait-inbox` kills a
