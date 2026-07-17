@@ -429,7 +429,11 @@ def test_project_discovery_does_not_fallback_to_ref_when_runtime_uuid_differs(tm
         tree=tree_with_workspaces(),
         identify={"caller": {"workspace_ref": "workspace:1", "workspace_id": "UUID-B"}},
     )
-    env["RT_PROJECTS_DIR"] = str(tmp_path)
+    registry = tmp_path / "projects.yaml"
+    env["RT_PROJECTS_FILE"] = str(registry)
+    for project in (first, second):
+        registered = run_tool("rt-projects", "add", str(project), env=env)
+        assert registered.returncode == 0, registered.stderr
 
     proc = run_tool("rt-resolve", "codex", cwd=outside, env=env)
 
@@ -1654,7 +1658,14 @@ def test_roundtable_init_next_steps_include_binding_and_watcher(tmp_path):
     parent = tmp_path / "parent"
     parent.mkdir()
 
-    proc = run_tool("roundtable-init", "--no-git", "-p", str(parent), "sample")
+    proc = run_tool(
+        "roundtable-init",
+        "--no-git",
+        "-p",
+        str(parent),
+        "sample",
+        env={"RT_PROJECTS_FILE": str(tmp_path / "projects.yaml")},
+    )
 
     assert proc.returncode == 0, proc.stderr
     assert "rt-refresh --bind-current" in proc.stdout
@@ -2028,6 +2039,9 @@ def test_startup_advisory_suggests_unique_same_workspace_project(tmp_path):
         surface_workspace=active,
     )
     env.update({"CMUX_SURFACE_ID": current_id, "ROUNDTABLE_PROJECT_DIR": ""})
+    env["RT_PROJECTS_FILE"] = str(tmp_path / "projects.yaml")
+    registered = run_tool("rt-projects", "add", str(peer), env=env)
+    assert registered.returncode == 0, registered.stderr
 
     proc = run_executable("rt-watch-ensure", cwd=outside, env=env)
 

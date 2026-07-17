@@ -3,9 +3,12 @@ Shared library for roundtable rt-* tools.
 Portable version — no hardcoded paths or agent names.
 """
 import json
+import fcntl
 import os
 import subprocess
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -15,6 +18,208 @@ except Exception:
 
 
 LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3, "acked": 4}
+PROJECTS_SCHEMA = "roundtable.projects.v1"
+
+
+def projects_registry_path():
+    override = os.environ.get("RT_PROJECTS_FILE")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.home() / ".roundtable" / "projects.yaml"
+
+
+def _empty_projects_doc():
+    return {"schema": PROJECTS_SCHEMA, "projects": []}
+
+
+def _read_projects_doc(path):
+    if not path.exists():
+        return _empty_projects_doc()
+    if yaml is None:
+        raise ValueError("PyYAML is required to read projects.yaml")
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except Exception as error:
+        # PyYAML's exception hierarchy is optional when yaml import failed, so
+        # keep this parser boundary self-contained.
+        raise ValueError(f"cannot parse {path}: {error}") from error
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path} is not a mapping")
+    if loaded.get("schema") != PROJECTS_SCHEMA:
+        raise ValueError(
+            f"{path} schema is {loaded.get('schema')!r}, expected {PROJECTS_SCHEMA!r}"
+        )
+    if not isinstance(loaded.get("projects"), list):
+        raise ValueError(f"{path} projects is not a list")
+    return loaded
+
+
+def load_project_registry(path=None):
+    """Return (valid entries, warnings), never deleting invalid entries.
+
+    Each returned entry has a canonical absolute ``root`` Path and the original
+    ``registered_at`` value. Consumers must use this function so stale registry
+    entries are skipped consistently instead of growing their own discovery
+    rules.
+    """
+    path = Path(path or projects_registry_path()).expanduser()
+    try:
+        document = _read_projects_doc(path)
+    except ValueError as error:
+        return [], [str(error)]
+    valid = []
+    warnings = []
+    seen = set()
+    for index, entry in enumerate(document.get("projects") or []):
+        label = f"{path}: projects[{index}]"
+        if not isinstance(entry, dict):
+            warnings.append(f"{label} is not a mapping; skipped")
+            continue
+        value = entry.get("root")
+        if not isinstance(value, str) or not value.strip():
+            warnings.append(f"{label} has no root; skipped")
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            warnings.append(f"{label} root is not absolute: {value}; skipped")
+            continue
+        try:
+            root = candidate.resolve()
+        except OSError as error:
+            warnings.append(f"{label} root cannot resolve: {error}; skipped")
+            continue
+        key = str(root)
+        if key in seen:
+            warnings.append(f"{label} duplicates {root}; skipped")
+            continue
+        registered_at = entry.get("registered_at")
+        if not isinstance(registered_at, str) or not registered_at.strip():
+            warnings.append(f"{label} has no valid registered_at; skipped")
+            continue
+        if not is_project_root(root):
+            warnings.append(
+                f"{label} missing {project_config_path(root)}; skipped"
+            )
+            continue
+        seen.add(key)
+        valid.append(
+            {"root": root, "registered_at": registered_at}
+        )
+    return valid, warnings
+
+
+def validate_project_registry(path=None):
+    """Fail before a mutating workflow if the existing registry is malformed."""
+    path = Path(path or projects_registry_path()).expanduser()
+    try:
+        _read_projects_doc(path)
+    except ValueError as error:
+        raise SystemExit(f"roundtable: invalid project registry: {error}")
+    return path
+
+
+def emit_registry_warnings(warnings, stream=None, tool="roundtable"):
+    stream = stream or sys.stderr
+    for warning in warnings:
+        print(f"{tool}: registry warning: {warning}", file=stream)
+
+
+def registered_project_roots(path=None, *, warn=True, tool="roundtable"):
+    entries, warnings = load_project_registry(path)
+    if warn:
+        emit_registry_warnings(warnings, tool=tool)
+    return [entry["root"] for entry in entries]
+
+
+def _write_projects_doc(path, document):
+    if yaml is None:
+        raise SystemExit("roundtable: PyYAML is required to write projects.yaml")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    descriptor = None
+    try:
+        descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _update_project_registry(mutator, path=None):
+    path = Path(path or projects_registry_path()).expanduser()
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            document = _read_projects_doc(path)
+        except ValueError as error:
+            raise SystemExit(f"roundtable: refusing to overwrite invalid registry: {error}")
+        changed = mutator(document)
+        if changed:
+            _write_projects_doc(path, document)
+        return changed
+
+
+def register_project(root, path=None, registered_at=None):
+    root = Path(root).expanduser().resolve()
+    if not is_project_root(root):
+        raise SystemExit(
+            f"roundtable: not a project (missing {project_config_path(root)}): {root}"
+        )
+    timestamp = registered_at or datetime.now(timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+
+    def add(document):
+        for entry in document["projects"]:
+            if isinstance(entry, dict) and isinstance(entry.get("root"), str):
+                try:
+                    existing = Path(entry["root"]).expanduser().resolve()
+                except OSError:
+                    continue
+                if existing == root:
+                    return False
+        document["projects"].append(
+            {"root": str(root), "registered_at": timestamp}
+        )
+        return True
+
+    return _update_project_registry(add, path)
+
+
+def unregister_project(root, path=None):
+    root = Path(root).expanduser().resolve()
+
+    def remove(document):
+        old = document["projects"]
+        kept = []
+        for entry in old:
+            matches = False
+            if isinstance(entry, dict) and isinstance(entry.get("root"), str):
+                try:
+                    matches = Path(entry["root"]).expanduser().resolve() == root
+                except OSError:
+                    matches = False
+            if not matches:
+                kept.append(entry)
+        if len(kept) == len(old):
+            return False
+        document["projects"] = kept
+        return True
+
+    return _update_project_registry(remove, path)
 
 
 def project_config_path(root):
@@ -58,44 +263,21 @@ def project_for_current_workspace():
     if not (ws_id or ws_ref):
         return None
 
-    # Search common project locations
-    search_roots = []
-    # ROUNDTABLE_PROJECT_DIR's parent
-    override = os.environ.get("ROUNDTABLE_PROJECT_DIR")
-    if override:
-        search_roots.append(Path(override).expanduser().resolve().parent)
-    # RT_PROJECTS_DIR if set
-    projects_dir = os.environ.get("RT_PROJECTS_DIR")
-    if projects_dir:
-        search_roots.append(Path(projects_dir).expanduser().resolve())
-    # Fallback project's parent (sibling projects)
-    fb = fallback_project_root()
-    if fb:
-        search_roots.append(fb.parent)
-
     exact_matches = []
     legacy_matches = []
-    seen_runtimes = set()
-    for search_root in search_roots:
-        for runtime in sorted(search_root.glob("*/.roundtable/runtime.json")):
-            runtime_key = str(runtime.resolve())
-            if runtime_key in seen_runtimes:
-                continue
-            seen_runtimes.add(runtime_key)
-            try:
-                data = json.loads(runtime.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            runtime_ws_id = data.get("workspace_id")
-            root = runtime.parent.parent
-            if not is_project_root(root):
-                continue
-            if runtime_ws_id:
-                if ws_id and runtime_ws_id == ws_id:
-                    exact_matches.append(root)
-                continue
-            if ws_ref and data.get("workspace_ref") == ws_ref:
-                legacy_matches.append(root)
+    for root in registered_project_roots(tool="roundtable"):
+        runtime = root / ".roundtable" / "runtime.json"
+        try:
+            data = json.loads(runtime.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        runtime_ws_id = data.get("workspace_id")
+        if runtime_ws_id:
+            if ws_id and runtime_ws_id == ws_id:
+                exact_matches.append(root)
+            continue
+        if ws_ref and data.get("workspace_ref") == ws_ref:
+            legacy_matches.append(root)
 
     if len(exact_matches) == 1:
         return exact_matches[0]

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Maintain the Roundtable project registry."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from _rtlib import (
+    emit_registry_warnings,
+    load_project_registry,
+    projects_registry_path,
+    register_project,
+    unregister_project,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="rt-projects")
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=projects_registry_path(),
+        help="registry path (default: ~/.roundtable/projects.yaml)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("list")
+    add = subparsers.add_parser("add")
+    add.add_argument("root", type=Path)
+    remove = subparsers.add_parser("rm")
+    remove.add_argument("root", type=Path)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "list":
+        entries, warnings = load_project_registry(args.registry)
+        emit_registry_warnings(warnings, tool="rt-projects")
+        for entry in entries:
+            registered_at = entry.get("registered_at") or "unknown"
+            print(f"{entry['root']}\t{registered_at}")
+        return 0
+    if args.command == "add":
+        root = args.root.expanduser().resolve()
+        changed = register_project(root, args.registry)
+        print(f"{'added' if changed else 'already registered'} {root}")
+        return 0
+    root = args.root.expanduser().resolve()
+    changed = unregister_project(root, args.registry)
+    print(f"{'removed' if changed else 'not registered'} {root}")
+    return 0 if changed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

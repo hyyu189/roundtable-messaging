@@ -124,32 +124,26 @@ def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
 def wake_plist(
     socket_path: Path = DEFAULT_SOCKET,
     *,
-    projects: list[str] | None = None,
-    fallback_project: str | None = None,
+    auto_discover: bool = False,
 ) -> dict:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    if projects is None:
-        configured = os.environ.get("RT_CODEX_PROJECTS", "")
-        projects = [value for value in configured.split(os.pathsep) if value]
-    if fallback_project is None:
-        fallback_project = os.environ.get("RT_FALLBACK_PROJECT")
     arguments = [
         str(ROUND_ROOT / "bin" / "rt-codex-wake"),
         "--socket",
         str(socket_path),
         "run",
     ]
-    for project in projects:
-        arguments.extend(("--project", str(Path(project).expanduser().resolve())))
+    if auto_discover:
+        arguments.append("--auto-discover")
     environment = {
         "HOME": str(Path.home()),
         "PATH": _env_path(),
         "CODEX_HOME": str(CODEX_HOME),
         "RT_CODEX_RUNTIME_DIR": str(RUNTIME_DIR),
     }
-    if fallback_project:
-        environment["RT_FALLBACK_PROJECT"] = str(
-            Path(fallback_project).expanduser().resolve()
+    if os.environ.get("RT_PROJECTS_FILE"):
+        environment["RT_PROJECTS_FILE"] = str(
+            Path(os.environ["RT_PROJECTS_FILE"]).expanduser().resolve()
         )
     return {
         "Label": WAKE_LABEL,

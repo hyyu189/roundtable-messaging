@@ -31,15 +31,16 @@ normal `codex`/cmux wrapper path.
 
 `rt-codex-wake`:
 
-- watches explicit roots, `RT_CODEX_PROJECTS`, or the default `~/RL/*` plus
-  `RT_FALLBACK_PROJECT`;
+- watches valid roots from `~/.roundtable/projects.yaml`; `run --project` is a
+  process-local diagnostic override and is never persisted by `install`;
 - treats maildir `new/` as the fact source and never moves or deletes mail;
 - validates every mail header/id/target and rejects symlinks or non-files;
 - binds a project to one root, non-ephemeral TUI thread and persists the mapping
   (`cli`, or app-server's `vscode` + `threadSource=user|None` for `--remote`);
-- prefers `CODEX_THREAD_ID` self-registration (`rt-codex-wake bind`); only an
-  embedded local `cli` thread may be auto-discovered, because app-server's
-  `vscode` source cannot distinguish a remote TUI from a real IDE session;
+- requires `CODEX_THREAD_ID` self-registration (`rt-codex-wake bind`) by
+  default; legacy embedded-CLI discovery is available only through the
+  explicit `--auto-discover` compatibility switch, because discovery caused a
+  real cross-project wake during the 2026-07-17 cutover;
 - resumes and revalidates the bound thread after every daemon reconnect;
 - starts one short pointer turn for a non-empty generation only when status is
   idle; an active thread waits for its matching `turn/completed` notification;
@@ -72,12 +73,35 @@ remain active; the original mail remains pending and the event is logged.
 # required from a remote target Codex turn at the coordinated cutover
 ~/.roundtable/bin/rt-codex-wake bind /absolute/project/root
 
-# install the bridge; repeat --project for roots outside the default scan
-~/.roundtable/bin/rt-codex-wake install --project /absolute/project/root
+# remove a stale or retired binding without deleting project mail
+~/.roundtable/bin/rt-codex-wake unbind /absolute/project/root
+
+# register the root, then install/reload the registry-backed bridge
+~/.roundtable/bin/rt-projects add /absolute/project/root
+~/.roundtable/bin/rt-codex-wake install --reload
 
 # five operational checks, nonzero only for FAIL (WARN is legacy fallback)
 ~/.roundtable/bin/rt-doctor
 ```
+
+## Project registry and launchers (WP4)
+
+`~/.roundtable/projects.yaml` is the sole discovery source for the wake bridge,
+doctor, startup advisory, workspace lookup, and harness launch menu. Manage it
+with `rt-projects list|add|rm`; `roundtable-init` registers a project only after
+its bootstrap succeeds. Consumers validate that each registered root still has
+`.roundtable/agents.yaml`, warn about invalid entries, and never delete them
+implicitly.
+
+`rt-codex`, `rt-claude`, and `rt-hermes` share one selector. Inside a project
+they preserve the existing direct-launch behavior. Outside a project they show
+the registry menu only on a TTY; non-interactive use fails with exit 2 instead
+of waiting for input. Codex retains its `--remote unix://` injection, while
+Claude and Hermes receive their original arguments unchanged.
+
+All three installed SessionStart mechanisms already call `rt-watch-ensure`,
+which delegates to `rt-startup-advisory` outside a project. No harness-private
+hook rewrite is required for WP4.
 
 Installing the bridge does not migrate an already-running embedded TUI. The
 current cmux Codex session must only be restarted through `rt-codex` during the

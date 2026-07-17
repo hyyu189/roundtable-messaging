@@ -3,4 +3,4 @@ from _rtlauncher import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main("codex"))
+    raise SystemExit(main("hermes"))

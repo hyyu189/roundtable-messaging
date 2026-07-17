@@ -65,6 +65,7 @@ doctor = load_doctor_module()
 @pytest.fixture(autouse=True)
 def isolate_wake_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(wake, "RUNTIME_DIR", tmp_path / "runtime")
+    monkeypatch.setenv("RT_PROJECTS_FILE", str(tmp_path / "projects.yaml"))
 
 
 def write_project(path: Path) -> Path:
@@ -135,7 +136,7 @@ def test_idle_three_messages_produce_one_wake(tmp_path):
         add_mail(project, f"20260716T04000{index}Z-claude-to-codex-{index}")
     client = FakeClient(thread(project))
     store = wake.StateStore(tmp_path / "state.json")
-    bridge = wake.WakeBridge(client, [project], store)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
 
     first = bridge.step()
     client.value["status"] = {"type": "active"}
@@ -154,7 +155,7 @@ def test_busy_waits_for_matching_turn_completed(tmp_path):
     live_thread = thread(project, status="active")
     client = FakeClient(live_thread)
     store = wake.StateStore(tmp_path / "state.json")
-    bridge = wake.WakeBridge(client, [project], store)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
 
     assert bridge.step()[0].detail == "waiting for turn/completed"
     live_thread["status"] = {"type": "idle"}
@@ -185,7 +186,10 @@ def test_fresh_zero_turn_tui_uses_status_transition_when_resume_has_no_rollout(
 
     client = FreshClient(live_thread)
     bridge = wake.WakeBridge(
-        client, [project], wake.StateStore(tmp_path / "state.json")
+        client,
+        [project],
+        wake.StateStore(tmp_path / "state.json"),
+        auto_discover=True,
     )
 
     assert bridge.step()[0].detail == "waiting for turn/completed"
@@ -200,7 +204,7 @@ def test_failed_wake_turn_keeps_mail_and_retries_with_backoff(tmp_path):
     mail = add_mail(project, "20260716T041500Z-claude-to-codex-1")
     client = FakeClient(thread(project))
     store = wake.StateStore(tmp_path / "state.json")
-    bridge = wake.WakeBridge(client, [project], store)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
     assert bridge.step()[0].detail == "wake started"
 
     failed = {
@@ -228,7 +232,9 @@ def test_daemon_reconnect_resumes_before_retrying_undrained_wake(tmp_path):
     first_client = FakeClient(thread(project))
     state_path = tmp_path / "state.json"
     store = wake.StateStore(state_path)
-    assert wake.WakeBridge(first_client, [project], store).step()[0].detail == "wake started"
+    assert wake.WakeBridge(
+        first_client, [project], store, auto_discover=True
+    ).step()[0].detail == "wake started"
 
     recovered = thread(project)
     recovered["turns"] = [{"id": "turn-1", "status": "interrupted"}]
@@ -295,7 +301,10 @@ def test_same_connection_unload_resumes_active_wake_before_history_check(tmp_pat
 
     client = RestartingClient(thread(project))
     bridge = wake.WakeBridge(
-        client, [project], wake.StateStore(tmp_path / "state.json")
+        client,
+        [project],
+        wake.StateStore(tmp_path / "state.json"),
+        auto_discover=True,
     )
     assert bridge.step()[0].detail == "wake started"
     client.unloaded = True
@@ -313,12 +322,32 @@ def test_wrong_thread_identity_fails_closed_and_keeps_mail(tmp_path):
     client = FakeClient(wrong)
     store = wake.StateStore(tmp_path / "state.json")
 
-    result = wake.WakeBridge(client, [project], store).step()[0]
+    result = wake.WakeBridge(
+        client, [project], store, auto_discover=True
+    ).step()[0]
 
     assert not result.ok
     assert "exactly one" in result.detail
     assert mail.exists()
     assert not any(call[0] == "turn/start" for call in client.calls)
+
+
+def test_default_bridge_leaves_unbound_project_mail_waiting(tmp_path):
+    project = write_project(tmp_path / "project")
+    mail = add_mail(project, "20260716T042050Z-claude-to-codex-1")
+    client = FakeClient(thread(project))
+    store = wake.StateStore(tmp_path / "state.json")
+
+    result = wake.WakeBridge(client, [project], store).step()[0]
+
+    assert not result.ok
+    assert "no explicit Codex binding" in result.detail
+    assert mail.exists()
+    assert store.bindings == {}
+    assert not any(
+        method in {"thread/loaded/list", "turn/start"}
+        for method, _params in client.calls
+    )
 
 
 def test_remote_tui_vscode_source_binds_with_absent_thread_source(tmp_path):
@@ -415,7 +444,9 @@ def test_malformed_project_backs_off_without_blocking_other_project(
 
     monkeypatch.setattr(wake, "pending_generation", counted)
     store = wake.StateStore(tmp_path / "state.json")
-    bridge = wake.WakeBridge(FakeClient(thread(good)), [bad, good], store)
+    bridge = wake.WakeBridge(
+        FakeClient(thread(good)), [bad, good], store, auto_discover=True
+    )
 
     first = bridge.step()
     second = bridge.step()
@@ -833,6 +864,22 @@ def test_running_store_does_not_overwrite_external_rebind(tmp_path):
     assert "lastWakeGeneration" not in reloaded.project_state(project)
 
 
+def test_unbind_removes_binding_and_project_phase_atomically(tmp_path):
+    project = write_project(tmp_path / "project")
+    path = tmp_path / "state.json"
+    store = wake.StateStore(path)
+    store.bind(project, thread(project))
+    store.project_state(project)["phase"] = "WAKE_ACTIVE"
+    store.save()
+
+    assert wake.StateStore(path).unbind(project)
+    reloaded = wake.StateStore(path)
+
+    assert str(project) not in reloaded.bindings
+    assert str(project) not in reloaded.data["projects"]
+    assert not reloaded.unbind(project)
+
+
 def test_resume_excludes_turn_history(tmp_path):
     project = write_project(tmp_path / "project")
     client = FakeClient(thread(project))
@@ -921,7 +968,9 @@ def test_auto_discovery_does_not_overwrite_concurrent_explicit_bind(tmp_path):
                 }
             raise AssertionError(method)
 
-    bridge = wake.WakeBridge(DiscoverRaceClient(), [project], store)
+    bridge = wake.WakeBridge(
+        DiscoverRaceClient(), [project], store, auto_discover=True
+    )
 
     selected = bridge._thread_for(project)
 
@@ -1037,25 +1086,18 @@ def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):
     assert bridge["ProgramArguments"][-1] == "run"
 
 
-def test_launchd_payload_persists_configured_projects(tmp_path, monkeypatch):
+def test_launchd_payload_uses_registry_and_persists_only_auto_discover(tmp_path, monkeypatch):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text("#!/bin/sh\n")
     fake_codex.chmod(0o755)
-    project = tmp_path / "outside-rl"
-    project.mkdir()
-    fallback = tmp_path / "fallback"
-    fallback.mkdir()
     monkeypatch.setenv("RT_CODEX_BIN", str(fake_codex))
     monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", tmp_path / "runtime")
 
-    payload = _rtcodex.wake_plist(
-        tmp_path / "app.sock",
-        projects=[str(project)],
-        fallback_project=str(fallback),
-    )
+    payload = _rtcodex.wake_plist(tmp_path / "app.sock", auto_discover=True)
 
-    assert payload["ProgramArguments"][-2:] == ["--project", str(project)]
-    assert payload["EnvironmentVariables"]["RT_FALLBACK_PROJECT"] == str(fallback)
+    assert payload["ProgramArguments"][-2:] == ["run", "--auto-discover"]
+    assert "--project" not in payload["ProgramArguments"]
+    assert "RT_FALLBACK_PROJECT" not in payload["EnvironmentVariables"]
 
 
 def test_explicit_launch_agent_reload_applies_unchanged_plist(tmp_path, monkeypatch):

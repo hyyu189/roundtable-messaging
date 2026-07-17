@@ -7,6 +7,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from _rtlib import register_project, validate_project_registry
+
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "templates"
 
@@ -83,6 +85,7 @@ def main():
         raise SystemExit(f"roundtable-init: target already exists: {project_dir}")
     if not TEMPLATES.is_dir():
         raise SystemExit(f"roundtable-init: templates directory missing: {TEMPLATES}")
+    validate_project_registry()
 
     values = {
         "project_name": project_name,
@@ -109,7 +112,16 @@ def main():
     if not args.no_git:
         git_init(project_dir, project_name)
 
+    try:
+        register_project(project_dir)
+    except (OSError, SystemExit) as error:
+        raise SystemExit(
+            f"roundtable-init: project created at {project_dir}, but registry update failed: "
+            f"{error}; recover with: rt-projects add {project_dir}"
+        ) from error
+
     print(f"created {project_dir}")
+    print(f"registered {project_dir}")
     print("next:")
     print(f"  cd {project_dir}")
     print(f"  # name the cmux workspace {project_name!r}, or bind the current workspace explicitly:")

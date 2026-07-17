@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from _rtlib import (
+    emit_registry_warnings,
+    load_project_registry,
+    projects_registry_path,
+)
+
 from _rtcodex import (
     DEFAULT_SOCKET,
     RUNTIME_DIR,
@@ -212,6 +218,18 @@ class StateStore:
             }
             atomic_json(self.path, self.data)
             return dict(binding)
+
+    def unbind(self, project: Path) -> bool:
+        key = str(project.expanduser().resolve())
+        with self._lock(True):
+            loaded = self._read()
+            if loaded is not None:
+                self.data = loaded
+            removed_binding = self.bindings.pop(key, None) is not None
+            removed_state = self.data.setdefault("projects", {}).pop(key, None) is not None
+            if removed_binding or removed_state:
+                atomic_json(self.path, self.data)
+            return removed_binding or removed_state
 
 
 def log_event(event: str, **fields) -> None:
@@ -453,10 +471,18 @@ class ProjectResult:
 
 
 class WakeBridge:
-    def __init__(self, client: AppServerClient, projects: list[Path], store: StateStore):
+    def __init__(
+        self,
+        client: AppServerClient,
+        projects: list[Path],
+        store: StateStore,
+        *,
+        auto_discover: bool = False,
+    ):
         self.client = client
         self.projects = projects
         self.store = store
+        self.auto_discover = auto_discover
         self.resumed: dict[str, dict] = {}
         self.completed_threads: set[str] = set()
         self.completions: dict[str, list[dict]] = {}
@@ -506,6 +532,11 @@ class WakeBridge:
                     self.subscribed_threads.add(thread_id)
             return self.resumed[key]
 
+        if not self.auto_discover:
+            raise IdentityError(
+                f"project has no explicit Codex binding: {project}; "
+                "run rt-codex-wake bind from its target Codex turn"
+            )
         thread = discover_thread(self.client, project)
         binding = self.store.bind_if_absent(project, thread)
         self.resume_attempted.add(key)
@@ -770,16 +801,15 @@ class WakeBridge:
         return [self.step_project(project) for project in self.projects]
 
 
-def discover_projects(explicit: list[str]) -> list[Path]:
-    paths = []
+def discover_projects(explicit: list[str], *, warn: bool = True) -> list[Path]:
+    paths: list[Path] = []
     if explicit:
         paths.extend(Path(value) for value in explicit)
-    elif os.environ.get("RT_CODEX_PROJECTS"):
-        paths.extend(Path(value) for value in os.environ["RT_CODEX_PROJECTS"].split(os.pathsep))
     else:
-        paths.extend((Path.home() / "RL").glob("*"))
-        if os.environ.get("RT_FALLBACK_PROJECT"):
-            paths.append(Path(os.environ["RT_FALLBACK_PROJECT"]))
+        entries, warnings = load_project_registry()
+        if warn:
+            emit_registry_warnings(warnings, tool="rt-codex-wake")
+        paths.extend(entry["root"] for entry in entries)
     projects = []
     seen = set()
     for path in paths:
@@ -793,6 +823,14 @@ def discover_projects(explicit: list[str]) -> list[Path]:
             seen.add(str(project))
             projects.append(project)
     return projects
+
+
+def registry_stamp() -> tuple[int, int] | None:
+    try:
+        info = projects_registry_path().stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
 
 
 def acquire_singleton(lock: Path):
@@ -857,6 +895,14 @@ def bind_command(args) -> int:
         client.close()
 
 
+def unbind_command(args) -> int:
+    project = Path(args.project).expanduser().resolve()
+    store = StateStore(args.state_file)
+    removed = store.unbind(project)
+    print(f"{'unbound' if removed else 'not bound'} project={project} agent=codex")
+    return 0 if removed else 1
+
+
 def run_command(args) -> int:
     try:
         projects = discover_projects(args.project)
@@ -864,7 +910,7 @@ def run_command(args) -> int:
         log_event("bridge_disabled", error=str(error))
         print(f"rt-codex-wake: bridge disabled: {error}", file=sys.stderr)
         return 1 if args.once else 0
-    if not projects:
+    if not projects and args.once:
         log_event("bridge_disabled", error="no configured Roundtable projects with a Codex agent")
         print("rt-codex-wake: no configured Roundtable projects; bridge disabled", file=sys.stderr)
         return 0
@@ -884,6 +930,7 @@ def run_command(args) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     store = StateStore(args.state_file)
+    last_registry_stamp = registry_stamp() if not args.project else None
     client = None
     backoff = 1.0
     exit_code = 0
@@ -896,9 +943,29 @@ def run_command(args) -> int:
                 ensure_daemon(args.socket)
                 require_validated_daemon(args.socket)
                 client = AppServerClient(args.socket)
-                bridge = WakeBridge(client, projects, store)
+                bridge = WakeBridge(
+                    client,
+                    projects,
+                    store,
+                    auto_discover=getattr(args, "auto_discover", False),
+                )
                 messages = []
                 while not stopping:
+                    current_stamp = registry_stamp() if not args.project else None
+                    if args.project or current_stamp != last_registry_stamp:
+                        refreshed_projects = discover_projects(
+                            args.project, warn=True
+                        )
+                        last_registry_stamp = current_stamp
+                    else:
+                        refreshed_projects = bridge.projects
+                    if refreshed_projects != bridge.projects:
+                        bridge.projects = refreshed_projects
+                        projects = refreshed_projects
+                        log_event(
+                            "projects_reloaded",
+                            projects=[str(project) for project in projects],
+                        )
                     results = bridge.step(messages)
                     backoff = 1.0
                     exit_code = 0
@@ -962,6 +1029,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run")
     run.add_argument("--project", action="append", default=[])
+    run.add_argument("--auto-discover", action="store_true")
     run.add_argument("--poll-seconds", type=float, default=5.0)
     run.add_argument("--once", action="store_true")
 
@@ -969,10 +1037,12 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("project", nargs="?")
     bind.add_argument("--thread-id")
 
+    unbind = subparsers.add_parser("unbind")
+    unbind.add_argument("project")
+
     install = subparsers.add_parser("install")
     install.add_argument("--reload", action="store_true")
-    install.add_argument("--project", action="append", default=[])
-    install.add_argument("--fallback-project")
+    install.add_argument("--auto-discover", action="store_true")
     return parser
 
 
@@ -981,14 +1051,15 @@ def main() -> int:
     try:
         if args.command == "bind":
             return bind_command(args)
+        if args.command == "unbind":
+            return unbind_command(args)
         if args.command == "install":
             require_default_socket(args.socket)
             path = install_launch_agent(
                 WAKE_LABEL,
                 wake_plist(
                     args.socket,
-                    projects=args.project or None,
-                    fallback_project=args.fallback_project,
+                    auto_discover=args.auto_discover,
                 ),
                 reload=args.reload,
             )

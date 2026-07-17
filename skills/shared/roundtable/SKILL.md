@@ -37,9 +37,16 @@ mail waits in `new/` (the mailbox is the fact source).
 | `rt-inbox` | List un-ack'd inbound messages. |
 | `rt-resolve <agent>` | Print an agent's status + current surface ref. |
 | `rt-refresh` | Rebuild the topology map (runtime.json) from the live cmux tree. |
+| `rt-projects <list|add|rm>` | Maintain the validated project registry used by launchers and wake services. |
 
 Run them from a project root (a dir with `.roundtable/agents.yaml`). Outside one,
 set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT` to point at a fallback project.
+
+Launch dedicated sessions with `rt-codex`, `rt-claude`, or `rt-hermes`. When
+called outside a project on a TTY they offer registered projects, project
+creation, or an explicit unanchored launch; non-TTY unanchored calls exit 2.
+`roundtable-init` and `rt-projects` maintain `~/.roundtable/projects.yaml`, the
+single discovery source for these launchers and background services.
 
 ## Delivery v2: per-agent maildir + tripwire
 

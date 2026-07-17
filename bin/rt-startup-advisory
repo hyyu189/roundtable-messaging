@@ -14,7 +14,12 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from _rtlib import caller_cmux_context, is_project_root
+from _rtlib import (
+    caller_cmux_context,
+    emit_registry_warnings,
+    is_project_root,
+    load_project_registry,
+)
 
 
 COMMAND_TIMEOUT = 0.75
@@ -61,7 +66,12 @@ def same_workspace(caller: dict, listing: dict) -> bool:
     )
 
 
-def peer_project(caller: dict, listing: dict, surface_token: str) -> Path | None:
+def peer_project(
+    caller: dict,
+    listing: dict,
+    surface_token: str,
+    registered_roots: set[Path],
+) -> Path | None:
     caller_surfaces = {caller.get("surface_id"), caller.get("surface_ref")}
     if surface_token not in caller_surfaces or not same_workspace(caller, listing):
         return None
@@ -76,7 +86,7 @@ def peer_project(caller: dict, listing: dict, surface_token: str) -> Path | None
             binding.get("cwd") if isinstance(binding, dict) else None
         ) or surface.get("requested_working_directory")
         root = project_at_or_above(cwd)
-        if root is not None:
+        if root is not None and root in registered_roots:
             roots.add(root)
     return next(iter(roots)) if len(roots) == 1 else None
 
@@ -88,6 +98,9 @@ def main() -> int:
     try:
         if project_at_or_above(str(Path.cwd())) is not None:
             return 0
+        entries, warnings = load_project_registry()
+        emit_registry_warnings(warnings, tool="rt-startup-advisory")
+        registered_roots = {entry["root"] for entry in entries}
         identify = command_json(["cmux", "identify", "--json", "--id-format", "both"])
         caller = caller_cmux_context(identify)
         workspace = caller.get("workspace_ref")
@@ -96,7 +109,7 @@ def main() -> int:
         listing = command_json(
             ["cmux", "rpc", "surface.list", json.dumps({"workspace": workspace})]
         )
-        root = peer_project(caller, listing, surface_token)
+        root = peer_project(caller, listing, surface_token, registered_roots)
         if root is None:
             return 0
         quoted = shlex.quote(str(root))

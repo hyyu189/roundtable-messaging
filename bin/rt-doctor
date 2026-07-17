@@ -7,11 +7,13 @@ import argparse
 import json
 import os
 import stat
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from _rtcodex import (
+    AppServerClient,
     DEFAULT_SOCKET,
     RUNTIME_DIR,
     VALIDATED_CODEX_MAX,
@@ -24,6 +26,7 @@ from _rtcodex import (
     probe_handshake,
     version_is_validated,
 )
+from _rtlib import load_project_registry, projects_registry_path
 
 
 def render_version(version) -> str:
@@ -112,11 +115,275 @@ def bridge_check(runtime_dir: Path, max_age: float) -> tuple[bool, str]:
     return True, f"{detail}, heartbeat age={age:.1f}s"
 
 
+def process_cwd(pid: int) -> Path | None:
+    proc_link = Path("/proc") / str(pid) / "cwd"
+    try:
+        if proc_link.exists():
+            return proc_link.resolve()
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("n/"):
+            try:
+                return Path(line[1:]).resolve()
+            except OSError:
+                return None
+    return None
+
+
+def project_at_or_above(path: Path) -> Path | None:
+    for candidate in (path, *path.parents):
+        if (candidate / ".roundtable" / "agents.yaml").is_file():
+            return candidate
+    return None
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def tripwire_process(pid: int, agent: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        return False, str(error)
+    command = proc.stdout.strip()
+    expected = f"rt-wait-inbox {agent}"
+    return proc.returncode == 0 and expected in command, command or "process unavailable"
+
+
+def project_health_checks(
+    report: Report,
+    registry_path: Path,
+    state_file: Path,
+    socket_path: Path,
+    rpc_ok: bool,
+) -> None:
+    entries, warnings = load_project_registry(registry_path)
+    for warning in warnings:
+        report.item(
+            "WARN",
+            "registry",
+            warning,
+            f"inspect {registry_path}; use rt-projects rm <stale-root> when applicable",
+        )
+    if not entries:
+        report.item(
+            "WARN",
+            "registry",
+            f"no valid projects in {registry_path}",
+            "rt-projects add <project-root>",
+        )
+    for entry in entries:
+        report.item(
+            "OK",
+            "registry",
+            f"{entry['root']} registered_at={entry.get('registered_at') or 'unknown'}",
+        )
+
+    registered = {str(entry["root"]): entry["root"] for entry in entries}
+    saw_tripwire = False
+    for project in registered.values():
+        inbox = project / ".roundtable" / "inbox"
+        for marker in sorted(inbox.glob("*/.armed-*")):
+            try:
+                pid = int(marker.name.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                report.item("WARN", "tripwire-anchor", f"invalid marker {marker}")
+                continue
+            if not pid_alive(pid):
+                continue
+            agent = marker.parent.name
+            is_tripwire, command = tripwire_process(pid, agent)
+            if not is_tripwire:
+                report.item(
+                    "WARN",
+                    "tripwire-anchor",
+                    f"stale or reused marker {marker}: pid={pid} command={command!r}",
+                    f"remove stale marker {marker}",
+                )
+                continue
+            saw_tripwire = True
+            cwd = process_cwd(pid)
+            if cwd is None:
+                report.item(
+                    "WARN",
+                    "tripwire-anchor",
+                    f"pid={pid} project={project} cwd unavailable",
+                    f"inspect pid {pid}",
+                )
+                continue
+            anchored = project_at_or_above(cwd)
+            if anchored == project:
+                report.item(
+                    "OK",
+                    "tripwire-anchor",
+                    f"pid={pid} cwd={cwd} project={project}",
+                )
+            else:
+                report.item(
+                    "FAIL",
+                    "tripwire-anchor",
+                    f"pid={pid} cwd={cwd} resolves_to={anchored} expected={project}",
+                    f"restart the owning harness from {project}",
+                )
+    if entries and not saw_tripwire:
+        report.item("OK", "tripwire-anchor", "no active tripwire markers")
+
+    try:
+        state = json.loads(state_file.read_text())
+        if not isinstance(state, dict) or state.get("schema") != "roundtable.codex-wake.v1":
+            raise ValueError("invalid or missing schema")
+        bindings = state.get("bindings") if isinstance(state, dict) else None
+        if not isinstance(bindings, dict):
+            raise ValueError("bindings is not a mapping")
+    except FileNotFoundError:
+        bindings = {}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"invalid wake state {state_file}: {error}",
+            f"inspect or move aside {state_file}, then re-bind active Codex projects",
+        )
+        return
+
+    if not bindings:
+        report.item("OK", "codex-anchor", "no stored Codex bindings")
+        return
+
+    client = None
+    try:
+        for value, binding in sorted(bindings.items()):
+            try:
+                project = str(Path(value).expanduser().resolve())
+            except OSError:
+                project = value
+            registered_binding = project in registered
+            if not registered_binding:
+                report.item(
+                    "WARN",
+                    "codex-anchor",
+                    f"stale binding project={project}",
+                    f"rt-codex-wake unbind {project}",
+                )
+            if not isinstance(binding, dict):
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"binding for {project} is not a mapping",
+                    f"rt-codex-wake unbind {project}",
+                )
+                continue
+            if binding.get("agent") != "codex" or binding.get("project") != project:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"binding identity mismatch for {project}",
+                    f"rt-codex-wake unbind {project}",
+                )
+                continue
+            thread_id = binding.get("threadId")
+            if not thread_id:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"binding for {project} has no threadId",
+                    f"rt-codex-wake unbind {project}",
+                )
+                continue
+            if not rpc_ok:
+                report.item(
+                    "WARN",
+                    "codex-anchor",
+                    f"thread={thread_id} cwd unchecked because RPC is unavailable",
+                    daemon_fix(socket_path),
+                )
+                continue
+            if client is None:
+                try:
+                    client = AppServerClient(socket_path)
+                except Exception as error:
+                    report.item(
+                        "FAIL",
+                        "codex-anchor",
+                        f"app-server connection failed: {error}",
+                        daemon_fix(socket_path),
+                    )
+                    break
+            try:
+                result = client.request(
+                    "thread/read", {"threadId": thread_id, "includeTurns": False}
+                )
+            except Exception as error:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"thread={thread_id} read failed: {error}",
+                    f"rt-codex-wake unbind {project}",
+                )
+                continue
+            thread = result.get("thread") or {}
+            try:
+                cwd = Path(thread["cwd"]).expanduser().resolve()
+            except (KeyError, TypeError, OSError) as error:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"thread={thread_id} has invalid cwd: {error}",
+                    f"rt-codex-wake unbind {project}",
+                )
+                continue
+            if str(cwd) == project:
+                report.item(
+                    "OK",
+                    "codex-anchor",
+                    f"thread={thread_id} cwd={cwd}",
+                )
+            else:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"thread={thread_id} cwd={cwd} expected={project}",
+                    f"rt-codex-wake unbind {project}",
+                )
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="rt-doctor")
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--runtime-dir", type=Path, default=RUNTIME_DIR)
     parser.add_argument("--bridge-max-age", type=float, default=15.0)
+    parser.add_argument("--registry", type=Path, default=projects_registry_path())
+    parser.add_argument("--state-file", type=Path)
     args = parser.parse_args()
     report = Report()
 
@@ -216,6 +483,10 @@ def main() -> int:
         "bridge",
         bridge_detail,
         bridge_fix,
+    )
+    state_file = args.state_file or args.runtime_dir / "rt-codex-wake-state.json"
+    project_health_checks(
+        report, args.registry, state_file, args.socket, rpc_ok
     )
     return 1 if report.failed else 0
 
