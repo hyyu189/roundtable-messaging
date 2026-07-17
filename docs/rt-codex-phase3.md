@@ -36,7 +36,7 @@ normal `codex`/cmux wrapper path.
 - treats maildir `new/` as the fact source and never moves or deletes mail;
 - validates every mail header/id/target and rejects symlinks or non-files;
 - binds a project to one root, non-ephemeral TUI thread and persists the mapping
-  (`cli`, or app-server 0.144.3's `vscode` + `threadSource=user` for `--remote`);
+  (`cli`, or app-server's `vscode` + `threadSource=user|None` for `--remote`);
 - prefers `CODEX_THREAD_ID` self-registration (`rt-codex-wake bind`); only an
   embedded local `cli` thread may be auto-discovered, because app-server's
   `vscode` source cannot distinguish a remote TUI from a real IDE session;

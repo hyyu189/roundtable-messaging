@@ -280,12 +280,16 @@ def validate_thread(project: Path, thread: dict, expected_id: str | None = None)
     if thread_cwd != project:
         raise IdentityError(f"thread cwd mismatch: {thread_cwd} != {project}")
     # A local embedded TUI reports `cli`; a TUI attached through --remote is
-    # serialized by app-server 0.144.3 as `vscode` + threadSource=user.
+    # serialized as `vscode`. Depending on how the interactive turn reached
+    # app-server, threadSource may be either `user` or absent. For explicit
+    # CODEX_THREAD_ID self-registration, the exact id plus cwd is the primary
+    # identity proof; this source allowlist remains a secondary guard against
+    # binding exec, sub-agent, or other non-interactive thread kinds.
     source = thread.get("source")
     thread_source = thread.get("threadSource")
     if source not in ("cli", "vscode"):
         raise IdentityError(f"thread source is not a supported TUI: {source!r}")
-    if source == "vscode" and thread_source != "user":
+    if source == "vscode" and thread_source not in (None, "user"):
         raise IdentityError(
             f"remote TUI threadSource is not user: {thread_source!r}"
         )

@@ -321,7 +321,7 @@ def test_wrong_thread_identity_fails_closed_and_keeps_mail(tmp_path):
     assert not any(call[0] == "turn/start" for call in client.calls)
 
 
-def test_remote_tui_vscode_source_is_allowed_but_non_user_source_is_not(tmp_path):
+def test_remote_tui_vscode_source_binds_with_absent_thread_source(tmp_path):
     project = write_project(tmp_path / "project")
     remote = thread(project)
     remote.update({"source": "vscode", "threadSource": "user"})
@@ -333,8 +333,15 @@ def test_remote_tui_vscode_source_is_allowed_but_non_user_source_is_not(tmp_path
         wake.validate_thread(project, remote)
 
     remote["threadSource"] = None
-    with pytest.raises(wake.IdentityError, match="remote TUI threadSource is not user"):
-        wake.validate_thread(project, remote)
+    validated = wake.validate_thread(project, remote, expected_id="thread-1")
+    store = wake.StateStore(tmp_path / "state.json")
+    store.bind(project, validated)
+    assert store.bindings[str(project)]["threadId"] == "thread-1"
+
+    remote["ephemeral"] = True
+    with pytest.raises(wake.IdentityError, match="refusing to bind an ephemeral thread"):
+        wake.validate_thread(project, remote, expected_id="thread-1")
+    remote["ephemeral"] = False
 
     remote.update({"source": {"subAgent": "child"}, "threadSource": "user"})
     with pytest.raises(wake.IdentityError, match="source is not a supported TUI"):
