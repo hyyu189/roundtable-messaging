@@ -124,10 +124,11 @@ def main():
     print(f"registered {project_dir}")
     print("next:")
     print(f"  cd {project_dir}")
-    print(f"  # name the cmux workspace {project_name!r}, or bind the current workspace explicitly:")
-    print("  rt-refresh --bind-current")
-    print("  rt-watch-ensure")
-    print("  rt-resolve codex")
+    print("  # launch a dedicated project session:")
+    print("  rt-claude  # or rt-hermes / rt-codex")
+    print("  # in a fresh Codex thread, arm native maildir wake once:")
+    print(f"  rt-codex-wake bind {project_dir}")
+    print("  rt-doctor")
 
 
 if __name__ == "__main__":

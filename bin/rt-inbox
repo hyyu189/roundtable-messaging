@@ -102,10 +102,12 @@ def read_maildir_records():
         if not target_dir.is_dir() or not AGENT_COMPONENT_RE.fullmatch(target_dir.name):
             continue
         target = target_dir.name.lower()
-        new_dir = target_dir / "new"
-        if not new_dir.is_dir():
-            continue
-        for path in sorted(new_dir.glob("*.md")):
+        paths = []
+        for folder in ("new", "cur"):
+            directory = target_dir / folder
+            if directory.is_dir():
+                paths.extend((folder, path) for path in sorted(directory.glob("*.md")))
+        for folder, path in paths:
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -117,6 +119,11 @@ def read_maildir_records():
             msg_id = parsed["msg_id"]
             to_agent = parsed["to"].lower()
             kind = parsed["kind"].lower()
+            # Drained normal mail is no longer inbox-visible. Drained quiet acks
+            # remain fact-source tombstones: without the retired rt-watch there
+            # is no separate process to materialize an "acked" ledger event.
+            if folder == "cur" and kind != "sync-ack":
+                continue
             valid_stems = {msg_id}
             if kind == "sync-ack":
                 valid_stems.add(f"ack-{msg_id}")
@@ -138,7 +145,7 @@ def read_maildir_records():
                 "surface_ref": None,
                 "pane_ref": None,
                 "submit": "none",
-                "lifecycle": "new",
+                "lifecycle": folder,
                 "refs": [],
                 "correlation": {},
                 "source": "maildir",

@@ -25,6 +25,8 @@ INBOX_DIR = STATE_DIR / "inbox"
 LEDGER_LOCK = LOCK_DIR / "ledger.lock"
 LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3, "acked": 4}
 AGENT_COMPONENT_RE = re.compile(r"^[a-z0-9#_-]+$")
+LEGACY_FAILURE_EXIT = 3
+LEGACY_OPERATION_ACTIVE = False
 
 
 def usage():
@@ -40,18 +42,17 @@ def print_help():
     print(
         """usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] <agent-or-instance> <kind> <body...>
 
-Deliver a roundtable message. Per-agent delivery comes from agents.yaml:
-delivery: dual (default) writes maildir then nudges; delivery: maildir does not
-touch the keyboard.
+Deliver a roundtable message through the project's maildir. A successful atomic
+write to inbox/<agent>/new is successful delivery and exits 0. Normal delivery
+does not require a topology map and never touches the keyboard.
 
 options:
-  --no-nudge           write maildir only; do not inject text or press keys
-  --legacy-nudge-only  use only the legacy cmux nudge path; do not write maildir
+  --no-nudge           compatibility alias; normal delivery is already maildir-only
+  --legacy-nudge-only  emergency legacy cmux path; do not write maildir; failures exit 3
   --verbose            print route and submit details
   -h, --help           show this help
 
-Explicit flags override per-agent delivery. For dual-write delivery, receivers
-deduplicate using the msgid in the header and filename.
+The legacy path is human-coordinated and fails independently with exit 3.
 """
     )
 
@@ -112,34 +113,6 @@ def configured_target(root, target, *, required=True, runtime=None):
     if not required and target in ((runtime or {}).get("agents") or {}):
         return target, target
     raise SystemExit(f"rt-say: unknown agent or instance: {target}")
-
-
-def configured_delivery_mode(root, target):
-    """Return the base agent's delivery mode for a configured target."""
-    doc = load_agents_doc(root, "rt-say")
-    for base, raw_config in (doc.get("agents") or {}).items():
-        base_name = str(base).lower()
-        config = raw_config if isinstance(raw_config, dict) else {}
-        instances = config.get("instances") or [{"id": base_name}]
-        instance_names = []
-        for instance in instances:
-            if isinstance(instance, str):
-                instance_names.append(instance.lower())
-            else:
-                instance_names.append(
-                    str((instance or {}).get("id") or base_name).lower()
-                )
-        if target != base_name and target not in instance_names:
-            continue
-        mode = str(config.get("delivery") or "dual").lower()
-        if mode not in {"dual", "maildir"}:
-            raise SystemExit(
-                f"rt-say: invalid delivery mode for {base_name}: {mode}; "
-                "expected dual or maildir"
-            )
-        return mode
-    # Runtime-surplus instances retain the backwards-compatible default.
-    return "dual"
 
 
 def infer_sender_from_harness_env(root):
@@ -357,6 +330,20 @@ def append_ledger(sender, record):
         release_lock(LEDGER_LOCK)
 
 
+def append_ledger_after_delivery(sender, record):
+    """Record mail delivery without changing the committed delivery result."""
+    try:
+        append_ledger(sender, record)
+    # The atomic maildir rename is the delivery commit point. Ledger corruption
+    # or lock failures after it must never turn a delivered message into a CLI
+    # failure. Do not catch BaseException: interrupts still stop the process.
+    except (Exception, SystemExit) as error:
+        print(
+            f"rt-say: warning: maildir delivery committed but ledger update failed: {error}",
+            file=sys.stderr,
+        )
+
+
 def base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, lifecycle, source, correlation=None):
     return {
         "schema": "roundtable.message_event.v1",
@@ -510,6 +497,8 @@ def steer_prefix(target, status, submit_cfg):
 
 
 def main():
+    global LEGACY_OPERATION_ACTIVE
+
     args = sys.argv[1:]
     if "-h" in args or "--help" in args:
         print_help()
@@ -536,13 +525,12 @@ def main():
     if len(args) < 3 and not ack_mode:
         usage()
 
-    delivery_mode = configured_delivery_mode(ROOT, target)
-    configured_maildir_only = (
-        delivery_mode == "maildir"
-        and not explicit_no_nudge
-        and not legacy_nudge_only
-    )
-    no_nudge = explicit_no_nudge or configured_maildir_only
+    maildir_only = not legacy_nudge_only
+    if legacy_nudge_only:
+        # Syntax errors above retain their ordinary usage status. Once an
+        # explicitly requested legacy operation begins, every operational
+        # failure is reported uniformly by the top-level handler.
+        LEGACY_OPERATION_ACTIVE = True
 
     STATE_DIR.mkdir(exist_ok=True)
     LOCK_DIR.mkdir(exist_ok=True)
@@ -552,24 +540,24 @@ def main():
     explicit_sender = os.environ.get("RT_FROM", "").lower()
     if explicit_sender:
         validate_agent_component(explicit_sender, "sender")
-    if no_nudge:
+    if maildir_only:
         target_agent, target_instance = configured_target(ROOT, target)
-        if configured_maildir_only:
+        if explicit_no_nudge:
+            # Preserve the compatibility flag's historical contract: an
+            # explicit sender does not require a live cmux caller probe.
+            sender = explicit_sender or infer_sender_from_harness_env(ROOT)
+            if not sender:
+                runtime = read_existing_runtime()
+                sender = infer_live_caller(runtime) if runtime is not None else ""
+        else:
+            # Normal delivery retains live-caller authority. Inherited app
+            # server identity is a fallback only when no live caller matches.
             runtime = read_existing_runtime()
             sender = (
                 (infer_live_caller(runtime) if runtime is not None else "")
                 or explicit_sender
                 or infer_sender_from_harness_env(ROOT)
             )
-        else:
-            # Explicit --no-nudge predates per-agent delivery and intentionally
-            # treats RT_FROM as authoritative without touching cmux.
-            sender = explicit_sender or infer_sender_from_harness_env(ROOT)
-        if not sender:
-            # Preserve legacy convenience for an interactive cmux caller, but
-            # only refresh after the runtime-independent paths were exhausted.
-            runtime = read_runtime()
-            sender = infer_sender(runtime)
     else:
         runtime = read_runtime()
         # Preserve WP1 caller authority: a live cmux caller wins over all
@@ -583,10 +571,10 @@ def main():
             runtime=runtime,
         )
     if not sender:
-        raise SystemExit("rt-say: could not infer sender from current cmux surface; set RT_FROM")
+        raise SystemExit("rt-say: could not infer sender; set RT_FROM")
     sender = str(sender).lower()
     validate_agent_component(sender, "sender")
-    if no_nudge:
+    if maildir_only:
         _sender_agent, sender_instance = configured_target(ROOT, sender)
         is_self_send = sender_instance == target_instance
     else:
@@ -611,10 +599,10 @@ def main():
     mail_text = header + (f" {body_arg}" if body_arg else "")
     rendered = f"{header} {body_arg}".rstrip()
 
-    if not legacy_nudge_only:
+    if maildir_only:
         publish_maildir(target, msg_id, mail_text, quiet_ack=kind == "sync-ack")
 
-    if no_nudge:
+    if maildir_only:
         route = {"workspace": None, "surface": None, "pane": None}
         submit = "none"
         send_text = terminal_single_line(rendered)
@@ -632,18 +620,15 @@ def main():
             "pending",
             "rt-say",
         )
-        append_ledger(sender, pending)
+        append_ledger_after_delivery(sender, pending)
         if verbose:
-            label = "maildir-only" if configured_maildir_only else "maildir"
-            print(f"sent id={msg_id} from={sender} to={target} delivery={label} submit=none")
-        elif configured_maildir_only:
-            print(f"sent maildir-only {msg_id}")
+            print(f"sent id={msg_id} from={sender} to={target} delivery=maildir submit=none")
         else:
-            print(f"sent {msg_id}")
+            print(f"sent maildir-only {msg_id}")
         return
 
-    # Everything below is the legacy nudge path. Maildir publication above is
-    # the fact-source commit and must survive any runtime/route/nudge failure.
+    # Everything below is the explicit, keyboard-only legacy path. It never
+    # publishes maildir state; failures are therefore independent of delivery.
     runtime = read_runtime()
     route = parse_resolve(target)
     # Re-read runtime AFTER resolve — rt-resolve may have refreshed the map.
@@ -714,8 +699,19 @@ def main():
             stderr=subprocess.DEVNULL,
         )
         started_at = time.time()
-        run("cmux", "send", "--workspace", route["workspace"], "--surface", route["surface"], send_text, stdout=subprocess.DEVNULL)
-        correlation = wait_surface_input(watcher, route["surface"], text_length(send_text), started_at)
+        try:
+            run("cmux", "send", "--workspace", route["workspace"], "--surface", route["surface"], send_text, stdout=subprocess.DEVNULL)
+            correlation = wait_surface_input(watcher, route["surface"], text_length(send_text), started_at)
+        finally:
+            if watcher.poll() is None:
+                try:
+                    watcher.terminate()
+                    watcher.wait(timeout=0.2)
+                except Exception:
+                    try:
+                        watcher.kill()
+                    except Exception:
+                        pass
         injected = base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, "injected", "rt-say", correlation)
         append_ledger(sender, injected)
 
@@ -736,4 +732,32 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        if LEGACY_OPERATION_ACTIVE:
+            command = error.cmd if isinstance(error.cmd, str) else " ".join(error.cmd)
+            print(
+                f"rt-say: legacy nudge failed with exit {error.returncode}: {command}",
+                file=sys.stderr,
+            )
+            raise SystemExit(LEGACY_FAILURE_EXIT) from None
+        raise
+    except SystemExit as error:
+        if not LEGACY_OPERATION_ACTIVE:
+            raise
+        detail = terminal_single_line(str(error.code)) or "unknown failure"
+        print(f"rt-say: legacy nudge failed: {detail}", file=sys.stderr)
+        raise SystemExit(LEGACY_FAILURE_EXIT) from None
+    except OSError as error:
+        if LEGACY_OPERATION_ACTIVE:
+            detail = terminal_single_line(str(error)) or error.__class__.__name__
+            print(f"rt-say: legacy nudge failed: {detail}", file=sys.stderr)
+            raise SystemExit(LEGACY_FAILURE_EXIT) from None
+        raise SystemExit(f"rt-say: command failed: {error}") from None
+    except Exception as error:
+        if not LEGACY_OPERATION_ACTIVE:
+            raise
+        detail = terminal_single_line(str(error)) or error.__class__.__name__
+        print(f"rt-say: legacy nudge failed: {detail}", file=sys.stderr)
+        raise SystemExit(LEGACY_FAILURE_EXIT) from None

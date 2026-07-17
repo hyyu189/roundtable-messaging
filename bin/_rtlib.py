@@ -378,6 +378,8 @@ def workspace_by_id(tree, workspace_id):
 
 def iter_ledgers(msg_dir):
     for path in sorted(Path(msg_dir).glob("*.jsonl")):
+        if not path.is_file():
+            continue
         if path.name.count("-") and path.stem.rsplit("-", 1)[-1].isdigit():
             continue
         yield path
@@ -386,14 +388,19 @@ def iter_ledgers(msg_dir):
 def read_records(msg_dir):
     records = []
     for path in iter_ledgers(msg_dir):
-        with path.open() as fh:
-            for line in fh:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("msg_id") and record.get("lifecycle") in LIFECYCLE_ORDINAL:
-                    records.append(record)
+        try:
+            with path.open() as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("msg_id") and record.get("lifecycle") in LIFECYCLE_ORDINAL:
+                        records.append(record)
+        except (OSError, UnicodeError):
+            # Maildir is the delivery fact source. One degraded optional ledger
+            # must not make otherwise valid inbox mail unreadable.
+            continue
     return records
 
 

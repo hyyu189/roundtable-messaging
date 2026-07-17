@@ -19,7 +19,7 @@ ROOT = find_project_root("rt-ack")
 
 
 def usage():
-    print("usage: bin/rt-ack <ref_csv> [body]", file=sys.stderr)
+    print("usage: rt-ack <ref_csv> [body]", file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -53,14 +53,23 @@ def main():
         env["RT_ACK_MODE"] = "1"
         env["RT_ACK_REFS"] = csv
         env["RT_ACK_BODY"] = body
-        proc = subprocess.run(
-            [str(TOOL_DIR / "rt-say"), target, "sync-ack", visible_body],
-            text=True,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                [str(TOOL_DIR / "rt-say"), target, "sync-ack", visible_body],
+                text=True,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        except OSError as error:
+            raise SystemExit(f"rt-ack: failed to run rt-say: {error}") from None
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or f"rt-say exited {proc.returncode}"
+            print(detail, file=sys.stderr)
+            raise SystemExit(proc.returncode)
+        if proc.stderr.strip():
+            print(proc.stderr.strip(), file=sys.stderr)
         outputs.append(proc.stdout.strip())
 
     print("\n".join(output for output in outputs if output))

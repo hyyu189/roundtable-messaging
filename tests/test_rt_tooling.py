@@ -520,7 +520,7 @@ def test_rt_ack_still_sends_sync_ack_in_ack_mode(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "sent 2026" in proc.stdout
+    assert "sent maildir-only 2026" in proc.stdout
     ledger = (state / "messages" / "codex.jsonl").read_text()
     assert '"kind":"sync-ack"' in ledger
     assert "20260610T000000Z-claude-to-codex-12345" in ledger
@@ -651,6 +651,7 @@ def test_rt_say_inbox_ack_flow_with_fake_cmux(tmp_path):
         tree=tree_with_workspaces(active),
         identify={"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:1"}},
     )
+    base_env["RT_FROM"] = "codex"
 
     send_proc = run_tool("rt-say", "claude", "question", "please review", cwd=project, env=base_env)
 
@@ -670,9 +671,13 @@ def test_rt_say_inbox_ack_flow_with_fake_cmux(tmp_path):
     assert ack_proc.returncode == 0, ack_proc.stderr
     after_ack = run_tool("rt-inbox", cwd=project, env={**base_env, "RT_FROM": "claude"})
     assert msg_id not in after_ack.stdout
+    ack_file = next((project / ".roundtable" / "inbox" / "codex" / "new").glob("ack-*.md"))
+    ack_file.rename(ack_file.parents[1] / "cur" / ack_file.name)
+    after_drain = run_tool("rt-inbox", cwd=project, env={**base_env, "RT_FROM": "claude"})
+    assert msg_id not in after_drain.stdout
 
 
-def test_rt_say_default_dual_writes_exact_mail_and_preserves_legacy_nudge(tmp_path):
+def test_rt_say_default_maildir_writes_exact_mail_without_legacy_nudge(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     body = "line 1\nline 2  with  spaces  "
 
@@ -686,29 +691,21 @@ def test_rt_say_default_dual_writes_exact_mail_and_preserves_legacy_nudge(tmp_pa
     assert list((state / "inbox" / "claude" / "cur").iterdir()) == []
 
     records = read_ledger(state)
-    assert [record["lifecycle"] for record in records] == ["pending", "injected", "submitted"]
+    assert [record["lifecycle"] for record in records] == ["pending"]
     assert all(record["msg_id"] == msg_id for record in records)
     assert all(record["body"] == body for record in records)
+    assert records[0]["submit"] == "none"
+    assert records[0]["workspace_ref"] is None
+    assert records[0]["surface_ref"] is None
     calls = read_cmux_calls(trace_dir)
     send_calls = [call for call in calls if call[:1] == ["send"]]
     key_calls = [call for call in calls if call[:1] == ["send-key"]]
-    assert send_calls == [
-        [
-            "send",
-            "--workspace",
-            "workspace:1",
-            "--surface",
-            "surface:2",
-            records[0]["send_text"],
-        ]
-    ]
+    assert send_calls == []
     assert records[0]["send_text"] == f"[CODEX→CLAUDE question id={msg_id}] line 1 line 2 with spaces"
-    assert key_calls == [
-        ["send-key", "--workspace", "workspace:1", "--surface", "surface:2", "Enter"]
-    ]
+    assert key_calls == []
 
 
-def test_rt_say_default_preserves_busy_submit_policy_per_harness(tmp_path):
+def test_rt_say_explicit_legacy_preserves_busy_submit_policy_per_harness(tmp_path):
     cases = [
         ("claude", "codex", "surface:2", "none", None, False),
         ("codex", "claude", "surface:1", "Tab", "Tab", False),
@@ -738,7 +735,15 @@ def test_rt_say_default_preserves_busy_submit_policy_per_harness(tmp_path):
             runtime["surfaces"].append(route)
         runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
 
-        proc = run_tool("rt-say", target, "fyi", "busy delivery", cwd=project, env=env)
+        proc = run_tool(
+            "rt-say",
+            "--legacy-nudge-only",
+            target,
+            "fyi",
+            "busy delivery",
+            cwd=project,
+            env=env,
+        )
 
         assert proc.returncode == 0, proc.stderr
         record = read_ledger(state, sender)[0]
@@ -767,7 +772,6 @@ def test_rt_say_concurrent_same_target_delivers_both_once(tmp_path):
         [
             sys.executable,
             str(BIN / "rt-say"),
-            "--no-nudge",
             "claude",
             "question",
             "first",
@@ -782,7 +786,6 @@ def test_rt_say_concurrent_same_target_delivers_both_once(tmp_path):
         [
             sys.executable,
             str(BIN / "rt-say"),
-            "--no-nudge",
             "claude",
             "question",
             "second",
@@ -812,10 +815,11 @@ def test_rt_say_concurrent_same_target_delivers_both_once(tmp_path):
         by_id.setdefault(record["msg_id"], []).append(record["lifecycle"])
     assert set(by_id) == msg_ids
     assert all(lifecycles == ["pending"] for lifecycles in by_id.values())
-    assert read_cmux_calls(trace_dir) == []
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
 
 
-def test_rt_say_contended_legacy_lock_still_fails_fast_after_publishing_mail(tmp_path):
+def test_rt_say_contended_explicit_legacy_lock_fails_fast_without_mail(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     env["CMUX_FAKE_SEND_DELAY"] = "0.30"
     env["RT_FROM"] = "codex"
@@ -823,7 +827,14 @@ def test_rt_say_contended_legacy_lock_still_fails_fast_after_publishing_mail(tmp
     process_env.update(env)
 
     first = subprocess.Popen(
-        [sys.executable, str(BIN / "rt-say"), "claude", "question", "first legacy"],
+        [
+            sys.executable,
+            str(BIN / "rt-say"),
+            "--legacy-nudge-only",
+            "claude",
+            "question",
+            "first legacy",
+        ],
         cwd=project,
         env=process_env,
         text=True,
@@ -836,18 +847,21 @@ def test_rt_say_contended_legacy_lock_still_fails_fast_after_publishing_mail(tmp
         time.sleep(0.01)
     assert send_lock.exists(), "first rt-say never acquired the target send lock"
 
-    second = run_tool("rt-say", "claude", "question", "second legacy", cwd=project, env=env)
+    second = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "question",
+        "second legacy",
+        cwd=project,
+        env=env,
+    )
     first_stdout, first_stderr = first.communicate(timeout=10)
 
     assert first.returncode == 0, first_stderr
     assert second.returncode != 0
     assert "lock busy" in second.stderr
-    files = list((state / "inbox" / "claude" / "new").glob("*.md"))
-    assert len(files) == 2
-    assert {path.read_text().rsplit("] ", 1)[-1] for path in files} == {
-        "first legacy",
-        "second legacy",
-    }
+    assert not (state / "inbox").exists()
     first_id = first_stdout.strip().split()[-1]
     assert {record["msg_id"] for record in read_ledger(state)} == {first_id}
     calls = read_cmux_calls(trace_dir)
@@ -928,17 +942,28 @@ def test_rt_say_no_nudge_rejects_same_multi_instance_but_allows_sibling(tmp_path
     assert read_cmux_calls(trace_dir) == []
 
 
-def test_rt_say_legacy_modes_keep_caller_first_sender_inference(tmp_path):
-    for index, flag in enumerate((None, "--legacy-nudge-only")):
-        project, state, env, _trace_dir = say_project(tmp_path / f"legacy-{index}")
-        env["RT_FROM"] = "claude"
-        args = ([flag] if flag else []) + ["claude", "fyi", "caller wins"]
+def test_rt_say_default_and_legacy_keep_live_caller_while_no_nudge_uses_explicit_sender(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path / "maildir")
+    env["RT_FROM"] = "claude"
+    proc = run_tool("rt-say", "hermes", "fyi", "caller wins", cwd=project, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert len(read_ledger(state, "codex")) == 1
+    assert read_ledger(state, "claude") == []
 
-        proc = run_tool("rt-say", *args, cwd=project, env=env)
-
-        assert proc.returncode == 0, proc.stderr
-        assert len(read_ledger(state, "codex")) == 3
-        assert read_ledger(state, "claude") == []
+    project, state, env, _trace_dir = say_project(tmp_path / "legacy")
+    env["RT_FROM"] = "claude"
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "fyi",
+        "caller wins",
+        cwd=project,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(read_ledger(state, "codex")) == 3
+    assert read_ledger(state, "claude") == []
 
     project, state, env, trace_dir = say_project(tmp_path / "mail-only")
     env["RT_FROM"] = "claude"
@@ -956,7 +981,7 @@ def test_rt_say_legacy_modes_keep_caller_first_sender_inference(tmp_path):
     assert read_cmux_calls(trace_dir) == []
 
 
-def test_rt_say_legacy_accepts_runtime_surplus_instances(tmp_path):
+def test_rt_say_explicit_legacy_accepts_runtime_surplus_instances(tmp_path):
     project, state, env, _trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
@@ -980,14 +1005,29 @@ def test_rt_say_legacy_accepts_runtime_surplus_instances(tmp_path):
         {"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:3"}}
     )
 
-    proc = run_tool("rt-say", "claude#1", "fyi", "surplus instance", cwd=project, env=env)
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude#1",
+        "fyi",
+        "surplus instance",
+        cwd=project,
+        env=env,
+    )
 
     assert proc.returncode == 0, proc.stderr
-    msg_id = proc.stdout.strip().split()[-1]
-    assert (state / "inbox" / "claude#1" / "new" / f"{msg_id}.md").is_file()
+    assert not (state / "inbox").exists()
     assert len(read_ledger(state, "codex#1")) == 3
 
-    self_proc = run_tool("rt-say", "codex#1", "fyi", "must not loop", cwd=project, env=env)
+    self_proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "codex#1",
+        "fyi",
+        "must not loop",
+        cwd=project,
+        env=env,
+    )
     assert self_proc.returncode != 0
     assert "refusing self-send" in self_proc.stderr
     assert not (state / "inbox" / "codex#1").exists()
@@ -1095,24 +1135,24 @@ def test_rt_say_rejects_conflicting_delivery_flags_without_side_effects(tmp_path
     assert read_cmux_calls(trace_dir) == []
 
 
-def test_rt_say_nudge_failure_leaves_published_mail_and_pending_ledger(tmp_path):
+def test_rt_say_default_maildir_succeeds_when_legacy_cmux_would_fail(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     env["CMUX_FAKE_FAIL_SEND"] = "1"
 
     proc = run_tool("rt-say", "claude", "question", "survive failure", cwd=project, env=env)
 
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     files = list((state / "inbox" / "claude" / "new").glob("*.md"))
     assert len(files) == 1
     records = read_ledger(state)
     assert [record["lifecycle"] for record in records] == ["pending"]
     assert files[0].stem == records[0]["msg_id"]
     calls = read_cmux_calls(trace_dir)
-    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send"]]) == 0
     assert [call for call in calls if call[:1] == ["send-key"]] == []
 
 
-def test_rt_say_route_failure_still_leaves_published_mail(tmp_path):
+def test_rt_say_default_maildir_ignores_stale_runtime_route(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
@@ -1122,11 +1162,11 @@ def test_rt_say_route_failure_still_leaves_published_mail(tmp_path):
 
     proc = run_tool("rt-say", "claude", "question", "route is broken", cwd=project, env=env)
 
-    assert proc.returncode != 0
+    assert proc.returncode == 0, proc.stderr
     files = list((state / "inbox" / "claude" / "new").glob("*.md"))
     assert len(files) == 1
     assert files[0].read_text().endswith("] route is broken")
-    assert read_ledger(state) == []
+    assert [record["lifecycle"] for record in read_ledger(state)] == ["pending"]
     calls = read_cmux_calls(trace_dir)
     assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
 
@@ -1165,7 +1205,80 @@ def test_rt_say_mail_failure_prevents_ledger_and_keyboard_side_effects(tmp_path)
     assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
 
 
-def test_rt_say_help_documents_dual_delivery_and_dedup(tmp_path):
+def test_rt_say_maildir_commit_stays_successful_when_ledger_update_fails(tmp_path):
+    for case in ("directory", "invalid-utf8"):
+        project, state, env, trace_dir = say_project(tmp_path / case)
+        ledger = state / "messages" / "codex.jsonl"
+        if case == "directory":
+            ledger.mkdir()
+        else:
+            ledger.write_bytes(b"\xff\n")
+
+        proc = run_tool("rt-say", "claude", "fyi", "ledger degraded", cwd=project, env=env)
+
+        assert proc.returncode == 0
+        assert "maildir delivery committed but ledger update failed" in proc.stderr
+        assert "Traceback" not in proc.stderr
+        msg_id = proc.stdout.strip().split()[-1]
+        assert (state / "inbox" / "claude" / "new" / f"{msg_id}.md").is_file()
+        inbox = run_tool("rt-inbox", "claude", cwd=project, env=env)
+        assert inbox.returncode == 0, inbox.stderr
+        assert msg_id in inbox.stdout
+        calls = read_cmux_calls(trace_dir)
+        assert [call for call in calls if call[:1] in (["events"], ["send"], ["send-key"])] == []
+
+
+def test_rt_ack_reports_downstream_failure_without_traceback(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    (state / "inbox").write_text("not a directory")
+    original = "20260717T010000Z-codex-to-claude-original"
+
+    proc = run_tool(
+        "rt-ack",
+        original,
+        "cannot publish",
+        cwd=project,
+        env={
+            **env,
+            "RT_FROM": "claude",
+            "CMUX_FAKE_IDENTIFY": json.dumps(
+                {"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:2"}}
+            ),
+        },
+    )
+
+    assert proc.returncode != 0
+    assert "failed to publish inbox message" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_rt_ack_mail_commit_survives_ledger_failure_and_cur_ref_stays_effective(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    sent = run_tool("rt-say", "claude", "question", "please ack", cwd=project, env=env)
+    assert sent.returncode == 0, sent.stderr
+    original = sent.stdout.strip().split()[-1]
+    (state / "messages" / "claude.jsonl").mkdir()
+    ack_env = {
+        **env,
+        "RT_FROM": "claude",
+        "CMUX_FAKE_IDENTIFY": json.dumps(
+            {"caller": {"workspace_ref": "workspace:1", "surface_ref": "surface:2"}}
+        ),
+    }
+
+    ack = run_tool("rt-ack", original, "ledger degraded", cwd=project, env=ack_env)
+
+    assert ack.returncode == 0
+    assert "maildir delivery committed but ledger update failed" in ack.stderr
+    assert "Traceback" not in ack.stderr
+    ack_file = next((state / "inbox" / "codex" / "new").glob("ack-*.md"))
+    ack_file.rename(state / "inbox" / "codex" / "cur" / ack_file.name)
+    inbox = run_tool("rt-inbox", "claude", cwd=project, env=env)
+    assert inbox.returncode == 0, inbox.stderr
+    assert original not in inbox.stdout
+
+
+def test_rt_say_help_documents_maildir_as_the_sole_normal_path(tmp_path):
     project = tmp_path / "project"
     write_project(project)
 
@@ -1174,8 +1287,11 @@ def test_rt_say_help_documents_dual_delivery_and_dedup(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "--no-nudge" in proc.stdout
     assert "--legacy-nudge-only" in proc.stdout
-    assert "dual-write" in proc.stdout
-    assert "deduplicate using the msgid" in proc.stdout
+    assert "normal delivery is already maildir-only" in proc.stdout
+    assert "does not require a topology map and never touches the keyboard" in proc.stdout
+    assert "failures exit 3" in proc.stdout
+    assert "dual-write" not in proc.stdout
+    assert "deduplicate" not in proc.stdout
 
 
 def test_rt_inbox_shows_ledger_and_maildir_copies_with_source_labels(tmp_path):
@@ -1679,7 +1795,7 @@ def test_rt_refresh_without_caller_or_stored_binding_fails_without_state(tmp_pat
     assert not (state / "runtime.json").exists()
 
 
-def test_roundtable_init_next_steps_include_binding_and_watcher(tmp_path):
+def test_roundtable_init_next_steps_use_native_launch_and_codex_binding(tmp_path):
     parent = tmp_path / "parent"
     parent.mkdir()
 
@@ -1693,29 +1809,16 @@ def test_roundtable_init_next_steps_include_binding_and_watcher(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "rt-refresh --bind-current" in proc.stdout
-    assert "rt-watch-ensure" in proc.stdout
+    assert "rt-claude  # or rt-hermes / rt-codex" in proc.stdout
+    assert f"rt-codex-wake bind {parent / 'sample'}" in proc.stdout
+    assert "rt-doctor" in proc.stdout
+    assert "rt-refresh" not in proc.stdout
+    assert "rt-watch" not in proc.stdout
 
 
-def test_rt_watch_ensure_does_not_use_focused_workspace_without_caller(tmp_path):
-    project = tmp_path / "project"
-    state = write_project(project)
-    focused = workspace("workspace:4", "Other", "surface:4", "pane:4", "Terminal")
-    env = fake_cmux(
-        tmp_path,
-        tree=tree_with_workspaces(focused),
-        identify={
-            "caller": None,
-            "focused": {"workspace_ref": "workspace:4", "pane_ref": "pane:4"},
-        },
-    )
-
-    proc = run_executable("rt-watch-ensure", cwd=project, env=env)
-
-    assert proc.returncode == 0
-    assert "SCRIPT_DIR" not in proc.stderr
-    assert "unbound variable" not in proc.stderr
-    assert "no cmux caller workspace/pane" in (state / "rt-watch.log").read_text()
+def test_v1_watch_scripts_are_retired_from_bin():
+    assert not (BIN / "rt-watch").exists()
+    assert not (BIN / "rt-watch-ensure").exists()
 
 
 def test_sync_ack_uses_quiet_ack_filename_without_changing_header_id(tmp_path):
@@ -1744,13 +1847,13 @@ def test_sync_ack_uses_quiet_ack_filename_without_changing_header_id(tmp_path):
     assert path.read_text().startswith(f"[CLAUDE→CODEX sync-ack id={ack_id}]")
 
 
-def test_per_agent_delivery_retires_claude_nudge_but_keeps_hermes_dual(tmp_path):
+def test_legacy_delivery_config_cannot_reenable_normal_nudges(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     agents_path = state / "agents.yaml"
     agents_path.write_text(
         agents_path.read_text().replace(
-            "  claude:\n    harness: claude-code\n",
-            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+            "  hermes:\n    harness: hermes-agent\n",
+            "  hermes:\n    harness: hermes-agent\n    delivery: dual\n",
         )
     )
     runtime_path = state / "runtime.json"
@@ -1773,21 +1876,17 @@ def test_per_agent_delivery_retires_claude_nudge_but_keeps_hermes_dual(tmp_path)
     assert claude.stdout.startswith("sent maildir-only ")
     assert hermes.returncode == 0, hermes.stderr
     calls = read_cmux_calls(trace_dir)
-    assert len([call for call in calls if call[:1] == ["send"]]) == 1
-    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
-    claude_records = [
-        record for record in read_ledger(state) if record["to"] == "claude"
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+    assert [record["lifecycle"] for record in read_ledger(state)] == [
+        "pending",
+        "pending",
     ]
-    assert [record["lifecycle"] for record in claude_records] == ["pending"]
 
 
-def test_configured_claude_instances_inherit_maildir_delivery(tmp_path):
+def test_configured_instances_use_default_maildir_delivery(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     agents_path = state / "agents.yaml"
-    text = agents_path.read_text().replace(
-        "  claude:\n    harness: claude-code\n",
-        "  claude:\n    harness: claude-code\n    delivery: maildir\n",
-    )
+    text = agents_path.read_text()
     text = text.replace(
         "    instances:\n      - id: claude\n        session_id: null\n",
         "    instances:\n      - id: claude-build\n      - id: claude-review\n",
@@ -1807,13 +1906,6 @@ def test_configured_claude_instances_inherit_maildir_delivery(tmp_path):
 
 def test_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
-    agents_path = state / "agents.yaml"
-    agents_path.write_text(
-        agents_path.read_text().replace(
-            "  claude:\n    harness: claude-code\n",
-            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
-        )
-    )
     (state / "runtime.json").unlink()
     env.update(
         {
@@ -1833,13 +1925,6 @@ def test_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_pa
 
 def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
-    agents_path = state / "agents.yaml"
-    agents_path.write_text(
-        agents_path.read_text().replace(
-            "  claude:\n    harness: claude-code\n",
-            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
-        )
-    )
     env.update(
         {
             "RT_FROM": "codex",
@@ -1868,13 +1953,6 @@ def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_p
 
 def test_maildir_best_effort_caller_probe_failure_is_silent(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
-    agents_path = state / "agents.yaml"
-    agents_path.write_text(
-        agents_path.read_text().replace(
-            "  claude:\n    harness: claude-code\n",
-            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
-        )
-    )
     env.update({"RT_FROM": "codex", "CMUX_FAKE_FAIL_IDENTIFY": "1"})
 
     proc = run_tool("rt-say", "claude", "fyi", "silent probe", cwd=project, env=env)
@@ -1886,7 +1964,7 @@ def test_maildir_best_effort_caller_probe_failure_is_silent(tmp_path):
     assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
 
 
-def test_dual_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
+def test_default_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
@@ -1907,20 +1985,15 @@ def test_dual_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path)
         }
     )
 
-    proc = run_tool("rt-say", "hermes", "fyi", "remote dual", cwd=project, env=env)
+    proc = run_tool("rt-say", "hermes", "fyi", "remote mail", cwd=project, env=env)
 
     assert proc.returncode == 0, proc.stderr
-    assert [record["from"] for record in read_ledger(state)] == [
-        "codex",
-        "codex",
-        "codex",
-    ]
+    assert [record["from"] for record in read_ledger(state)] == ["codex"]
     calls = read_cmux_calls(trace_dir)
-    assert len([call for call in calls if call[:1] == ["send"]]) == 1
-    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
 
 
-def test_dual_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
+def test_default_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
     project, state, env, _trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
@@ -1953,14 +2026,10 @@ def test_dual_sender_keeps_live_caller_authority_over_stale_environment(tmp_path
 
     assert proc.returncode == 0, proc.stderr
     assert read_ledger(state, sender="codex") == []
-    assert [record["from"] for record in read_ledger(state, sender="claude")] == [
-        "claude",
-        "claude",
-        "claude",
-    ]
+    assert [record["from"] for record in read_ledger(state, sender="claude")] == ["claude"]
 
 
-def test_dual_rt_ack_uses_unique_codex_thread_environment_without_cmux(tmp_path):
+def test_maildir_rt_ack_uses_unique_codex_thread_environment_without_cmux(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
@@ -1990,19 +2059,12 @@ def test_dual_rt_ack_uses_unique_codex_thread_environment_without_cmux(tmp_path)
     assert ack_path.is_file()
     assert ack_path.read_text().startswith(f"[CODEX→HERMES sync-ack id={ack_id}]")
     calls = read_cmux_calls(trace_dir)
-    assert len([call for call in calls if call[:1] == ["send"]]) == 1
-    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
 
 
-def test_legacy_only_explicitly_overrides_maildir_delivery(tmp_path):
+def test_explicit_legacy_failure_is_nonzero_without_publishing_mail(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
-    agents_path = state / "agents.yaml"
-    agents_path.write_text(
-        agents_path.read_text().replace(
-            "  claude:\n    harness: claude-code\n",
-            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
-        )
-    )
+    env["CMUX_FAKE_FAIL_SEND"] = "1"
 
     proc = run_tool(
         "rt-say",
@@ -2014,11 +2076,60 @@ def test_legacy_only_explicitly_overrides_maildir_delivery(tmp_path):
         env=env,
     )
 
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode != 0
+    assert proc.returncode == 3
+    assert "legacy nudge failed with exit 70" in proc.stderr
+    assert "Traceback" not in proc.stderr
     assert not (state / "inbox").exists()
     calls = read_cmux_calls(trace_dir)
     assert len([call for call in calls if call[:1] == ["send"]]) == 1
-    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 0
+
+
+def test_explicit_legacy_bad_runtime_is_exit_three_without_traceback(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    (state / "runtime.json").write_text("{not-json\n")
+
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "fyi",
+        "bad runtime",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 3
+    assert "legacy nudge failed" in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert proc.stderr.count("\n") == 1
+    assert not (state / "inbox").exists()
+
+
+def test_explicit_legacy_missing_cmux_is_exit_three_without_traceback(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    python_only = tmp_path / "python-only"
+    python_only.mkdir()
+    (python_only / "python3").symlink_to(sys.executable)
+    env.update({"PATH": str(python_only), "RT_FROM": "codex"})
+
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "fyi",
+        "missing cmux",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 3
+    assert "legacy nudge failed" in proc.stderr
+    assert "No such file or directory" in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert proc.stderr.count("\n") == 1
+    assert not (state / "inbox").exists()
 
 
 def test_startup_advisory_suggests_unique_same_workspace_project(tmp_path):
@@ -2068,7 +2179,7 @@ def test_startup_advisory_suggests_unique_same_workspace_project(tmp_path):
     registered = run_tool("rt-projects", "add", str(peer), env=env)
     assert registered.returncode == 0, registered.stderr
 
-    proc = run_executable("rt-watch-ensure", cwd=outside, env=env)
+    proc = run_executable("rt-startup-advisory", cwd=outside, env=env)
 
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.count("\n") == 1
@@ -2082,7 +2193,7 @@ def test_startup_advisory_without_cmux_environment_is_silent(tmp_path):
     outside.mkdir()
 
     proc = run_executable(
-        "rt-watch-ensure",
+        "rt-startup-advisory",
         cwd=outside,
         env={"CMUX_SURFACE_ID": "", "ROUNDTABLE_PROJECT_DIR": ""},
     )

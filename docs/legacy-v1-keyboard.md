@@ -1,7 +1,7 @@
 # Legacy v1 keyboard delivery (retired 2026-07-17)
 
 v1 delivered messages by typing into the target's terminal. It is retired:
-`rt-say` is maildir-only by config everywhere, rt-watch and its SessionStart
+normal `rt-say` is maildir-only by design, rt-watch and its SessionStart
 hook are gone. This note preserves the emergency manual path.
 
 ## Emergency manual send (last resort, human-coordinated only)
