@@ -1,12 +1,14 @@
 schema: roundtable.agents.v1
 project: ${project_dir}
 # submit: how rt-say submits to each agent by state (read by rt-say).
+# delivery: maildir avoids keyboard nudge; omitted means dual.
 # detect.screen: model-independent banner signatures used by rt-refresh to place a
 #   fresh agent (one that hasn't checkpointed yet, so has no cmux resume_binding).
 # instances: one per running session; add `match: {cwd|title}` to pin multi-instance ids.
 agents:
   claude:
     harness: claude-code
+    delivery: maildir
     instances:
       - id: claude
     submit:

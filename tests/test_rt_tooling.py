@@ -1677,3 +1677,354 @@ def test_rt_watch_ensure_does_not_use_focused_workspace_without_caller(tmp_path)
     assert "SCRIPT_DIR" not in proc.stderr
     assert "unbound variable" not in proc.stderr
     assert "no cmux caller workspace/pane" in (state / "rt-watch.log").read_text()
+
+
+def test_sync_ack_uses_quiet_ack_filename_without_changing_header_id(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    env.update(
+        {
+            "RT_FROM": "claude",
+            "CMUX_FAKE_IDENTIFY": json.dumps(
+                {
+                    "caller": {
+                        "workspace_ref": "workspace:1",
+                        "surface_ref": "surface:2",
+                    }
+                }
+            ),
+        }
+    )
+    original = "20260717T010000Z-codex-to-claude-original"
+
+    proc = run_tool("rt-ack", original, "received", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    ack_id = proc.stdout.strip().split()[-1]
+    path = state / "inbox" / "codex" / "new" / f"ack-{ack_id}.md"
+    assert path.is_file()
+    assert path.read_text().startswith(f"[CLAUDE→CODEX sync-ack id={ack_id}]")
+
+
+def test_per_agent_delivery_retires_claude_nudge_but_keeps_hermes_dual(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents_path.write_text(
+        agents_path.read_text().replace(
+            "  claude:\n    harness: claude-code\n",
+            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+        )
+    )
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    hermes_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:3",
+        "pane_ref": "pane:3",
+        "status": "idle",
+    }
+    runtime["agents"]["hermes"] = hermes_route
+    runtime["surfaces"].append(hermes_route)
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env["RT_FROM"] = "codex"
+
+    claude = run_tool("rt-say", "claude", "fyi", "quiet", cwd=project, env=env)
+    hermes = run_tool("rt-say", "hermes", "fyi", "dual", cwd=project, env=env)
+
+    assert claude.returncode == 0, claude.stderr
+    assert claude.stdout.startswith("sent maildir-only ")
+    assert hermes.returncode == 0, hermes.stderr
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+    claude_records = [
+        record for record in read_ledger(state) if record["to"] == "claude"
+    ]
+    assert [record["lifecycle"] for record in claude_records] == ["pending"]
+
+
+def test_configured_claude_instances_inherit_maildir_delivery(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    text = agents_path.read_text().replace(
+        "  claude:\n    harness: claude-code\n",
+        "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+    )
+    text = text.replace(
+        "    instances:\n      - id: claude\n        session_id: null\n",
+        "    instances:\n      - id: claude-build\n      - id: claude-review\n",
+    )
+    agents_path.write_text(text)
+    env["RT_FROM"] = "codex"
+
+    proc = run_tool(
+        "rt-say", "claude-build", "fyi", "instance quiet", cwd=project, env=env
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("sent maildir-only ")
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+
+
+def test_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents_path.write_text(
+        agents_path.read_text().replace(
+            "  claude:\n    harness: claude-code\n",
+            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+        )
+    )
+    (state / "runtime.json").unlink()
+    env.update(
+        {
+            "RT_FROM": "",
+            "CODEX_THREAD_ID": "thread-from-app-server",
+            "CMUX_FAKE_IDENTIFY": json.dumps({"caller": None}),
+        }
+    )
+
+    proc = run_tool("rt-say", "claude", "fyi", "remote turn", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("sent maildir-only ")
+    assert [record["from"] for record in read_ledger(state)] == ["codex"]
+    assert read_cmux_calls(trace_dir) == []
+
+
+def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents_path.write_text(
+        agents_path.read_text().replace(
+            "  claude:\n    harness: claude-code\n",
+            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+        )
+    )
+    env.update(
+        {
+            "RT_FROM": "codex",
+            "CODEX_THREAD_ID": "stale-codex-thread",
+            "CMUX_FAKE_IDENTIFY": json.dumps(
+                {
+                    "caller": {
+                        "workspace_ref": "workspace:1",
+                        "workspace_id": "UUID-A",
+                        "surface_ref": "surface:2",
+                    }
+                }
+            ),
+        }
+    )
+
+    proc = run_tool("rt-say", "claude", "fyi", "self send", cwd=project, env=env)
+
+    assert proc.returncode != 0
+    assert "refusing self-send from claude to claude" in proc.stderr
+    assert not (state / "inbox").exists()
+    assert read_ledger(state, sender="codex") == []
+    calls = read_cmux_calls(trace_dir)
+    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+
+
+def test_dual_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    hermes_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:3",
+        "pane_ref": "pane:3",
+        "status": "idle",
+    }
+    runtime["agents"]["hermes"] = hermes_route
+    runtime["surfaces"].append(hermes_route)
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env.update(
+        {
+            "RT_FROM": "",
+            "CODEX_THREAD_ID": "thread-from-app-server",
+            "CMUX_FAKE_IDENTIFY": json.dumps({"caller": None}),
+        }
+    )
+
+    proc = run_tool("rt-say", "hermes", "fyi", "remote dual", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [record["from"] for record in read_ledger(state)] == [
+        "codex",
+        "codex",
+        "codex",
+    ]
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+
+
+def test_dual_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
+    project, state, env, _trace_dir = say_project(tmp_path)
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    hermes_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:3",
+        "pane_ref": "pane:3",
+        "status": "idle",
+    }
+    runtime["agents"]["hermes"] = hermes_route
+    runtime["surfaces"].append(hermes_route)
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env.update(
+        {
+            "RT_FROM": "codex",
+            "CODEX_THREAD_ID": "stale-codex-thread",
+            "CMUX_FAKE_IDENTIFY": json.dumps(
+                {
+                    "caller": {
+                        "workspace_ref": "workspace:1",
+                        "workspace_id": "UUID-A",
+                        "surface_ref": "surface:2",
+                    }
+                }
+            ),
+        }
+    )
+
+    proc = run_tool("rt-say", "hermes", "fyi", "caller wins", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert read_ledger(state, sender="codex") == []
+    assert [record["from"] for record in read_ledger(state, sender="claude")] == [
+        "claude",
+        "claude",
+        "claude",
+    ]
+
+
+def test_dual_rt_ack_uses_unique_codex_thread_environment_without_cmux(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    runtime_path = state / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    hermes_route = {
+        "workspace_ref": "workspace:1",
+        "surface_ref": "surface:3",
+        "pane_ref": "pane:3",
+        "status": "idle",
+    }
+    runtime["agents"]["hermes"] = hermes_route
+    runtime["surfaces"].append(hermes_route)
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    env.update(
+        {
+            "RT_FROM": "",
+            "CODEX_THREAD_ID": "thread-from-app-server",
+            "CMUX_FAKE_IDENTIFY": json.dumps({"caller": None}),
+        }
+    )
+    original = "20260717T010000Z-hermes-to-codex-original"
+
+    proc = run_tool("rt-ack", original, "remote ack", cwd=project, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    ack_id = proc.stdout.strip().split()[-1]
+    ack_path = state / "inbox" / "hermes" / "new" / f"ack-{ack_id}.md"
+    assert ack_path.is_file()
+    assert ack_path.read_text().startswith(f"[CODEX→HERMES sync-ack id={ack_id}]")
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+
+
+def test_legacy_only_explicitly_overrides_maildir_delivery(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
+    agents_path = state / "agents.yaml"
+    agents_path.write_text(
+        agents_path.read_text().replace(
+            "  claude:\n    harness: claude-code\n",
+            "  claude:\n    harness: claude-code\n    delivery: maildir\n",
+        )
+    )
+
+    proc = run_tool(
+        "rt-say",
+        "--legacy-nudge-only",
+        "claude",
+        "fyi",
+        "manual fallback",
+        cwd=project,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (state / "inbox").exists()
+    calls = read_cmux_calls(trace_dir)
+    assert len([call for call in calls if call[:1] == ["send"]]) == 1
+    assert len([call for call in calls if call[:1] == ["send-key"]]) == 1
+
+
+def test_startup_advisory_suggests_unique_same_workspace_project(tmp_path):
+    peer = tmp_path / "peer"
+    write_project(peer)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    current_id = "current-surface-uuid"
+    active = workspace(
+        "workspace:1",
+        "project",
+        "surface:1",
+        "pane:1",
+        "Claude",
+        workspace_id="workspace-uuid",
+    )
+    surface_list = [
+        {
+            "id": current_id,
+            "ref": "surface:1",
+            "type": "terminal",
+            "requested_working_directory": str(outside),
+        },
+        {
+            "id": "peer-surface-uuid",
+            "ref": "surface:2",
+            "type": "terminal",
+            "requested_working_directory": str(peer),
+        },
+    ]
+    env = fake_cmux(
+        tmp_path,
+        tree=tree_with_workspaces(active),
+        identify={
+            "caller": {
+                "workspace_ref": "workspace:1",
+                "workspace_id": "workspace-uuid",
+                "surface_ref": "surface:1",
+                "surface_id": current_id,
+            }
+        },
+        surface_list=surface_list,
+        surface_workspace=active,
+    )
+    env.update({"CMUX_SURFACE_ID": current_id, "ROUNDTABLE_PROJECT_DIR": ""})
+
+    proc = run_executable("rt-watch-ensure", cwd=outside, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.count("\n") == 1
+    assert "cwd 不在 roundtable 项目" in proc.stdout
+    assert str(peer.resolve()) in proc.stdout
+    assert "export ROUNDTABLE_PROJECT_DIR=" in proc.stdout
+
+
+def test_startup_advisory_without_cmux_environment_is_silent(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    proc = run_executable(
+        "rt-watch-ensure",
+        cwd=outside,
+        env={"CMUX_SURFACE_ID": "", "ROUNDTABLE_PROJECT_DIR": ""},
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+    assert proc.stderr == ""

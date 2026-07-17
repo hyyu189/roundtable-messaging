@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Suggest a peer Roundtable root when a cmux agent starts elsewhere.
+
+This is advisory only: it never binds a workspace and never writes state.
+Every operational failure is intentionally a silent success because it runs
+from SessionStart hooks.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+from pathlib import Path
+
+from _rtlib import caller_cmux_context, is_project_root
+
+
+COMMAND_TIMEOUT = 0.75
+
+
+def command_json(args: list[str]) -> dict:
+    proc = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=COMMAND_TIMEOUT,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"command failed: {args[0]}")
+    value = json.loads(proc.stdout)
+    if not isinstance(value, dict):
+        raise ValueError("cmux response is not an object")
+    return value
+
+
+def project_at_or_above(value: str | None) -> Path | None:
+    if not value:
+        return None
+    try:
+        current = Path(value).expanduser().resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        if is_project_root(candidate):
+            return candidate
+    return None
+
+
+def same_workspace(caller: dict, listing: dict) -> bool:
+    caller_id = caller.get("workspace_id")
+    if caller_id:
+        return (listing.get("workspace_id") or listing.get("id")) == caller_id
+    caller_ref = caller.get("workspace_ref")
+    return bool(
+        caller_ref
+        and (listing.get("workspace_ref") or listing.get("ref")) == caller_ref
+    )
+
+
+def peer_project(caller: dict, listing: dict, surface_token: str) -> Path | None:
+    caller_surfaces = {caller.get("surface_id"), caller.get("surface_ref")}
+    if surface_token not in caller_surfaces or not same_workspace(caller, listing):
+        return None
+    roots = set()
+    for surface in listing.get("surfaces") or []:
+        if not isinstance(surface, dict) or surface.get("type") != "terminal":
+            continue
+        if surface_token in {surface.get("id"), surface.get("ref")}:
+            continue
+        binding = surface.get("resume_binding") or {}
+        cwd = (
+            binding.get("cwd") if isinstance(binding, dict) else None
+        ) or surface.get("requested_working_directory")
+        root = project_at_or_above(cwd)
+        if root is not None:
+            roots.add(root)
+    return next(iter(roots)) if len(roots) == 1 else None
+
+
+def main() -> int:
+    surface_token = os.environ.get("CMUX_SURFACE_ID", "")
+    if not surface_token:
+        return 0
+    try:
+        if project_at_or_above(str(Path.cwd())) is not None:
+            return 0
+        identify = command_json(["cmux", "identify", "--json", "--id-format", "both"])
+        caller = caller_cmux_context(identify)
+        workspace = caller.get("workspace_ref")
+        if not workspace:
+            return 0
+        listing = command_json(
+            ["cmux", "rpc", "surface.list", json.dumps({"workspace": workspace})]
+        )
+        root = peer_project(caller, listing, surface_token)
+        if root is None:
+            return 0
+        quoted = shlex.quote(str(root))
+        print(
+            "roundtable: cwd 不在 roundtable 项目; "
+            f"workspace 同伴在 {root}; cd {quoted} 或 "
+            f"export ROUNDTABLE_PROJECT_DIR={quoted}"
+        )
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,12 +2,13 @@
 # rt-watch-ensure: idempotent auto-start of rt-watch for current project.
 #
 # Called by agent SessionStart hooks. Safe to call concurrently.
-# Does nothing if not in a roundtable project, or if rt-watch already alive.
+# Outside a roundtable project it may print one advisory, but never binds/routes.
+# Inside a project it does nothing when rt-watch is already alive.
 # Starts a foreground rt-watch process in a dedicated cmux terminal surface.
 #
 # Exit codes:
 #   0  rt-watch is alive after this call (was alive or just started)
-#   0  not in a roundtable project (silent no-op; hooks shouldn't fail)
+#   0  not in a roundtable project (silent or one advisory; hooks don't fail)
 #   2  could not acquire lock (another concurrent caller is starting it)
 
 set -u
@@ -35,7 +36,10 @@ discover_project() {
     return 1
 }
 
-project="$(discover_project)" || exit 0  # silent no-op outside roundtable
+project="$(discover_project)" || {
+    "$SCRIPT_DIR/rt-startup-advisory" 2>/dev/null || true
+    exit 0
+}
 
 state_dir="$project/.roundtable"
 lock_dir="$state_dir/locks/rt-watch-ensure.lock"

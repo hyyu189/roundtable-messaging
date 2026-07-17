@@ -6,7 +6,7 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 5.0.0
+version: 5.1.0
 author: Roundtable contributors
 license: MIT
 platforms: [linux, macos]
@@ -23,7 +23,7 @@ agents restart and move.
 
 | Tool | Purpose |
 |------|---------|
-| `rt-say <agent> <kind> "body"` | Send — resolves the surface, picks the submit key, tags it, blocks self-echo. |
+| `rt-say <agent> <kind> "body"` | Send through the target's configured maildir/dual delivery mode; tags it and blocks self-echo. |
 | `rt-ack <id>[,<id>...] ["note"]` | Acknowledge received message(s). Comma-batches. |
 | `rt-inbox` | List un-ack'd inbound messages. |
 | `rt-resolve <agent>` | Print an agent's status + current surface ref. |
@@ -32,13 +32,20 @@ agents restart and move.
 Run them from a project root (a dir with `.roundtable/agents.yaml`). Outside one,
 set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT` to point at a fallback project.
 
-## Delivery v2: maildir + tripwire (dual-write period active since 2026-07-15)
+## Delivery v2: per-agent maildir + tripwire
 
-`rt-say` now writes every message to
-`<project>/.roundtable/inbox/<to>/new/<msgid>.md` **and** sends the legacy
-keyboard nudge. The same message arriving twice (nudge text + maildir file) is
-expected — dedupe by msgid. `--no-nudge` = maildir only; `--legacy-nudge-only`
-= old behavior.
+`rt-say` atomically writes each normal message to
+`<project>/.roundtable/inbox/<to>/new/<msgid>.md`. The target's `agents.yaml`
+entry selects `delivery: dual` (compatibility default: also send the legacy
+keyboard nudge) or `delivery: maildir` (never touch the keyboard); configured
+instances inherit the base agent's mode. In dual mode the same msgid may arrive
+through both paths, so dedupe by msgid. `--no-nudge` is an explicit mail-only
+override; `--legacy-nudge-only` is the emergency keyboard-only override.
+
+`sync-ack` keeps its normal header and msgid but uses
+`new/ack-<msgid>.md`, making it a quiet acknowledgement. Current rollout:
+Claude is `maildir`; Hermes and Codex remain `dual` until their separately
+coordinated cutovers.
 
 **Receiving (drain protocol)** — when woken by a tripwire or told the inbox has
 mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack` the ids
@@ -64,8 +71,8 @@ Its exit re-invokes you automatically — no keyboard, no human input. A Stop
 hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
 tripwire; follow its stderr instruction, it is self-explanatory. Hermes arms
 the same script via `terminal(background=true, notify_on_complete=true)`.
-Codex delivery currently arrives via the nudge path (its wake bridge lands in
-Phase 3).
+Codex still receives the dual-mode nudge in production. Its Phase 3 wake bridge
+is ready but must not replace the live TUI until the coordinated cutover.
 
 **Replacing a tripwire: kill by marker, NEVER by name.** Other projects run
 tripwires under the same process name; `pkill -f rt-wait-inbox` kills a
@@ -76,7 +83,14 @@ duplicates are harmless (first mail wakes both, both exit).
 
 ## Sending
 
-Standard send sequence: **refresh → resolve → send**.
+For a target configured as `delivery: maildir`, send directly with `rt-say` or
+`rt-ack`; neither a live cmux route nor a refresh is required. This is the
+normal path to Claude. In a remote Codex app-server turn, sender inference uses
+the exact/unique `CODEX_THREAD_ID`; an ambiguous multi-instance setup fails
+closed. Outside a harness, set `RT_FROM` explicitly.
+
+For `delivery: dual` (the default) or an explicit legacy nudge, use
+**refresh → resolve → send**:
 
 ```bash
 rt-refresh                    # 1. rebuild topology from live cmux
@@ -84,7 +98,7 @@ rt-resolve codex              # 2. verify target is mapped and where
 rt-say codex question "..."   # 3. send
 ```
 
-`rt-say` reads the existing topology map — it does NOT refresh internally
+On that nudge path, `rt-say` reads the existing topology map — it does NOT refresh internally
 (refreshing inside rt-say can shuffle the map between your resolve and the
 send, causing the message to go to the wrong surface). If you haven't
 refreshed recently or agents restarted, refresh first.

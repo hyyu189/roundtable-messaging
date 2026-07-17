@@ -40,8 +40,9 @@ def print_help():
     print(
         """usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] <agent-or-instance> <kind> <body...>
 
-Deliver a roundtable message. By default the message is written atomically to
-.roundtable/inbox/<to>/new/ and then sent through the legacy cmux nudge path.
+Deliver a roundtable message. Per-agent delivery comes from agents.yaml:
+delivery: dual (default) writes maildir then nudges; delivery: maildir does not
+touch the keyboard.
 
 options:
   --no-nudge           write maildir only; do not inject text or press keys
@@ -49,8 +50,8 @@ options:
   --verbose            print route and submit details
   -h, --help           show this help
 
-During the dual-write period, inbox and nudge delivery of the same message is
-expected. Receivers deduplicate using the msgid in the header and filename.
+Explicit flags override per-agent delivery. For dual-write delivery, receivers
+deduplicate using the msgid in the header and filename.
 """
     )
 
@@ -113,6 +114,63 @@ def configured_target(root, target, *, required=True, runtime=None):
     raise SystemExit(f"rt-say: unknown agent or instance: {target}")
 
 
+def configured_delivery_mode(root, target):
+    """Return the base agent's delivery mode for a configured target."""
+    doc = load_agents_doc(root, "rt-say")
+    for base, raw_config in (doc.get("agents") or {}).items():
+        base_name = str(base).lower()
+        config = raw_config if isinstance(raw_config, dict) else {}
+        instances = config.get("instances") or [{"id": base_name}]
+        instance_names = []
+        for instance in instances:
+            if isinstance(instance, str):
+                instance_names.append(instance.lower())
+            else:
+                instance_names.append(
+                    str((instance or {}).get("id") or base_name).lower()
+                )
+        if target != base_name and target not in instance_names:
+            continue
+        mode = str(config.get("delivery") or "dual").lower()
+        if mode not in {"dual", "maildir"}:
+            raise SystemExit(
+                f"rt-say: invalid delivery mode for {base_name}: {mode}; "
+                "expected dual or maildir"
+            )
+        return mode
+    # Runtime-surplus instances retain the backwards-compatible default.
+    return "dual"
+
+
+def infer_sender_from_harness_env(root):
+    """Infer a unique Codex instance for shared app-server turn shells."""
+    thread_id = os.environ.get("CODEX_THREAD_ID")
+    if not thread_id:
+        return ""
+    doc = load_agents_doc(root, "rt-say")
+    exact = []
+    candidates = []
+    for base, raw_config in (doc.get("agents") or {}).items():
+        config = raw_config if isinstance(raw_config, dict) else {}
+        if str(config.get("harness") or base).lower() != "codex":
+            continue
+        base_name = str(base).lower()
+        instances = config.get("instances") or [{"id": base_name}]
+        for instance in instances:
+            if isinstance(instance, str):
+                instance_id = instance.lower()
+                session_id = None
+            else:
+                instance_id = str((instance or {}).get("id") or base_name).lower()
+                session_id = (instance or {}).get("session_id")
+            candidates.append(instance_id)
+            if session_id == thread_id:
+                exact.append(instance_id)
+    if len(exact) == 1:
+        return exact[0]
+    return candidates[0] if len(candidates) == 1 else ""
+
+
 def validate_agent_component(value, label):
     if not AGENT_COMPONENT_RE.fullmatch(value):
         raise SystemExit(f"rt-say: invalid {label} agent component: {value}")
@@ -150,10 +208,10 @@ def ensure_inbox_gitignore():
         raise
 
 
-def publish_maildir(target, msg_id, content):
+def publish_maildir(target, msg_id, content, *, quiet_ack=False):
     """Publish one immutable maildir message via tmp -> new atomic rename."""
     validate_agent_component(target, "inbox target")
-    filename = f"{msg_id}.md"
+    filename = f"{'ack-' if quiet_ack else ''}{msg_id}.md"
     if Path(filename).name != filename or "/" in filename or "\x00" in filename:
         raise SystemExit(f"rt-say: invalid inbox message filename: {filename}")
 
@@ -205,6 +263,19 @@ def read_runtime(refresh=False):
     return runtime
 
 
+def read_existing_runtime():
+    """Best-effort read for caller authority without adding a topology dependency."""
+    try:
+        if not RUNTIME.is_file() or RUNTIME.stat().st_size == 0:
+            return None
+        runtime = json.loads(RUNTIME.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(runtime, dict) or runtime.get("project") != str(ROOT):
+        return None
+    return runtime
+
+
 def guard_route_in_runtime(runtime, route):
     runtime_workspace = runtime.get("workspace_ref")
     if route.get("workspace") != runtime_workspace:
@@ -218,15 +289,26 @@ def guard_route_in_runtime(runtime, route):
         raise SystemExit(f"rt-say: refusing route to surface not present in current project runtime: {route_surface}")
 
 
-def infer_sender(runtime):
+def infer_live_caller(runtime):
     caller_surface = ""
     try:
-        caller_surface = (run_json("cmux", "identify", "--json").get("caller") or {}).get("surface_ref") or ""
-    except subprocess.CalledProcessError:
-        pass
+        identity = run_json("cmux", "identify", "--json")
+        caller = identity.get("caller") if isinstance(identity, dict) else None
+        caller_surface = (
+            caller.get("surface_ref") if isinstance(caller, dict) else ""
+        ) or ""
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return ""
     for name, agent in (runtime.get("agents") or {}).items():
-        if agent.get("surface_ref") == caller_surface:
+        if isinstance(agent, dict) and agent.get("surface_ref") == caller_surface:
             return name
+    return ""
+
+
+def infer_sender(runtime):
+    sender = infer_live_caller(runtime)
+    if sender:
+        return sender
     # No match in current runtime — caller may be on a fresh surface.
     # Do NOT auto-refresh (same reasoning as read_runtime). Just return None
     # and let the caller set RT_FROM or run rt-refresh manually.
@@ -431,9 +513,9 @@ def main():
     if "--verbose" in args:
         verbose = True
         args = [arg for arg in args if arg != "--verbose"]
-    no_nudge = "--no-nudge" in args
+    explicit_no_nudge = "--no-nudge" in args
     legacy_nudge_only = "--legacy-nudge-only" in args
-    if no_nudge and legacy_nudge_only:
+    if explicit_no_nudge and legacy_nudge_only:
         print("rt-say: --no-nudge and --legacy-nudge-only are mutually exclusive", file=sys.stderr)
         raise SystemExit(2)
     args = [arg for arg in args if arg not in {"--no-nudge", "--legacy-nudge-only"}]
@@ -448,20 +530,46 @@ def main():
     if len(args) < 3 and not ack_mode:
         usage()
 
+    delivery_mode = configured_delivery_mode(ROOT, target)
+    configured_maildir_only = (
+        delivery_mode == "maildir"
+        and not explicit_no_nudge
+        and not legacy_nudge_only
+    )
+    no_nudge = explicit_no_nudge or configured_maildir_only
+
     STATE_DIR.mkdir(exist_ok=True)
     LOCK_DIR.mkdir(exist_ok=True)
     MSG_DIR.mkdir(exist_ok=True)
 
     validate_agent_component(target, "target")
+    explicit_sender = os.environ.get("RT_FROM", "").lower()
+    if explicit_sender:
+        validate_agent_component(explicit_sender, "sender")
     if no_nudge:
         target_agent, target_instance = configured_target(ROOT, target)
-        sender = os.environ.get("RT_FROM", "").lower()
+        if configured_maildir_only:
+            runtime = read_existing_runtime()
+            sender = (
+                (infer_live_caller(runtime) if runtime is not None else "")
+                or explicit_sender
+                or infer_sender_from_harness_env(ROOT)
+            )
+        else:
+            # Explicit --no-nudge predates per-agent delivery and intentionally
+            # treats RT_FROM as authoritative without touching cmux.
+            sender = explicit_sender or infer_sender_from_harness_env(ROOT)
         if not sender:
+            # Preserve legacy convenience for an interactive cmux caller, but
+            # only refresh after the runtime-independent paths were exhausted.
             runtime = read_runtime()
             sender = infer_sender(runtime)
     else:
         runtime = read_runtime()
-        sender = infer_sender(runtime)
+        # Preserve WP1 caller authority: a live cmux caller wins over all
+        # inherited environment. The app-server fallback is consulted only
+        # when neither the caller nor explicit RT_FROM identifies a sender.
+        sender = infer_sender(runtime) or infer_sender_from_harness_env(ROOT)
         target_agent, target_instance = configured_target(
             ROOT,
             target,
@@ -498,7 +606,7 @@ def main():
     rendered = f"{header} {body_arg}".rstrip()
 
     if not legacy_nudge_only:
-        publish_maildir(target, msg_id, mail_text)
+        publish_maildir(target, msg_id, mail_text, quiet_ack=kind == "sync-ack")
 
     if no_nudge:
         route = {"workspace": None, "surface": None, "pane": None}
@@ -520,7 +628,10 @@ def main():
         )
         append_ledger(sender, pending)
         if verbose:
-            print(f"sent id={msg_id} from={sender} to={target} delivery=maildir submit=none")
+            label = "maildir-only" if configured_maildir_only else "maildir"
+            print(f"sent id={msg_id} from={sender} to={target} delivery={label} submit=none")
+        elif configured_maildir_only:
+            print(f"sent maildir-only {msg_id}")
         else:
             print(f"sent {msg_id}")
         return

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Install, start, or probe the Roundtable-owned Codex app-server LaunchAgent."""
+
+import argparse
+import sys
+from pathlib import Path
+
+from _rtcodex import (
+    APP_SERVER_LABEL,
+    DEFAULT_SOCKET,
+    CodexRuntimeError,
+    app_server_plist,
+    ensure_daemon,
+    install_launch_agent,
+    launchd_running,
+    probe_handshake,
+    require_default_socket,
+)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="rt-codex-daemon")
+    parser.add_argument("command", choices=("install", "ensure", "status"))
+    parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    parser.add_argument("--reload", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "install":
+            require_default_socket(args.socket)
+            path = install_launch_agent(
+                APP_SERVER_LABEL, app_server_plist(args.socket), reload=args.reload
+            )
+            print(f"installed {path}")
+            return 0
+        if args.command == "ensure":
+            ensure_daemon(args.socket)
+            print(f"ready {args.socket}")
+            return 0
+        ok, detail = probe_handshake(args.socket)
+        print(
+            f"launchd={'running' if launchd_running(APP_SERVER_LABEL) else 'not-running'} "
+            f"handshake={'ok' if ok else 'failed'} socket={args.socket} detail={detail}"
+        )
+        return 0 if ok else 1
+    except CodexRuntimeError as error:
+        print(f"rt-codex-daemon: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -116,7 +116,11 @@ def read_maildir_records():
             parsed = match.groupdict()
             msg_id = parsed["msg_id"]
             to_agent = parsed["to"].lower()
-            if path.stem != msg_id or to_agent != target:
+            kind = parsed["kind"].lower()
+            valid_stems = {msg_id}
+            if kind == "sync-ack":
+                valid_stems.add(f"ack-{msg_id}")
+            if path.stem not in valid_stems or to_agent != target:
                 continue
             body = parsed.get("body") or ""
             record = {
@@ -126,7 +130,7 @@ def read_maildir_records():
                 "ts": mail_timestamp(msg_id, path),
                 "from": parsed["from"].lower(),
                 "to": to_agent,
-                "kind": parsed["kind"],
+                "kind": kind,
                 "body": body,
                 "rendered_text": content,
                 "send_text": None,

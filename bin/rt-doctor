@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Operational checks for the Roundtable Codex wake path."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from _rtcodex import (
+    DEFAULT_SOCKET,
+    RUNTIME_DIR,
+    VALIDATED_CODEX_MAX,
+    VALIDATED_CODEX_MIN,
+    WAKE_LABEL,
+    codex_version,
+    daemon_version,
+    launchd_loaded,
+    pid_is_running,
+    probe_handshake,
+    version_is_validated,
+)
+
+
+def render_version(version) -> str:
+    return ".".join(str(part) for part in version) if version else "unknown"
+
+
+class Report:
+    def __init__(self):
+        self.failed = False
+
+    def item(self, level: str, name: str, detail: str, fix: str = "none") -> None:
+        print(f"{level} {name}: {detail}")
+        print(f"  fix: {fix}")
+        if level == "FAIL":
+            self.failed = True
+
+
+def socket_check(path: Path) -> tuple[bool, str]:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        return False, str(error)
+    if stat.S_ISLNK(info.st_mode):
+        return False, "path is a symlink"
+    if not stat.S_ISSOCK(info.st_mode):
+        return False, "path is not a Unix socket"
+    if info.st_uid != os.getuid():
+        return False, f"owner uid {info.st_uid} != {os.getuid()}"
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        return False, f"unsafe mode {mode:04o}; expected no group/other access"
+    return True, f"Unix socket owner={info.st_uid} mode={mode:04o}"
+
+
+def daemon_fix(socket_path: Path) -> str:
+    if socket_path != DEFAULT_SOCKET:
+        return f"~/.roundtable/bin/rt-doctor --socket {DEFAULT_SOCKET}"
+    return "~/.roundtable/bin/rt-codex-daemon ensure"
+
+
+def socket_fix(socket_path: Path, detail: str) -> str:
+    if detail.startswith("unsafe mode"):
+        return f"chmod 600 {socket_path}"
+    if detail.startswith("owner uid"):
+        return f"chown $(id -u) {socket_path}"
+    if socket_path != DEFAULT_SOCKET:
+        return f"~/.roundtable/bin/rt-doctor --socket {DEFAULT_SOCKET}"
+    if "No such file" in detail:
+        return "~/.roundtable/bin/rt-codex-daemon ensure"
+    return f"inspect and replace unsafe socket path {socket_path}, then run rt-codex-daemon ensure"
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def bridge_check(runtime_dir: Path, max_age: float) -> tuple[bool, str]:
+    pid_path = runtime_dir / "rt-codex-wake.pid"
+    alive, detail = pid_is_running(pid_path, "rt-codex-wake")
+    if not alive:
+        return False, detail
+    heartbeat_path = runtime_dir / "rt-codex-wake-heartbeat.json"
+    try:
+        heartbeat = json.loads(heartbeat_path.read_text())
+        if not isinstance(heartbeat, dict):
+            raise ValueError("heartbeat is not a JSON object")
+    except (OSError, UnicodeError, ValueError) as error:
+        return False, f"invalid heartbeat: {error}"
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (OSError, ValueError):
+        return False, "invalid bridge pid"
+    if heartbeat.get("pid") != pid:
+        return False, f"heartbeat pid {heartbeat.get('pid')} != live pid {pid}"
+    timestamp = parse_timestamp(heartbeat.get("heartbeatAt"))
+    if timestamp is None:
+        return False, "heartbeat timestamp is missing or invalid"
+    age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    if age > max_age:
+        return False, f"heartbeat is stale ({age:.1f}s > {max_age:.1f}s)"
+    return True, f"{detail}, heartbeat age={age:.1f}s"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="rt-doctor")
+    parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    parser.add_argument("--runtime-dir", type=Path, default=RUNTIME_DIR)
+    parser.add_argument("--bridge-max-age", type=float, default=15.0)
+    args = parser.parse_args()
+    report = Report()
+
+    cli_version, cli_output = codex_version()
+    daemon, daemon_output = daemon_version(args.socket)
+    daemon_socket_matches = bool(
+        daemon
+        and Path(daemon.get("socketPath") or "").expanduser() == args.socket.expanduser()
+    )
+    if daemon and daemon.get("status") == "running" and daemon_socket_matches:
+        report.item(
+            "OK",
+            "daemon",
+            f"running app-server={daemon.get('appServerVersion')} socket={daemon.get('socketPath')}",
+        )
+    else:
+        if daemon and daemon.get("status") == "running" and not daemon_socket_matches:
+            daemon_output = (
+                f"reported socket {daemon.get('socketPath')} != requested {args.socket}"
+            )
+        report.item(
+            "FAIL",
+            "daemon",
+            daemon_output or "daemon is not running",
+            daemon_fix(args.socket),
+        )
+
+    socket_ok, socket_detail = socket_check(args.socket)
+    report.item(
+        "OK" if socket_ok else "FAIL",
+        "socket",
+        socket_detail,
+        "none"
+        if socket_ok
+        else socket_fix(args.socket, socket_detail),
+    )
+
+    rpc_ok, rpc_detail = probe_handshake(args.socket)
+    report.item(
+        "OK" if rpc_ok else "FAIL",
+        "rpc",
+        rpc_detail,
+        "none"
+        if rpc_ok
+        else daemon_fix(args.socket),
+    )
+
+    version_supported = False
+    if cli_version is None:
+        report.item(
+            "FAIL",
+            "version",
+            f"could not parse CLI version: {cli_output}",
+            "reinstall Codex CLI 0.144.3",
+        )
+    else:
+        app_server_version = (daemon or {}).get("appServerVersion")
+        if app_server_version and app_server_version != render_version(cli_version):
+            report.item(
+                "FAIL",
+                "version",
+                f"CLI {render_version(cli_version)} != app-server {app_server_version}",
+                "~/.roundtable/bin/rt-codex-daemon install --reload",
+            )
+        elif version_is_validated(cli_version):
+            version_supported = True
+            report.item(
+                "OK",
+                "version",
+                f"{render_version(cli_version)} in validated range "
+                f"[{render_version(VALIDATED_CODEX_MIN)}, {render_version(VALIDATED_CODEX_MAX)}]",
+            )
+        else:
+            report.item(
+                "WARN",
+                "version",
+                f"{render_version(cli_version)} is outside validated range; "
+                "bridge wake disabled, use legacy nudge",
+                "revalidate this Codex version or install 0.144.3",
+            )
+
+    bridge_ok, bridge_detail = bridge_check(args.runtime_dir, args.bridge_max_age)
+    if bridge_ok:
+        bridge_level = "OK"
+        bridge_fix = "none"
+    elif not version_supported:
+        bridge_level = "WARN"
+        bridge_fix = "use legacy keyboard nudge until this Codex version is revalidated"
+    elif launchd_loaded(WAKE_LABEL):
+        bridge_level = "FAIL"
+        bridge_fix = "launchctl kickstart -k gui/$(id -u)/com.roundtable.codex-wake"
+    else:
+        bridge_level = "FAIL"
+        bridge_fix = "~/.roundtable/bin/rt-codex-wake install"
+    report.item(
+        bridge_level,
+        "bridge",
+        bridge_detail,
+        bridge_fix,
+    )
+    return 1 if report.failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"FAIL doctor: {error}")
+        print("  fix: inspect ~/.roundtable/.runtime/rt-codex-wake.log.jsonl")
+        raise SystemExit(2)
