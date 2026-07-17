@@ -60,8 +60,11 @@ override; `--legacy-nudge-only` is the emergency keyboard-only override.
 
 `sync-ack` keeps its normal header and msgid but uses
 `new/ack-<msgid>.md`, making it a quiet acknowledgement. Current rollout:
-Claude is `maildir`; Hermes and Codex remain `dual` until their separately
-coordinated cutovers.
+Claude is `maildir` fleet-wide; Codex is `maildir` in projects where its
+session is bridge-bound (rt-messaging-v2 since 2026-07-17) and `dual`
+elsewhere — flip a project's codex only after its session has
+self-registered (`rt-codex-wake bind`), or its mail has no waker. Hermes
+remains `dual` until its cutover.
 
 **Receiving (drain protocol)** — when woken by a tripwire or told the inbox has
 mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack` the ids
