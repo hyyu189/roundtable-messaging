@@ -67,6 +67,13 @@ the same script via `terminal(background=true, notify_on_complete=true)`.
 Codex delivery currently arrives via the nudge path (its wake bridge lands in
 Phase 3).
 
+**Replacing a tripwire: kill by marker, NEVER by name.** Other projects run
+tripwires under the same process name; `pkill -f rt-wait-inbox` kills a
+sibling project's tripwire and silently deafens that agent (real incident,
+2026-07-17). To replace your own: read the pid from YOUR inbox's
+`.armed-<pid>` marker and `kill` exactly that pid — or just arm a new one;
+duplicates are harmless (first mail wakes both, both exit).
+
 ## Sending
 
 Standard send sequence: **refresh → resolve → send**.
