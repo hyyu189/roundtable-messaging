@@ -44,9 +44,15 @@ normal `codex`/cmux wrapper path.
 - resumes and revalidates the bound thread after every daemon reconnect;
 - starts one short pointer turn for a non-empty generation only when status is
   idle; an active thread waits for its matching `turn/completed` notification;
-- persists generation/turn state, uses bounded exponential retry for an
-  interrupted, failed, ambiguous, or completed-but-undrained wake, and leaves
-  every message in `new/` on failure;
+- persists generation/turn state, uses bounded exponential retry for a failed,
+  ambiguous, or completed-but-undrained wake, and leaves every message in
+  `new/` on failure;
+- opens a circuit after three consecutive interrupted-undrained wakes for the
+  same `(generation, thread)`, persists `NEEDS_HUMAN`, attempts one desktop
+  notification, and starts no further wake until a human explicitly recovers
+  the project;
+- preflights hook trust with `hooks/list`, and precisely associates approval,
+  user-input, and MCP-elicitation requests with the bridge-owned wake turn;
 - uses a kernel `flock` singleton (released even on SIGKILL) and locked atomic
   state writes so a live bridge cannot overwrite an external rebind;
 - revalidates the CLI/app-server version on every connection and stops issuing
@@ -60,8 +66,17 @@ elimination requires an upstream conditional wake/CAS method.
 
 App-server human-decision requests are multicast to thread subscribers and the
 first response wins. The bridge deliberately does not race the TUI with
-synthetic approval or user-input responses. If no TUI is present, the wake can
-remain active; the original mail remains pending and the event is logged.
+synthetic approval or user-input responses. A headless wake **cannot cross any
+human decision gate**: modified/untrusted hooks, command or file approvals,
+permission requests, user input, and MCP elicitation all require a live human
+surface. Hook trust is checked before starting a wake. Approval/input requests
+for an active bridge-owned turn are persisted while a live TUI has a chance to
+resolve them; if that exact turn ends `interrupted` with a request unresolved,
+the bridge atomically latches the project in `NEEDS_HUMAN`. In either gate case
+it leaves the original mail pending, records one metadata-only event, and makes
+one best-effort cmux desktop notification. It never sends a Roundtable message
+as its own alert, because that would change the inbox generation and create a
+feedback loop.
 
 ## Operations
 
@@ -75,6 +90,10 @@ remain active; the original mail remains pending and the event is logged.
 
 # remove a stale or retired binding without deleting project mail
 ~/.roundtable/bin/rt-codex-wake unbind /absolute/project/root
+
+# after attaching the target TUI and resolving a trust/approval/input gate or
+# the repeated interruption cause, explicitly re-bind to clear NEEDS_HUMAN
+~/.roundtable/bin/rt-codex-wake bind /absolute/project/root
 
 # register the root, then install/reload the registry-backed bridge
 ~/.roundtable/bin/rt-projects add /absolute/project/root
@@ -111,10 +130,11 @@ separately coordinated production cutover.
 
 The regression suite covers WebSocket-over-UDS framing and the exact initialize
 envelope, multi-mail single wake, busy completion gating, fail-closed identity
-and mail validation, failed/undrained wake backoff, daemon-resume recovery,
-crash-safe singleton locking, concurrent rebind preservation, exact version
-gating, launchd root persistence, daemon self-heal orchestration, and doctor
-failure/WARN/socket-mismatch states.
+and mail validation, failed/undrained wake backoff, the interrupted-wake circuit
+breaker, trust and human-decision gates, one-shot notification, daemon-resume
+recovery, crash-safe singleton locking, concurrent rebind preservation, exact
+version gating, launchd root persistence, daemon self-heal orchestration, and
+doctor failure/WARN/socket-mismatch states.
 
 ```bash
 cd ~/.roundtable

@@ -13,9 +13,12 @@ import math
 import os
 import re
 import signal
+import shutil
 import stat
+import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,10 +54,27 @@ WAKE_TEXT = (
     "drain inbox at {inbox}, 按 roundtable skill Delivery v2 协议处理"
 )
 STATE_SCHEMA = "roundtable.codex-wake.v1"
+INTERRUPTED_BREAKER_LIMIT = 3
+HUMAN_DECISION_METHODS = frozenset(
+    {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "item/tool/requestUserInput",
+        "mcpServer/elicitation/request",
+    }
+)
 
 
 class IdentityError(RuntimeError):
     pass
+
+
+class HumanGate(RuntimeError):
+    def __init__(self, source: str, reason: str):
+        super().__init__(reason)
+        self.source = source
+        self.reason = reason
 
 
 def utc_now() -> str:
@@ -173,6 +193,7 @@ class StateStore:
                 "project": str(project),
                 "threadId": thread_id,
                 "sessionId": thread.get("sessionId"),
+                "bindingRevision": uuid.uuid4().hex,
                 "boundAt": utc_now(),
             }
             self.data.setdefault("projects", {})[str(project)] = {
@@ -209,6 +230,7 @@ class StateStore:
                 "project": key,
                 "threadId": thread_id,
                 "sessionId": thread.get("sessionId"),
+                "bindingRevision": uuid.uuid4().hex,
                 "boundAt": now,
             }
             self.bindings[key] = binding
@@ -239,6 +261,60 @@ def log_event(event: str, **fields) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def notify_needs_human(
+    project: Path,
+    thread_id: str,
+    generation: str,
+    turn_id: str | None,
+    source: str,
+    reason: str,
+) -> None:
+    """Emit one durable event and make one best-effort desktop notification."""
+    fields = {
+        "project": str(project),
+        "thread_id": thread_id,
+        "generation": generation,
+        "turn_id": turn_id,
+        "source": source,
+        "reason": reason,
+    }
+    log_event("wake_needs_human", **fields)
+    cmux = shutil.which("cmux")
+    if not cmux:
+        log_event("needs_human_notification_failed", **fields, error="cmux unavailable")
+        return
+    try:
+        result = subprocess.run(
+            [
+                cmux,
+                "notify",
+                "--title",
+                "Roundtable Codex needs human",
+                "--subtitle",
+                project.name,
+                "--body",
+                f"{reason[:300]} Inbox remains pending.",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log_event(
+            "needs_human_notification_failed",
+            **fields,
+            error=type(error).__name__,
+        )
+        return
+    if result.returncode != 0:
+        log_event(
+            "needs_human_notification_failed",
+            **fields,
+            error=f"cmux exit {result.returncode}",
+        )
 
 
 def canonical_project(path: Path) -> Path:
@@ -490,15 +566,61 @@ class WakeBridge:
         self.resume_attempted: set[str] = set()
         self.subscribed_threads: set[str] = set()
 
+    @staticmethod
+    def _request_key(request_id) -> str:
+        try:
+            return json.dumps(request_id, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return repr(request_id)
+
     def consume_messages(self, messages: list[dict]) -> None:
         for message in messages:
+            if message.get("method") == "serverRequest/resolved":
+                params = message.get("params") or {}
+                resolved = self._resolve_human_request(
+                    params.get("requestId"), params.get("threadId")
+                )
+                if not resolved:
+                    log_event(
+                        "server_request_resolution_ignored",
+                        thread_id=params.get("threadId"),
+                    )
+                continue
             if "id" in message and "method" in message:
                 # App-server multicasts approval/user-input requests to thread
                 # subscribers and the first response wins. The human-facing
                 # TUI owns those decisions; the bridge must not race it with a
                 # synthetic approval or denial. A missing TUI therefore fails
                 # safe (mail remains in new/) and is visible in this log.
-                log_event("server_request_ignored", method=message.get("method"))
+                method = message.get("method")
+                params = message.get("params") or {}
+                thread_id = params.get("threadId")
+                turn_id = params.get("turnId")
+                auto_resolves = (
+                    method == "item/tool/requestUserInput"
+                    and params.get("autoResolutionMs") is not None
+                )
+                request_id = message.get("id")
+                valid_request_id = isinstance(request_id, (str, int)) and not isinstance(
+                    request_id, bool
+                )
+                if (
+                    method in HUMAN_DECISION_METHODS
+                    and thread_id
+                    and valid_request_id
+                    and not auto_resolves
+                    and self._record_human_request(
+                        request_id, method, thread_id, turn_id
+                    )
+                ):
+                    log_event(
+                        "human_decision_requested",
+                        method=method,
+                        thread_id=thread_id,
+                        turn_id=turn_id or "bridge-owned-wake",
+                    )
+                else:
+                    log_event("server_request_ignored", method=method)
                 continue
             if message.get("method") != "turn/completed":
                 continue
@@ -510,6 +632,118 @@ class WakeBridge:
                 self.completions.setdefault(thread_id, []).append(
                     {"turnId": turn.get("id"), "status": turn.get("status")}
                 )
+
+    def _record_human_request(
+        self,
+        request_id: str | int,
+        method: str,
+        thread_id: str,
+        turn_id: str | None,
+    ) -> bool:
+        request_key = self._request_key(request_id)
+        with self.store.transaction():
+            for project in self.projects:
+                binding = self.store.bindings.get(str(project)) or {}
+                project_state = self.store.project_state(project)
+                wake_turn_id = project_state.get("lastWakeTurnId")
+                effective_turn_id = turn_id
+                if method == "mcpServer/elicitation/request" and not effective_turn_id:
+                    effective_turn_id = wake_turn_id
+                if (
+                    binding.get("threadId") != thread_id
+                    or project_state.get("lastWakeThreadId") != thread_id
+                    or not project_state.get("lastWakeGeneration")
+                    or not wake_turn_id
+                    or effective_turn_id != wake_turn_id
+                ):
+                    continue
+                pending = project_state.get("pendingHumanRequests")
+                if not isinstance(pending, dict):
+                    pending = {}
+                    project_state["pendingHumanRequests"] = pending
+                pending[request_key] = {
+                    "method": method,
+                    "threadId": thread_id,
+                    "turnId": effective_turn_id,
+                    "generation": project_state["lastWakeGeneration"],
+                    "observedAt": utc_now(),
+                }
+                self.store.flush_transaction()
+                return True
+        return False
+
+    def _resolve_human_request(self, request_id, thread_id) -> bool:
+        if not isinstance(request_id, (str, int)) or isinstance(request_id, bool):
+            return False
+        request_key = self._request_key(request_id)
+        with self.store.transaction():
+            projects = self.store.data.setdefault("projects", {})
+            for project_state in projects.values():
+                pending = project_state.get("pendingHumanRequests")
+                if not isinstance(pending, dict):
+                    continue
+                record = pending.get(request_key)
+                if not isinstance(record, dict) or record.get("threadId") != thread_id:
+                    continue
+                pending.pop(request_key, None)
+                if not pending:
+                    project_state.pop("pendingHumanRequests", None)
+                self.store.flush_transaction()
+                return True
+        return False
+
+    @staticmethod
+    def _pending_human_methods(
+        project_state: dict, thread_id: str, turn_id: str | None, generation: str
+    ) -> list[str]:
+        if not turn_id:
+            return []
+        pending = project_state.get("pendingHumanRequests")
+        if not isinstance(pending, dict):
+            return []
+        methods = {
+            record.get("method")
+            for record in pending.values()
+            if isinstance(record, dict)
+            and record.get("threadId") == thread_id
+            and record.get("turnId") == turn_id
+            and record.get("generation") == generation
+            and isinstance(record.get("method"), str)
+        }
+        return sorted(methods)
+
+    @staticmethod
+    def _drop_pending_human_requests(
+        project_state: dict, thread_id: str, turn_id: str | None
+    ) -> bool:
+        pending = project_state.get("pendingHumanRequests")
+        if not isinstance(pending, dict):
+            if "pendingHumanRequests" in project_state:
+                project_state.pop("pendingHumanRequests", None)
+                return True
+            return False
+        doomed = [
+            request_key
+            for request_key, record in pending.items()
+            if isinstance(record, dict)
+            and record.get("threadId") == thread_id
+            and record.get("turnId") == turn_id
+        ]
+        for request_key in doomed:
+            pending.pop(request_key, None)
+        if not pending:
+            project_state.pop("pendingHumanRequests", None)
+        return bool(doomed)
+
+    def _clear_pending_human_requests(
+        self, project: Path, thread_id: str, turn_id: str | None
+    ) -> None:
+        with self.store.transaction():
+            project_state = self.store.project_state(project)
+            if self._drop_pending_human_requests(
+                project_state, thread_id, turn_id
+            ):
+                self.store.flush_transaction()
 
     def _thread_for(self, project: Path) -> dict:
         key = str(project)
@@ -561,7 +795,187 @@ class WakeBridge:
         self.resumed[str(project)] = thread
         return thread
 
-    def _wake(self, project: Path, thread_id: str, generation: str, count: int) -> bool:
+    def _hook_trust_gate(self, project: Path) -> str | None:
+        result = self.client.request("hooks/list", {"cwds": [str(project)]})
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise IdentityError("hooks/list returned invalid data")
+        matches = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            cwd_value = entry.get("cwd")
+            if not isinstance(cwd_value, str) or not cwd_value:
+                continue
+            try:
+                cwd = Path(cwd_value).expanduser().resolve()
+            except OSError:
+                continue
+            if cwd == project:
+                matches.append(entry)
+        if len(matches) != 1:
+            raise IdentityError(
+                f"hooks/list expected one entry for {project}, found {len(matches)}"
+            )
+        entry = matches[0]
+        errors = entry.get("errors")
+        if not isinstance(errors, list):
+            raise IdentityError("hooks/list entry has invalid errors")
+        if errors:
+            raise IdentityError(f"hooks/list reported {len(errors)} discovery error(s)")
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list):
+            raise IdentityError("hooks/list entry has invalid hooks")
+        blockers = []
+        for hook in hooks:
+            if not isinstance(hook, dict) or not hook.get("enabled"):
+                continue
+            trust_status = hook.get("trustStatus")
+            if trust_status not in {"managed", "trusted", "untrusted", "modified"}:
+                raise IdentityError(
+                    "hooks/list returned unknown trustStatus for enabled hook: "
+                    f"{trust_status!r}"
+                )
+            if trust_status in {"untrusted", "modified"}:
+                blockers.append(f"{hook.get('key') or 'unknown'}={trust_status}")
+        if not blockers:
+            return None
+        sample = ", ".join(blockers[:3])
+        if len(blockers) > 3:
+            sample += f", +{len(blockers) - 3} more"
+        return f"enabled Codex hook trust review required: {sample}"
+
+    def _mark_needs_human(
+        self,
+        project: Path,
+        thread_id: str,
+        generation: str,
+        turn_id: str | None,
+        pending_count: int,
+        source: str,
+        reason: str,
+        *,
+        expected_binding_revision,
+        state_updates: dict | None = None,
+    ) -> ProjectResult:
+        now = utc_now()
+        with self.store.transaction():
+            current_binding = self.store.bindings.get(str(project)) or {}
+            if (
+                current_binding.get("threadId") != thread_id
+                or current_binding.get("bindingRevision")
+                != expected_binding_revision
+            ):
+                return ProjectResult(False, "binding changed before needs-human latch")
+            project_state = self.store.project_state(project)
+            existing = project_state.get("needsHuman")
+            if project_state.get("phase") == "NEEDS_HUMAN" and isinstance(
+                existing, dict
+            ):
+                return ProjectResult(
+                    False, f"needs human: {existing.get('reason') or 'manual recovery required'}"
+                )
+            if state_updates:
+                project_state.update(state_updates)
+            self._drop_pending_human_requests(project_state, thread_id, turn_id)
+            project_state.update(
+                {
+                    "phase": "NEEDS_HUMAN",
+                    "pendingCount": pending_count,
+                    "retryAt": 0,
+                    "lastError": reason,
+                    "needsHuman": {
+                        "generation": generation,
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "source": source,
+                        "reason": reason,
+                        "detectedAt": now,
+                        "notificationAttemptedAt": now,
+                    },
+                }
+            )
+            self.store.flush_transaction()
+        notify_needs_human(
+            project,
+            thread_id,
+            generation,
+            turn_id,
+            source,
+            reason,
+        )
+        return ProjectResult(False, f"needs human: {reason}")
+
+    def _latch_pending_human_if_any(
+        self,
+        project: Path,
+        thread_id: str,
+        generation: str,
+        turn_id: str | None,
+        pending_count: int,
+        *,
+        expected_binding_revision,
+    ) -> ProjectResult | None:
+        now = utc_now()
+        with self.store.transaction():
+            current_binding = self.store.bindings.get(str(project)) or {}
+            if (
+                current_binding.get("threadId") != thread_id
+                or current_binding.get("bindingRevision")
+                != expected_binding_revision
+            ):
+                return ProjectResult(False, "binding changed before needs-human latch")
+            project_state = self.store.project_state(project)
+            if (
+                project_state.get("lastWakeGeneration") != generation
+                or project_state.get("lastWakeThreadId") != thread_id
+                or project_state.get("lastWakeTurnId") != turn_id
+            ):
+                return ProjectResult(False, "wake state changed before needs-human latch")
+            methods = self._pending_human_methods(
+                project_state, thread_id, turn_id, generation
+            )
+            if not methods:
+                return None
+            reason = "wake turn requires human decision: " + ",".join(methods)
+            self._drop_pending_human_requests(project_state, thread_id, turn_id)
+            project_state.update(
+                {
+                    "phase": "NEEDS_HUMAN",
+                    "pendingCount": pending_count,
+                    "retryAt": 0,
+                    "lastError": reason,
+                    "needsHuman": {
+                        "generation": generation,
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "source": "server_request",
+                        "reason": reason,
+                        "detectedAt": now,
+                        "notificationAttemptedAt": now,
+                    },
+                }
+            )
+            self.store.flush_transaction()
+        notify_needs_human(
+            project,
+            thread_id,
+            generation,
+            turn_id,
+            "server_request",
+            reason,
+        )
+        return ProjectResult(False, f"needs human: {reason}")
+
+    def _wake(
+        self,
+        project: Path,
+        thread_id: str,
+        generation: str,
+        count: int,
+        *,
+        expected_binding_revision,
+    ) -> bool:
         # The API lacks an atomic only-if-idle primitive, so status can still
         # change between read and turn/start. Binding selection is stricter:
         # the state lock serializes bind() against the accepted wake.
@@ -580,13 +994,19 @@ class WakeBridge:
             return False
         if status_type(thread) != "idle":
             raise IdentityError(f"thread became {status_type(thread)} before wake")
+        trust_reason = self._hook_trust_gate(project)
+        if trust_reason:
+            raise HumanGate("hook_trust", trust_reason)
         inbox = project / ".roundtable" / "inbox" / "codex" / "new"
         with self.store.transaction():
             current_binding = self.store.bindings.get(str(project)) or {}
-            if current_binding.get("threadId") != thread_id:
+            if (
+                current_binding.get("threadId") != thread_id
+                or current_binding.get("bindingRevision")
+                != expected_binding_revision
+            ):
                 raise IdentityError(
-                    "binding changed before wake: "
-                    f"{thread_id} -> {current_binding.get('threadId')}"
+                    "binding changed before wake"
                 )
             project_state = self.store.project_state(project)
             project_state.update(
@@ -616,6 +1036,7 @@ class WakeBridge:
                     "lastWakeAt": utc_now(),
                     "lastWakeTurnId": wake_turn_id,
                     "lastWakeThreadId": thread_id,
+                    "lastWakeBindingRevision": expected_binding_revision,
                     "pendingCount": count,
                     "retryAt": 0,
                     "lastError": None,
@@ -658,19 +1079,34 @@ class WakeBridge:
         return {"turnId": turn_id, "status": "unknown-after-resume"}
 
     def _record_project_error(
-        self, project: Path, pending_count: int, error: Exception
+        self,
+        project: Path,
+        pending_count: int,
+        error: Exception,
+        *,
+        expected_binding: tuple[str, object] | None = None,
     ) -> ProjectResult:
-        self.store.reload()
-        project_state = self.store.project_state(project)
-        project_state.update(
-            {
-                "phase": "BACKOFF" if isinstance(error, RpcError) else "IDENTITY_ERROR",
-                "retryAt": time.time() + 30,
-                "lastError": str(error),
-                "pendingCount": pending_count,
-            }
-        )
-        self.store.save()
+        with self.store.transaction():
+            if expected_binding is not None:
+                expected_thread_id, expected_revision = expected_binding
+                current_binding = self.store.bindings.get(str(project)) or {}
+                if (
+                    current_binding.get("threadId") != expected_thread_id
+                    or current_binding.get("bindingRevision") != expected_revision
+                ):
+                    return ProjectResult(False, "binding changed before error record")
+            project_state = self.store.project_state(project)
+            project_state.update(
+                {
+                    "phase": (
+                        "BACKOFF" if isinstance(error, RpcError) else "IDENTITY_ERROR"
+                    ),
+                    "retryAt": time.time() + 30,
+                    "lastError": str(error),
+                    "pendingCount": pending_count,
+                }
+            )
+            self.store.flush_transaction()
         log_event("project_error", project=str(project), error=str(error))
         return ProjectResult(False, str(error))
 
@@ -692,6 +1128,16 @@ class WakeBridge:
                 project_state["phase"] = "EMPTY"
                 self.store.save()
             return ProjectResult(True, "empty")
+        if project_state.get("phase") == "NEEDS_HUMAN":
+            needs_human = project_state.get("needsHuman")
+            reason = (
+                needs_human.get("reason")
+                if isinstance(needs_human, dict)
+                else project_state.get("lastError")
+            )
+            return ProjectResult(
+                False, f"needs human: {reason or 'manual recovery required'}"
+            )
 
         retry_at = safe_timestamp(project_state.get("retryAt"))
         backing_off = time.time() < retry_at
@@ -713,12 +1159,16 @@ class WakeBridge:
         except (IdentityError, RpcError) as error:
             return self._record_project_error(project, len(ids), error)
         project_state = self.store.project_state(project)
+        binding = self.store.bindings.get(str(project)) or {}
+        binding_revision = binding.get("bindingRevision")
 
         if backing_off:
             return ProjectResult(False, "backoff")
-        if project_state.get("lastWakeGeneration") == generation:
+        wake_generation = project_state.get("lastWakeGeneration")
+        if isinstance(wake_generation, str) and wake_generation:
             wake_turn_id = project_state.get("lastWakeTurnId")
             wake_thread_id = project_state.get("lastWakeThreadId") or thread_id
+            wake_binding_revision = project_state.get("lastWakeBindingRevision")
             if wake_thread_id != thread_id:
                 terminal = {"turnId": wake_turn_id, "status": "binding-changed"}
             else:
@@ -733,9 +1183,82 @@ class WakeBridge:
                             else {"turnId": None, "status": "missing-turn-id"}
                         )
                 except (IdentityError, RpcError) as error:
-                    return self._record_project_error(project, len(ids), error)
+                    return self._record_project_error(
+                        project,
+                        len(ids),
+                        error,
+                        expected_binding=(thread_id, wake_binding_revision),
+                    )
             if terminal is None:
                 return ProjectResult(True, "generation already woken")
+            terminal_status = terminal.get("status")
+            if terminal_status == "interrupted":
+                human_result = self._latch_pending_human_if_any(
+                    project,
+                    thread_id,
+                    wake_generation,
+                    wake_turn_id,
+                    len(ids),
+                    expected_binding_revision=wake_binding_revision,
+                )
+                if human_result is not None:
+                    return human_result
+            self._clear_pending_human_requests(project, thread_id, wake_turn_id)
+            project_state = self.store.project_state(project)
+            if terminal_status == "interrupted":
+                try:
+                    trust_reason = self._hook_trust_gate(project)
+                except (IdentityError, RpcError) as error:
+                    return self._record_project_error(
+                        project,
+                        len(ids),
+                        error,
+                        expected_binding=(thread_id, wake_binding_revision),
+                    )
+                if trust_reason:
+                    return self._mark_needs_human(
+                        project,
+                        thread_id,
+                        wake_generation,
+                        wake_turn_id,
+                        len(ids),
+                        "hook_trust",
+                        trust_reason,
+                        expected_binding_revision=wake_binding_revision,
+                    )
+                breaker = project_state.get("breaker")
+                if not isinstance(breaker, dict):
+                    breaker = {}
+                same_pair = (
+                    breaker.get("generation") == wake_generation
+                    and breaker.get("threadId") == thread_id
+                )
+                interrupted_count = (
+                    safe_counter(breaker.get("interruptedUndrainedCount")) + 1
+                    if same_pair
+                    else 1
+                )
+                breaker_state = {
+                    "generation": wake_generation,
+                    "threadId": thread_id,
+                    "interruptedUndrainedCount": interrupted_count,
+                }
+                project_state["breaker"] = breaker_state
+                if interrupted_count >= INTERRUPTED_BREAKER_LIMIT:
+                    return self._mark_needs_human(
+                        project,
+                        thread_id,
+                        wake_generation,
+                        wake_turn_id,
+                        len(ids),
+                        "interrupted_breaker",
+                        f"{interrupted_count} consecutive interrupted wake turns "
+                        "left the same inbox generation undrained",
+                        expected_binding_revision=wake_binding_revision,
+                        state_updates={"breaker": breaker_state},
+                    )
+            else:
+                project_state.pop("breaker", None)
             retry_count = safe_counter(project_state.get("retryCount")) + 1
             delay = min(1800, 30 * (2 ** min(retry_count - 1, 6)))
             project_state.update(
@@ -752,6 +1275,7 @@ class WakeBridge:
             project_state.pop("lastWakeGeneration", None)
             project_state.pop("lastWakeTurnId", None)
             project_state.pop("lastWakeThreadId", None)
+            project_state.pop("lastWakeBindingRevision", None)
             self.store.save()
             log_event(
                 "wake_undrained",
@@ -790,10 +1314,32 @@ class WakeBridge:
                 return ProjectResult(True, "idle observed; waiting for matching turn/completed")
             self.completed_threads.discard(thread_id)
             self.active_observed.discard(thread_id)
-            started = self._wake(project, thread_id, generation, len(ids))
+            started = self._wake(
+                project,
+                thread_id,
+                generation,
+                len(ids),
+                expected_binding_revision=binding_revision,
+            )
             return ProjectResult(True, "wake started" if started else "became busy before wake")
+        except HumanGate as gate:
+            return self._mark_needs_human(
+                project,
+                thread_id,
+                generation,
+                None,
+                len(ids),
+                gate.source,
+                gate.reason,
+                expected_binding_revision=binding_revision,
+            )
         except (IdentityError, RpcError) as error:
-            return self._record_project_error(project, len(ids), error)
+            return self._record_project_error(
+                project,
+                len(ids),
+                error,
+                expected_binding=(thread_id, binding_revision),
+            )
 
     def step(self, messages: list[dict] | None = None) -> list[ProjectResult]:
         self.store.reload()

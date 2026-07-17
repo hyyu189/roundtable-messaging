@@ -120,6 +120,17 @@ class FakeClient:
             return {"data": [self.thread["id"]]}
         if method in {"thread/read", "thread/resume"}:
             return {"thread": dict(self.thread)}
+        if method == "hooks/list":
+            return {
+                "data": [
+                    {
+                        "cwd": self.thread["cwd"],
+                        "hooks": [],
+                        "warnings": [],
+                        "errors": [],
+                    }
+                ]
+            }
         if method == "turn/start":
             self.turn_count += 1
             return {"turn": {"id": f"wake-{self.turn_count}"}}

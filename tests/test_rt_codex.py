@@ -124,6 +124,17 @@ class FakeClient:
             return {"thread": dict(self.value)}
         if method == "thread/turns/list":
             return {"data": list(self.value.get("turns") or [])}
+        if method == "hooks/list":
+            return {
+                "data": [
+                    {
+                        "cwd": self.value["cwd"],
+                        "hooks": [],
+                        "warnings": [],
+                        "errors": [],
+                    }
+                ]
+            }
         if method == "turn/start":
             self.turn_count += 1
             return {"turn": {"id": f"turn-{self.turn_count}"}}
@@ -224,6 +235,600 @@ def test_failed_wake_turn_keeps_mail_and_retries_with_backoff(tmp_path):
     store.save()
     assert bridge.step()[0].detail == "wake started"
     assert client.turn_count == 2
+
+
+def test_three_interrupted_undrained_wakes_latch_needs_human(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041600Z-claude-to-codex-1")
+    client = FakeClient(thread(project))
+    state_path = tmp_path / "state.json"
+    store = wake.StateStore(state_path)
+    notices = []
+    monkeypatch.setattr(
+        wake,
+        "notify_needs_human",
+        lambda *args: notices.append(args),
+    )
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+
+    assert bridge.step()[0].detail == "wake started"
+    for attempt in range(1, wake.INTERRUPTED_BREAKER_LIMIT + 1):
+        interrupted = {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": f"turn-{attempt}", "status": "interrupted"},
+            },
+        }
+        result = bridge.step([interrupted])[0]
+        if attempt < wake.INTERRUPTED_BREAKER_LIMIT:
+            assert "retry in" in result.detail
+            store.project_state(project)["retryAt"] = 0
+            store.save()
+            assert bridge.step()[0].detail == "wake started"
+        else:
+            assert not result.ok and "needs human" in result.detail
+
+    assert client.turn_count == wake.INTERRUPTED_BREAKER_LIMIT
+    persisted = wake.StateStore(state_path).project_state(project)
+    assert persisted["phase"] == "NEEDS_HUMAN"
+    assert persisted["breaker"]["interruptedUndrainedCount"] == 3
+    assert persisted["needsHuman"]["source"] == "interrupted_breaker"
+    assert len(notices) == 1
+
+    add_mail(project, "20260716T041601Z-claude-to-codex-2")
+    restarted = wake.WakeBridge(client, [project], wake.StateStore(state_path))
+    assert "needs human" in restarted.step()[0].detail
+    assert client.turn_count == wake.INTERRUPTED_BREAKER_LIMIT
+    assert len(notices) == 1
+
+    wake.StateStore(state_path).bind(project, thread(project))
+    recovered = wake.WakeBridge(client, [project], wake.StateStore(state_path))
+    assert recovered.step()[0].detail == "wake started"
+    assert client.turn_count == wake.INTERRUPTED_BREAKER_LIMIT + 1
+
+
+def test_non_interrupted_terminal_resets_interrupted_breaker(tmp_path):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041610Z-claude-to-codex-1")
+    client = FakeClient(thread(project))
+    store = wake.StateStore(tmp_path / "state.json")
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+
+    assert bridge.step()[0].detail == "wake started"
+    first = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "interrupted"},
+        },
+    }
+    assert "retry in" in bridge.step([first])[0].detail
+    assert store.project_state(project)["breaker"]["interruptedUndrainedCount"] == 1
+    store.project_state(project)["retryAt"] = 0
+    store.save()
+    assert bridge.step()[0].detail == "wake started"
+
+    failed = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-2", "status": "failed"},
+        },
+    }
+    assert "retry in" in bridge.step([failed])[0].detail
+    assert "breaker" not in store.project_state(project)
+
+
+@pytest.mark.parametrize(
+    ("trust_status", "enabled", "blocked"),
+    [
+        ("untrusted", True, True),
+        ("modified", True, True),
+        ("trusted", True, False),
+        ("managed", True, False),
+        ("untrusted", False, False),
+    ],
+)
+def test_hook_trust_preflight_blocks_only_enabled_review_gates(
+    tmp_path, monkeypatch, trust_status, enabled, blocked
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041620Z-claude-to-codex-1")
+
+    class TrustClient(FakeClient):
+        def request(self, method, params):
+            if method == "hooks/list":
+                self.calls.append((method, params))
+                return {
+                    "data": [
+                        {
+                            "cwd": str(project),
+                            "hooks": [
+                                {
+                                    "key": "test:session_start:0:0",
+                                    "enabled": enabled,
+                                    "trustStatus": trust_status,
+                                }
+                            ],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
+            return super().request(method, params)
+
+    client = TrustClient(thread(project))
+    notices = []
+    monkeypatch.setattr(
+        wake,
+        "notify_needs_human",
+        lambda *args: notices.append(args),
+    )
+    bridge = wake.WakeBridge(
+        client,
+        [project],
+        wake.StateStore(tmp_path / "state.json"),
+        auto_discover=True,
+    )
+
+    result = bridge.step()[0]
+
+    assert ("needs human" in result.detail) is blocked
+    assert client.turn_count == (0 if blocked else 1)
+    assert len(notices) == (1 if blocked else 0)
+
+
+def test_malformed_hook_trust_response_fails_closed(tmp_path):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041625Z-claude-to-codex-1")
+
+    class MalformedHooksClient(FakeClient):
+        def request(self, method, params):
+            if method == "hooks/list":
+                self.calls.append((method, params))
+                return {"data": []}
+            return super().request(method, params)
+
+    client = MalformedHooksClient(thread(project))
+    bridge = wake.WakeBridge(
+        client,
+        [project],
+        wake.StateStore(tmp_path / "state.json"),
+        auto_discover=True,
+    )
+
+    result = bridge.step()[0]
+
+    assert not result.ok and "hooks/list expected one entry" in result.detail
+    assert client.turn_count == 0
+
+
+def test_unknown_enabled_hook_trust_status_fails_closed(tmp_path):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041627Z-claude-to-codex-1")
+
+    class UnknownTrustClient(FakeClient):
+        def request(self, method, params):
+            if method == "hooks/list":
+                self.calls.append((method, params))
+                return {
+                    "data": [
+                        {
+                            "cwd": str(project),
+                            "hooks": [
+                                {
+                                    "key": "test:session_start:0:0",
+                                    "enabled": True,
+                                    "trustStatus": "future-status",
+                                }
+                            ],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
+            return super().request(method, params)
+
+    client = UnknownTrustClient(thread(project))
+    result = wake.WakeBridge(
+        client,
+        [project],
+        wake.StateStore(tmp_path / "state.json"),
+        auto_discover=True,
+    ).step()[0]
+
+    assert not result.ok and "unknown trustStatus" in result.detail
+    assert client.turn_count == 0
+
+
+def test_same_thread_rebind_during_human_gate_does_not_resurrect_latch(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041628Z-claude-to-codex-1")
+    state_path = tmp_path / "state.json"
+    store = wake.StateStore(state_path)
+    store.bind(project, thread(project))
+    old_revision = store.bindings[str(project)]["bindingRevision"]
+    external = wake.StateStore(state_path)
+    notices = []
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *args: notices.append(args))
+
+    class RebindingTrustClient(FakeClient):
+        def request(self, method, params):
+            if method == "hooks/list":
+                self.calls.append((method, params))
+                external.bind(project, thread(project))
+                return {
+                    "data": [
+                        {
+                            "cwd": str(project),
+                            "hooks": [
+                                {
+                                    "key": "test:session_start:0:0",
+                                    "enabled": True,
+                                    "trustStatus": "untrusted",
+                                }
+                            ],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
+            return super().request(method, params)
+
+    client = RebindingTrustClient(thread(project))
+    result = wake.WakeBridge(client, [project], store).step()[0]
+
+    persisted = wake.StateStore(state_path)
+    assert result.detail == "binding changed before needs-human latch"
+    assert persisted.bindings[str(project)]["threadId"] == "thread-1"
+    assert persisted.bindings[str(project)]["bindingRevision"] != old_revision
+    assert persisted.project_state(project)["phase"] == "EMPTY"
+    assert "needsHuman" not in persisted.project_state(project)
+    assert notices == []
+    assert client.turn_count == 0
+
+
+def test_human_request_waits_while_active_then_resolution_clears_marker(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041630Z-claude-to-codex-1")
+    live = thread(project)
+    client = FakeClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    notices = []
+    monkeypatch.setattr(
+        wake,
+        "notify_needs_human",
+        lambda *args: notices.append(args),
+    )
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["status"] = {"type": "active", "activeFlags": ["waitingOnApproval"]}
+    live["turns"] = [{"id": "turn-1", "status": "inProgress"}]
+    approval = {
+        "id": "approval-1",
+        "method": "item/commandExecution/requestApproval",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    }
+
+    result = bridge.step([approval])[0]
+
+    assert result.ok and result.detail == "generation already woken"
+    assert store.project_state(project)["phase"] == "WAKE_ACTIVE"
+    assert len(store.project_state(project)["pendingHumanRequests"]) == 1
+    assert client.turn_count == 1
+    assert notices == []
+
+    resolved = {
+        "method": "serverRequest/resolved",
+        "params": {"requestId": "approval-1", "threadId": "thread-1"},
+    }
+    assert bridge.step([resolved])[0].detail == "generation already woken"
+    assert "pendingHumanRequests" not in store.project_state(project)
+
+    live["status"] = {"type": "idle"}
+    live["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+    terminal = bridge.step()[0]
+    assert "retry in" in terminal.detail
+    assert "needsHuman" not in store.project_state(project)
+    assert notices == []
+
+
+def test_persisted_human_request_survives_reconnect_and_interrupted_latches(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041635Z-claude-to-codex-1")
+    live = thread(project)
+    first_client = FakeClient(live)
+    state_path = tmp_path / "state.json"
+    store = wake.StateStore(state_path)
+    notices = []
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *args: notices.append(args))
+    first_bridge = wake.WakeBridge(
+        first_client, [project], store, auto_discover=True
+    )
+    assert first_bridge.step()[0].detail == "wake started"
+    live["status"] = {"type": "active"}
+    approval = {
+        "id": "approval-1",
+        "method": "item/fileChange/requestApproval",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    }
+    assert first_bridge.step([approval])[0].detail == "generation already woken"
+
+    recovered = thread(project)
+    recovered["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+    second_client = FakeClient(recovered)
+    result = wake.WakeBridge(
+        second_client, [project], wake.StateStore(state_path)
+    ).step()[0]
+
+    assert not result.ok and "needs human" in result.detail
+    persisted = wake.StateStore(state_path).project_state(project)
+    assert persisted["needsHuman"]["source"] == "server_request"
+    assert "pendingHumanRequests" not in persisted
+    assert first_client.turn_count == 1
+    assert second_client.turn_count == 0
+    assert len(notices) == 1
+
+
+def test_generation_drift_reconciles_old_human_gate_before_new_wake(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041636Z-claude-to-codex-1")
+    live = thread(project)
+    first_client = FakeClient(live)
+    state_path = tmp_path / "state.json"
+    store = wake.StateStore(state_path)
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *_args: None)
+    first_bridge = wake.WakeBridge(
+        first_client, [project], store, auto_discover=True
+    )
+    assert first_bridge.step()[0].detail == "wake started"
+    old_generation = store.project_state(project)["lastWakeGeneration"]
+    live["status"] = {"type": "active"}
+    request = {
+        "id": "approval-old-generation",
+        "method": "item/permissions/requestApproval",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    }
+    assert first_bridge.step([request])[0].detail == "generation already woken"
+    add_mail(project, "20260716T041637Z-claude-to-codex-2")
+    new_generation, _ids = wake.pending_generation(project)
+    assert new_generation != old_generation
+
+    recovered = thread(project)
+    recovered["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+    second_client = FakeClient(recovered)
+    result = wake.WakeBridge(
+        second_client, [project], wake.StateStore(state_path)
+    ).step()[0]
+
+    assert "needs human" in result.detail
+    persisted = wake.StateStore(state_path).project_state(project)
+    assert persisted["needsHuman"]["generation"] == old_generation
+    assert first_client.turn_count == 1
+    assert second_client.turn_count == 0
+
+
+def test_resolved_wrong_or_nonhuman_server_requests_do_not_latch(tmp_path):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041640Z-claude-to-codex-1")
+    client = FakeClient(thread(project))
+    store = wake.StateStore(tmp_path / "state.json")
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    messages = [
+        {
+            "id": "wrong-thread",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "other", "turnId": "turn-1"},
+        },
+        {
+            "id": "client-tool",
+            "method": "item/tool/call",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        },
+        {
+            "id": "resolved",
+            "method": "item/permissions/requestApproval",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        },
+        {
+            "method": "serverRequest/resolved",
+            "params": {"requestId": "resolved", "threadId": "thread-1"},
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "interrupted"},
+            },
+        },
+    ]
+
+    result = bridge.step(messages)[0]
+
+    assert "retry in" in result.detail
+    assert store.project_state(project)["phase"] == "BACKOFF"
+    assert "needsHuman" not in store.project_state(project)
+
+
+def test_active_human_flags_alone_do_not_latch(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041650Z-claude-to-codex-1")
+    live = thread(project)
+    client = FakeClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *_args: None)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["status"] = {
+        "type": "active",
+        "activeFlags": ["waitingOnApproval"],
+    }
+    live["turns"] = [{"id": "turn-1", "status": "inProgress"}]
+
+    result = bridge.step()[0]
+
+    assert result.ok and result.detail == "generation already woken"
+    assert "needsHuman" not in store.project_state(project)
+    assert client.turn_count == 1
+
+
+def test_auto_resolving_user_input_is_not_a_human_gate(tmp_path):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041655Z-claude-to-codex-1")
+    live = thread(project)
+    client = FakeClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["status"] = {"type": "active", "activeFlags": ["waitingOnUserInput"]}
+    request = {
+        "id": "input-1",
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "autoResolutionMs": 60000,
+        },
+    }
+
+    result = bridge.step([request])[0]
+
+    assert result.detail == "generation already woken"
+    assert "pendingHumanRequests" not in store.project_state(project)
+    assert "needsHuman" not in store.project_state(project)
+
+
+def test_partial_resolution_leaves_exact_human_gate_pending(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041656Z-claude-to-codex-1")
+    live = thread(project)
+    client = FakeClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *_args: None)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["status"] = {"type": "active"}
+    requests = [
+        {
+            "id": "approval-1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        },
+        {
+            "id": "approval-2",
+            "method": "item/fileChange/requestApproval",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        },
+    ]
+    assert bridge.step(requests)[0].detail == "generation already woken"
+    assert len(store.project_state(project)["pendingHumanRequests"]) == 2
+
+    wrong_resolution = {
+        "method": "serverRequest/resolved",
+        "params": {"requestId": "approval-1", "threadId": "other"},
+    }
+    assert bridge.step([wrong_resolution])[0].detail == "generation already woken"
+    assert len(store.project_state(project)["pendingHumanRequests"]) == 2
+    exact_resolution = {
+        "method": "serverRequest/resolved",
+        "params": {"requestId": "approval-1", "threadId": "thread-1"},
+    }
+    assert bridge.step([exact_resolution])[0].detail == "generation already woken"
+    assert len(store.project_state(project)["pendingHumanRequests"]) == 1
+
+    live["status"] = {"type": "idle"}
+    live["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+    result = bridge.step()[0]
+
+    assert "needs human" in result.detail
+    reason = store.project_state(project)["needsHuman"]["reason"]
+    assert "item/fileChange/requestApproval" in reason
+    assert "item/commandExecution/requestApproval" not in reason
+
+
+def test_nullable_mcp_elicitation_is_tied_to_bridge_wake_turn(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041657Z-claude-to-codex-1")
+    live = thread(project)
+    client = FakeClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *_args: None)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["status"] = {"type": "active"}
+    elicitation = {
+        "id": 7,
+        "method": "mcpServer/elicitation/request",
+        "params": {"threadId": "thread-1", "turnId": None},
+    }
+
+    assert bridge.step([elicitation])[0].detail == "generation already woken"
+    pending = next(
+        iter(store.project_state(project)["pendingHumanRequests"].values())
+    )
+    assert pending["turnId"] == "turn-1"
+    live["status"] = {"type": "idle"}
+    live["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+    assert "needs human" in bridge.step()[0].detail
+    assert store.project_state(project)["needsHuman"]["source"] == "server_request"
+
+
+def test_interrupted_wake_rechecks_hook_trust_before_retry(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    add_mail(project, "20260716T041658Z-claude-to-codex-1")
+
+    class ChangingTrustClient(FakeClient):
+        trust_checks = 0
+
+        def request(self, method, params):
+            if method == "hooks/list":
+                self.calls.append((method, params))
+                self.trust_checks += 1
+                return {
+                    "data": [
+                        {
+                            "cwd": str(project),
+                            "hooks": [
+                                {
+                                    "key": "test:session_start:0:0",
+                                    "enabled": True,
+                                    "trustStatus": (
+                                        "trusted" if self.trust_checks == 1 else "modified"
+                                    ),
+                                }
+                            ],
+                            "warnings": [],
+                            "errors": [],
+                        }
+                    ]
+                }
+            return super().request(method, params)
+
+    live = thread(project)
+    client = ChangingTrustClient(live)
+    store = wake.StateStore(tmp_path / "state.json")
+    monkeypatch.setattr(wake, "notify_needs_human", lambda *_args: None)
+    bridge = wake.WakeBridge(client, [project], store, auto_discover=True)
+    assert bridge.step()[0].detail == "wake started"
+    live["turns"] = [{"id": "turn-1", "status": "interrupted"}]
+
+    result = bridge.step()[0]
+
+    assert "needs human" in result.detail
+    assert store.project_state(project)["needsHuman"]["source"] == "hook_trust"
+    assert "breaker" not in store.project_state(project)
 
 
 def test_daemon_reconnect_resumes_before_retrying_undrained_wake(tmp_path):
@@ -935,9 +1540,16 @@ def test_rebind_before_locked_start_prevents_old_thread_wake(tmp_path):
 
     client = RebindingClient(thread(project, thread_id="thread-old"))
     bridge = wake.WakeBridge(client, [project], store)
+    revision = store.bindings[str(project)]["bindingRevision"]
 
     with pytest.raises(wake.IdentityError, match="binding changed before wake"):
-        bridge._wake(project, "thread-old", "generation", 1)
+        bridge._wake(
+            project,
+            "thread-old",
+            "generation",
+            1,
+            expected_binding_revision=revision,
+        )
 
     assert not any(method == "turn/start" for method, _params in client.calls)
     assert wake.StateStore(state_path).bindings[str(project)]["threadId"] == "thread-new"
@@ -1005,8 +1617,15 @@ def test_rebind_during_start_waits_then_resets_wake_state(tmp_path):
 
     client = ConcurrentRebindClient(thread(project, thread_id="thread-old"))
     bridge = wake.WakeBridge(client, [project], store)
+    revision = store.bindings[str(project)]["bindingRevision"]
 
-    assert bridge._wake(project, "thread-old", "generation", 1)
+    assert bridge._wake(
+        project,
+        "thread-old",
+        "generation",
+        1,
+        expected_binding_revision=revision,
+    )
     client.worker.join(2)
 
     assert client.finished.is_set()
@@ -1141,6 +1760,44 @@ def test_doctor_failure_matrix_and_install_fix(monkeypatch, capsys):
     assert "OK version:" in output
     assert "FAIL bridge:" in output
     assert "~/.roundtable/bin/rt-codex-wake install" in output
+
+
+def test_doctor_reports_persisted_needs_human_as_warn(tmp_path, monkeypatch, capsys):
+    project = str((tmp_path / "project").resolve())
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "schema": wake.STATE_SCHEMA,
+                "bindings": {},
+                "projects": {
+                    project: {
+                        "phase": "NEEDS_HUMAN",
+                        "needsHuman": {
+                            "threadId": "thread-1",
+                            "reason": "hook trust review required",
+                        },
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(doctor, "load_project_registry", lambda _path: ([], []))
+    report = doctor.Report()
+
+    doctor.project_health_checks(
+        report,
+        tmp_path / "projects.yaml",
+        state_file,
+        tmp_path / "app.sock",
+        False,
+    )
+
+    output = capsys.readouterr().out
+    assert "WARN codex-wake:" in output
+    assert "thread=thread-1 needs human" in output
+    assert f"rt-codex-wake bind {project}" in output
+    assert not report.failed
 
 
 def test_doctor_unsupported_version_warns_and_exits_zero(monkeypatch, capsys):

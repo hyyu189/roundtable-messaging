@@ -257,10 +257,16 @@ def project_health_checks(
         if not isinstance(state, dict) or state.get("schema") != "roundtable.codex-wake.v1":
             raise ValueError("invalid or missing schema")
         bindings = state.get("bindings") if isinstance(state, dict) else None
+        projects = state.get("projects") if isinstance(state, dict) else None
         if not isinstance(bindings, dict):
             raise ValueError("bindings is not a mapping")
+        if not isinstance(projects, dict) or not all(
+            isinstance(value, dict) for value in projects.values()
+        ):
+            raise ValueError("projects is not a mapping of states")
     except FileNotFoundError:
         bindings = {}
+        projects = {}
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         report.item(
             "FAIL",
@@ -269,6 +275,39 @@ def project_health_checks(
             f"inspect or move aside {state_file}, then re-bind active Codex projects",
         )
         return
+
+    for project, project_state in sorted(projects.items()):
+        if project_state.get("phase") != "NEEDS_HUMAN":
+            continue
+        needs_human = project_state.get("needsHuman")
+        reason = (
+            needs_human.get("reason")
+            if isinstance(needs_human, dict)
+            else project_state.get("lastError")
+        )
+        thread_id = (
+            needs_human.get("threadId") if isinstance(needs_human, dict) else None
+        )
+        source = (
+            needs_human.get("source") if isinstance(needs_human, dict) else None
+        )
+        if source == "interrupted_breaker":
+            recovery = (
+                "attach the target Codex, inspect and resolve the repeated wake "
+                f"interruption, then run rt-codex-wake bind {project}"
+            )
+        else:
+            recovery = (
+                "attach the target Codex, resolve its trust/approval/input gate, "
+                f"then run rt-codex-wake bind {project}"
+            )
+        report.item(
+            "WARN",
+            "codex-wake",
+            f"project={project} thread={thread_id or 'unknown'} needs human: "
+            f"{reason or 'manual recovery required'}",
+            recovery,
+        )
 
     if not bindings:
         report.item("OK", "codex-anchor", "no stored Codex bindings")
