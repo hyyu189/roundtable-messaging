@@ -24,10 +24,13 @@ default_min=45
 floor_min=240
 backoff_after=6
 
+# Project root = dir with .roundtable/agents.yaml (the project manifest).
+# A bare .roundtable dir is NOT enough — ~/.roundtable is the tool
+# installation, not a project, and must never grow a mailbox.
 dir=$PWD
-while [ "$dir" != "/" ] && [ ! -d "$dir/.roundtable" ]; do dir=$(dirname "$dir"); done
-if [ ! -d "$dir/.roundtable" ]; then
-  echo "rt-wait-inbox: no .roundtable project root at or above $PWD" >&2
+while [ "$dir" != "/" ] && [ ! -f "$dir/.roundtable/agents.yaml" ]; do dir=$(dirname "$dir"); done
+if [ ! -f "$dir/.roundtable/agents.yaml" ]; then
+  echo "rt-wait-inbox: no roundtable project (.roundtable/agents.yaml) at or above $PWD" >&2
   exit 2
 fi
 
