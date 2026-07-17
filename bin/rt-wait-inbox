@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 # rt-wait-inbox <agent> [max-minutes] — v2 delivery tripwire.
 # Blocks until a maildir message lands in the current project's inbox for
-# <agent>, or until timeout. Exits 0 either way and prints the trigger cause.
+# <agent>, or until an adaptive heartbeat timeout. Exits 0 either way and
+# prints the trigger cause.
+# - Wake condition ignores ack-* files (quiet delivery confirmations; drain
+#   them opportunistically on any other wake).
+# - Activity reset: rt-stop-gate touches $inbox/.last-active at every turn
+#   end; an mtime change restarts the countdown and clears heartbeat backoff,
+#   so heartbeats only tick during true idle stretches.
+# - Backoff: after 6 consecutive empty heartbeats (~4.5h idle) the timeout
+#   stretches to 240m, unless an explicit max-minutes argument pins it.
+#   Rationale: sub-hour heartbeats keep the conversation prompt-cache warm
+#   (cheap wakes, cheap return); once the operator is clearly away, drop to
+#   a floor that only guards against silent wake-path death.
 # Maintains an armed-marker (.armed-<pid>) so a Stop-hook gate can verify a
 # live tripwire exists before letting the agent go idle.
 # Run it as a harness-tracked background process (Claude: run_in_background;
 # Hermes: terminal(background=true, notify_on_complete=true)).
 set -u
 agent=${1:?usage: rt-wait-inbox <agent> [max-minutes]}
-max_min=${2:-30}
+explicit_min=${2:-}
+default_min=45
+floor_min=240
+backoff_after=6
 
 dir=$PWD
 while [ "$dir" != "/" ] && [ ! -d "$dir/.roundtable" ]; do dir=$(dirname "$dir"); done
@@ -20,19 +34,45 @@ fi
 inbox="$dir/.roundtable/inbox/$agent"
 mkdir -p "$inbox/new" "$inbox/cur" "$inbox/tmp"
 marker="$inbox/.armed-$$"
-echo "$(date -u +%Y%m%dT%H%M%SZ) pid=$$ max_min=$max_min" > "$marker"
+echo "$(date -u +%Y%m%dT%H%M%SZ) pid=$$ max_min=${explicit_min:-adaptive}" > "$marker"
 trap 'rm -f "$marker"' EXIT HUP INT TERM
 
+beats_file="$inbox/.empty-beats"
+beats=$(cat "$beats_file" 2>/dev/null || echo 0)
+case $beats in ''|*[!0-9]*) beats=0 ;; esac
+
+pick_max() {
+  if [ -n "$explicit_min" ]; then echo "$explicit_min"
+  elif [ "$beats" -ge "$backoff_after" ]; then echo "$floor_min"
+  else echo "$default_min"; fi
+}
+
+active_stamp() { stat -f %m "$inbox/.last-active" 2>/dev/null || echo 0; }
+wake_mail() { ls "$inbox/new" 2>/dev/null | grep -v '^ack-' || true; }
+
+max_min=$(pick_max)
+base=$(active_stamp)
 i=0
-limit=$((max_min * 12))
-until [ -n "$(ls "$inbox/new" 2>/dev/null)" ] || [ "$i" -ge "$limit" ]; do
+mail=$(wake_mail)
+while [ -z "$mail" ] && [ "$i" -lt $((max_min * 12)) ]; do
   sleep 5
-  i=$((i + 1))
+  now=$(active_stamp)
+  if [ "$now" != "$base" ]; then
+    base=$now; i=0; beats=0; echo 0 > "$beats_file"; max_min=$(pick_max)
+  else
+    i=$((i + 1))
+  fi
+  mail=$(wake_mail)
 done
 
-if [ -n "$(ls "$inbox/new" 2>/dev/null)" ]; then
+acks=$(ls "$inbox/new" 2>/dev/null | grep -c '^ack-' || true)
+if [ -n "$mail" ]; then
+  echo 0 > "$beats_file"
   echo "rt-wait-inbox: mail after $((i * 5))s:"
-  ls "$inbox/new"
+  echo "$mail"
 else
-  echo "rt-wait-inbox: heartbeat timeout after ${max_min}m (inbox empty)"
+  beats=$((beats + 1)); echo "$beats" > "$beats_file"
+  echo "rt-wait-inbox: heartbeat timeout after ${max_min}m (inbox empty; consecutive empty beats: $beats)"
 fi
+[ "${acks:-0}" -gt 0 ] && echo "rt-wait-inbox: $acks quiet ack file(s) pending in new/ — drain to cur/ while you're awake"
+exit 0

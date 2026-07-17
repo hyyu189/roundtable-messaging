@@ -43,14 +43,22 @@ expected — dedupe by msgid. `--no-nudge` = maildir only; `--legacy-nudge-only`
 **Receiving (drain protocol)** — when woken by a tripwire or told the inbox has
 mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack` the ids
 (comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm** the
-tripwire before going idle.
+tripwire before going idle. Files named `ack-*` are quiet delivery
+confirmations: they never wake you and never block a stop — just read and `mv`
+them to `cur/` whenever you are awake for another reason.
 
 **Arming (Claude)** — run as a harness-tracked background process at the end of
 any turn in a roundtable project:
 
 ```bash
-rt-wait-inbox claude 30    # via run_in_background; exits when mail lands (or 30min heartbeat)
+rt-wait-inbox claude    # via run_in_background; exits when mail lands (or heartbeat)
 ```
+
+No interval argument = adaptive heartbeat: 45m countdown that resets while the
+session is active (rt-stop-gate stamps `.last-active` at every turn end), and
+backs off to 240m after 6 consecutive empty beats (~4.5h true idle). Sub-hour
+beats keep the prompt cache warm, so idle wakes and the eventual return both
+stay cheap; pass an explicit interval only to pin special cases.
 
 Its exit re-invokes you automatically — no keyboard, no human input. A Stop
 hook (`rt-stop-gate`) blocks going idle with undrained mail or no live

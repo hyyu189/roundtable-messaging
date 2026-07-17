@@ -18,8 +18,15 @@ grep -q "^  $agent:" "$dir/.roundtable/agents.yaml" 2>/dev/null || exit 0
 
 inbox="$dir/.roundtable/inbox/$agent"
 
-if [ -d "$inbox/new" ] && [ -n "$(ls "$inbox/new" 2>/dev/null)" ]; then
-  echo "roundtable inbox has undrained mail: $(ls "$inbox/new" | tr '\n' ' '). Drain it now: read each file, act/ack (rt-ack <ids>), then mv to $inbox/cur/, then re-arm the tripwire (run in background: rt-wait-inbox $agent 30)." >&2
+# Activity stamp: lets an armed tripwire reset its heartbeat countdown while
+# the agent is in active use (see rt-wait-inbox).
+mkdir -p "$inbox" 2>/dev/null && touch "$inbox/.last-active" 2>/dev/null
+
+# ack-* files are quiet delivery confirmations: they never block a stop and
+# never wake; agents drain them opportunistically on other wakes.
+undrained=$(ls "$inbox/new" 2>/dev/null | grep -v '^ack-')
+if [ -n "$undrained" ]; then
+  echo "roundtable inbox has undrained mail: $(echo "$undrained" | tr '\n' ' '). Drain it now: read each file, act/ack (rt-ack <ids>), then mv to $inbox/cur/, then re-arm the tripwire (run in background: rt-wait-inbox $agent)." >&2
   exit 2
 fi
 
@@ -32,5 +39,5 @@ for marker in "$inbox"/.armed-*; do
   rm -f "$marker"
 done
 
-echo "no live inbox tripwire for '$agent' in $dir. Arm it before stopping: run as a harness-tracked background process: rt-wait-inbox $agent 30" >&2
+echo "no live inbox tripwire for '$agent' in $dir. Arm it before stopping: run as a harness-tracked background process: rt-wait-inbox $agent" >&2
 exit 2
