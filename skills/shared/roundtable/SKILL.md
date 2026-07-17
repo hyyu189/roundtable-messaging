@@ -6,7 +6,7 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 5.1.0
+version: 6.0.0
 author: Roundtable contributors
 license: MIT
 platforms: [linux, macos]
@@ -14,10 +14,9 @@ platforms: [linux, macos]
 
 # Roundtable
 
-Collocated agents (Hermes, Claude, Codex) share one cmux workspace and talk through
-the `rt-*` CLI tools. Address agents by **name**, never by surface id — the tools
-resolve which surface an agent occupies and how to submit to it, and both drift as
-agents restart and move.
+Collocated agents (Hermes, Claude, Codex) collaborate per project and talk
+through the `rt-*` CLI tools. Messages are **files in the project's mailbox**;
+wakes are harness-native. Nothing touches a keyboard.
 
 **Rule #0 — launch every agent in its project root.** One project × one
 harness = one dedicated session = one mailbox. Every identity mechanism
@@ -25,56 +24,42 @@ harness = one dedicated session = one mailbox. Every identity mechanism
 codex thread binding) keys off the directory the agent was started in; an
 agent launched elsewhere (e.g. `~`) is anchor-less — gates no-op, binds fail,
 workarounds pile up. `rt-startup-advisory` warns about this at session start.
-A project with no open session for an agent = that agent is offline there;
+A project with no open session for an agent = that agent is **offline** there;
 mail waits in `new/` (the mailbox is the fact source).
 
 ## Tools (on PATH via ~/.roundtable/bin/)
 
 | Tool | Purpose |
 |------|---------|
-| `rt-say <agent> <kind> "body"` | Send through the target's configured maildir/dual delivery mode; tags it and blocks self-echo. |
-| `rt-ack <id>[,<id>...] ["note"]` | Acknowledge received message(s). Comma-batches. |
+| `rt-say <agent> <kind> "body"` | Write the message into the target's project mailbox (atomic maildir). |
+| `rt-ack <id>[,<id>...] ["note"]` | Acknowledge received message(s). Comma-batches. Lands as a quiet `ack-*` file. |
 | `rt-inbox` | List un-ack'd inbound messages. |
-| `rt-resolve <agent>` | Print an agent's status + current surface ref. |
-| `rt-refresh` | Rebuild the topology map (runtime.json) from the live cmux tree. |
-| `rt-projects <list|add|rm>` | Maintain the validated project registry used by launchers and wake services. |
+| `rt-projects <list\|add\|rm>` | Maintain the validated project registry (single discovery source). |
+| `rt-doctor` | Health checks: daemon, socket, RPC, version, bridge, registry, anchor audit. |
+| `rt-resolve <agent>` / `rt-refresh` | Diagnostic only: where does cmux think an agent sits. Not part of sending. |
 
-Run them from a project root (a dir with `.roundtable/agents.yaml`). Outside one,
-set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT` to point at a fallback project.
+Run them from a project root (a dir with `.roundtable/agents.yaml`). Outside
+one, set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT`.
 
 Launch dedicated sessions with `rt-codex`, `rt-claude`, or `rt-hermes`. When
 called outside a project on a TTY they offer registered projects, project
 creation, or an explicit unanchored launch; non-TTY unanchored calls exit 2.
-`roundtable-init` and `rt-projects` maintain `~/.roundtable/projects.yaml`, the
-single discovery source for these launchers and background services.
 
-## Delivery v2: per-agent maildir + tripwire
+## Delivery: maildir + native wake (v2, sole path since 2026-07-17)
 
-`rt-say` atomically writes each normal message to
-`<project>/.roundtable/inbox/<to>/new/<msgid>.md`. The target's `agents.yaml`
-entry selects `delivery: dual` (compatibility default: also send the legacy
-keyboard nudge) or `delivery: maildir` (never touch the keyboard); configured
-instances inherit the base agent's mode. In dual mode the same msgid may arrive
-through both paths, so dedupe by msgid. `--no-nudge` is an explicit mail-only
-override; `--legacy-nudge-only` is the emergency keyboard-only override.
+`rt-say` atomically writes each message to
+`<project>/.roundtable/inbox/<to>/new/<msgid>.md`. That write IS the delivery
+— it needs no topology map, no live target, no refresh. `sync-ack` files are
+named `new/ack-<msgid>.md`: quiet confirmations that never wake anyone and
+never block a stop; drain them whenever you are awake for another reason.
 
-`sync-ack` keeps its normal header and msgid but uses
-`new/ack-<msgid>.md`, making it a quiet acknowledgement. Current rollout:
-Claude is `maildir` fleet-wide; Codex is `maildir` in projects where its
-session is bridge-bound (rt-messaging-v2 since 2026-07-17) and `dual`
-elsewhere — flip a project's codex only after its session has
-self-registered (`rt-codex-wake bind`), or its mail has no waker. Hermes
-remains `dual` until its cutover.
+**Receiving (drain protocol)** — when woken by a tripwire/bridge or told the
+inbox has mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack`
+the ids (comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm**
+before going idle.
 
-**Receiving (drain protocol)** — when woken by a tripwire or told the inbox has
-mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack` the ids
-(comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm** the
-tripwire before going idle. Files named `ack-*` are quiet delivery
-confirmations: they never wake you and never block a stop — just read and `mv`
-them to `cur/` whenever you are awake for another reason.
-
-**Arming (Claude)** — run as a harness-tracked background process at the end of
-any turn in a roundtable project:
+**Arming (Claude)** — run as a harness-tracked background process at the end
+of any turn in a roundtable project:
 
 ```bash
 rt-wait-inbox claude    # via run_in_background; exits when mail lands (or heartbeat)
@@ -83,105 +68,67 @@ rt-wait-inbox claude    # via run_in_background; exits when mail lands (or heart
 No interval argument = adaptive heartbeat: 45m countdown that resets while the
 session is active (rt-stop-gate stamps `.last-active` at every turn end), and
 backs off to 240m after 6 consecutive empty beats (~4.5h true idle). Sub-hour
-beats keep the prompt cache warm, so idle wakes and the eventual return both
-stay cheap; pass an explicit interval only to pin special cases.
+beats keep the prompt cache warm. Its exit re-invokes you automatically. A
+Stop hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
+tripwire; follow its stderr instruction.
 
-Its exit re-invokes you automatically — no keyboard, no human input. A Stop
-hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
-tripwire; follow its stderr instruction, it is self-explanatory. Hermes arms
-the same script via `terminal(background=true, notify_on_complete=true)`.
+**Arming (Hermes)** — same script via
+`terminal(background=true, notify_on_complete=true)`.
+
 **Arming (Codex)** — launch from the project root with `rt-codex` (daemon
-liveness and remote attach are handled automatically), then self-register in
-the first turn: `rt-codex-wake bind <project-root>` — the codex equivalent of
-arming the tripwire. From then on the wake bridge delivers maildir wakes with
-zero keyboard (verified E2E 2026-07-17); delivery stays `dual` during the
-observation period.
+liveness and remote attach handled automatically), then self-register in the
+first turn: `rt-codex-wake bind <project-root>`. The wake bridge then delivers
+maildir wakes with zero keyboard. A codex session that never self-registered
+has no waker — its mail waits like any offline agent's.
 
 **Replacing a tripwire: kill by marker, NEVER by name.** Other projects run
-tripwires under the same process name; `pkill -f rt-wait-inbox` kills a
-sibling project's tripwire and silently deafens that agent (real incident,
-2026-07-17). To replace your own: read the pid from YOUR inbox's
-`.armed-<pid>` marker and `kill` exactly that pid — or just arm a new one;
-duplicates are harmless (first mail wakes both, both exit).
+tripwires under the same process name; `pkill -f rt-wait-inbox` deafens a
+sibling project's agent (real incident, 2026-07-17). Read the pid from YOUR
+inbox's `.armed-<pid>` marker and `kill` exactly that pid — or just arm a new
+one; duplicates are harmless.
 
 ## Sending
 
-For a target configured as `delivery: maildir`, send directly with `rt-say` or
-`rt-ack`; neither a live cmux route nor a refresh is required. This is the
-normal path to Claude. In a remote Codex app-server turn, sender inference uses
-the exact/unique `CODEX_THREAD_ID`; an ambiguous multi-instance setup fails
-closed. Outside a harness, set `RT_FROM` explicitly.
-
-For `delivery: dual` (the default) or an explicit legacy nudge, use
-**refresh → resolve → send**:
-
-```bash
-rt-refresh                    # 1. rebuild topology from live cmux
-rt-resolve codex              # 2. verify target is mapped and where
-rt-say codex question "..."   # 3. send
-```
-
-On that nudge path, `rt-say` reads the existing topology map — it does NOT refresh internally
-(refreshing inside rt-say can shuffle the map between your resolve and the
-send, causing the message to go to the wrong surface). If you haven't
-refreshed recently or agents restarted, refresh first.
+`rt-say <agent> <kind> "body"` from the project root. That's the whole ritual
+— no refresh, no resolve, no liveness check. In a remote Codex app-server
+turn, sender inference uses `CODEX_THREAD_ID`; outside a harness set
+`RT_FROM`.
 
 `kind` is a free triage label (fyi, question, answer, proposal, review,
-correction, directive, urgent) with no effect on delivery — pick the closest
-and move on. For anything long, write `handoff/<topic>.md`, commit, and
-rt-say a one-line pointer instead of pasting walls of text.
+correction, directive, urgent) with no effect on delivery. For anything long,
+write `handoff/<topic>.md`, commit, and rt-say a one-line pointer.
+
+Emergency keyboard path (`--legacy-nudge-only` + submit-key lore) is archived
+in `~/.roundtable/docs/legacy-v1-keyboard.md`; human-coordinated use only.
 
 ## Receiving
 
-1. Inbound arrives as `[FROM→YOU kind id=<msg_id>] body`.
+1. Inbound arrives as a mail file `[FROM→YOU kind id=<msg_id>] body`.
 2. Do what it asks.
-3. `rt-ack <msg_id> ["note"]` — batch with commas: `rt-ack id1,id2,id3`.
+3. `rt-ack <msg_id> ["note"]` — batch with commas. Ack because it's the
+   sender's only delivery confirmation.
 
-Ack because it's the sender's only delivery confirmation; un-ack'd, they can't tell
-whether you saw it.
+## When mail sits unanswered
+
+Mail waiting in `new/` means the receiver is offline or unarmed — not lost.
+Diagnose in order: ① is a session open in that project (Rule #0)? ② Claude/
+Hermes: is a tripwire armed (`.armed-*` marker with a live pid)? ③ Codex: is
+the thread bound (`rt-doctor` anchor audit / bridge heartbeat)? ④ `rt-doctor`
+for daemon/bridge health. Fix the waker; never re-send by keyboard reflex.
 
 ## Multi-instance
 
-A harness can run more than one instance, each in its own **cmux-launched** surface.
-Define them under `instances:` in `agents.yaml` and address each by its `id`
-(verbatim, never auto-numbered); a single instance just reuses the base name
-(`codex`). `rt-refresh` maps each instance to its surface from cmux's authoritative
-`surface.list` binding, distinguishing same-harness instances by launch `cwd`
-(primary anchor) then terminal `title`:
+A harness can run more than one instance per project. Define them under
+`instances:` in `agents.yaml` and address each by its `id` (verbatim); a
+single instance reuses the base name (`codex`). Mail addressing needs only
+the name; cmux launch metadata (cwd anchor, title) matters for the diagnostic
+`rt-resolve` view and for legacy tooling, not for delivery:
 
 ```yaml
 instances:
   - { id: codex-build,  match: { cwd: /path/to/build } }
   - { id: codex-review, match: { title: review } }
 ```
-
-Instances must be cmux-launched — that's how roundtable agents normally start. An
-agent typed into a plain shell carries no cmux binding and won't be tracked.
-
-## Raw cmux/tmux fallback
-
-`rt-say` is a convenience wrapper, not a gate. If it's unavailable or misbehaving,
-send directly with `cmux send` / `cmux send-key` (or `tmux send-keys`) — but do the
-two things the wrapper normally handles for you:
-
-1. **Resolve the surface first** (`rt-resolve <agent>`); cached ids go stale.
-2. **Match the submit key to the target's state** — wrong key on a *busy* agent can
-   submit into the wrong prompt:
-
-   | Agent | Idle | Busy |
-   |-------|------|------|
-   | Claude | text + Enter | text only, no Enter (interrupt-safe) |
-   | Codex | text + Enter | text + **Tab** (Enter submits the wrong prompt) |
-   | Hermes | text + Enter | prepend `/steer`, then Enter (injects next turn) |
-
-## When messages vanish
-
-`rt-say` says `sent` but the target never reacts → the topology map was stale
-when the send happened (a surface moved on restart, or rt-say used a cached
-map from before the move). Recovery: `rt-refresh`, confirm with `rt-resolve`
-or `cmux read-screen --surface <id>`, then resend. Most common failure — reach
-for it first. Prevention: always `rt-refresh` before `rt-say` if you're unsure
-the map is current.
 
 ## Collaboration discipline
 
