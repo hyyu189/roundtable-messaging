@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from _rtlib import caller_cmux_context, current_workspace_ref, find_project_root, load_agents_doc
+
+TOOL_DIR = Path(__file__).resolve().parent
+
+
+ROOT = find_project_root("rt-refresh")
+STATE_DIR = ROOT / ".roundtable"
+RUNTIME = STATE_DIR / "runtime.json"
+LOCK_DIR = STATE_DIR / "locks"
+LEDGER_LOCK = LOCK_DIR / "ledger.lock"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog="rt-refresh")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--bind", metavar="WORKSPACE_REF", help="persistently bind this project to a cmux workspace ref")
+    group.add_argument("--bind-current", action="store_true", help="persistently bind this project to the caller/current workspace")
+    return parser.parse_args()
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def run_json(*args):
+    output = subprocess.check_output(args, text=True)
+    return json.loads(output)
+
+
+def acquire_lock(path, timeout=10.0):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            path.mkdir(parents=True)
+            return
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise SystemExit(f"rt-refresh: timed out waiting for lock {path}")
+            time.sleep(0.05)
+
+
+def release_lock(path):
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def read_existing_runtime():
+    try:
+        return json.loads(RUNTIME.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def normalize_title(value):
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def project_path_aliases(root):
+    aliases = {str(root).lower()}
+    weak_prefixes = set()
+    try:
+        rel = root.relative_to(Path.home())
+    except ValueError:
+        rel = None
+    if rel is not None:
+        parts = rel.parts
+        aliases.add(f"~/{rel}".lower())
+        if len(parts) > 1:
+            aliases.add(("~/" + "/".join([*(part[:1] for part in parts[:-1]), parts[-1]])).lower())
+        elif len(parts) == 1 and parts[0]:
+            weak_prefixes.add(f"~/{parts[0][:1]}".lower())
+    return {alias for alias in aliases if alias}, {alias for alias in weak_prefixes if alias}
+
+
+def text_path_alias_strength(text, aliases, weak_prefixes):
+    text = (text or "").lower()
+    for alias in aliases:
+        if not alias:
+            continue
+        if alias == text or alias in text:
+            return "strong"
+        if text.startswith(f"{alias}/") or f" {alias}/" in text:
+            return "strong"
+    for alias in weak_prefixes:
+        if text == alias or text.startswith(f"{alias}/") or f" {alias}/" in text:
+            return "weak"
+    return ""
+
+
+def configured_workspace_title():
+    data = load_agents_doc(ROOT, "rt-refresh")
+    return data.get("workspace_title") or ""
+
+
+def workspace_project_score(workspace, exact_title=""):
+    title = workspace.get("title") or ""
+    title_norm = normalize_title(title)
+    root_norm = normalize_title(ROOT.name)
+    exact_title_norm = normalize_title(exact_title)
+    aliases, weak_prefixes = project_path_aliases(ROOT)
+    score = 0
+    reasons = []
+
+    if exact_title_norm and title_norm == exact_title_norm:
+        score += 1000
+        reasons.append(f"workspace_title={exact_title!r}")
+
+    if root_norm and title_norm == root_norm:
+        score += 100
+        reasons.append(f"title={title!r}")
+    elif root_norm and len(root_norm) >= 4 and root_norm in title_norm:
+        score += 80
+        reasons.append(f"title contains {ROOT.name!r}")
+
+    for pane in workspace.get("panes", []):
+        for surface in pane.get("surfaces", []):
+            if surface.get("type") != "terminal":
+                continue
+            surface_title = surface.get("title") or ""
+            surface_norm = normalize_title(surface_title)
+            alias_strength = text_path_alias_strength(surface_title, aliases, weak_prefixes)
+            if alias_strength == "strong":
+                score += 70
+                reasons.append(f"surface {surface.get('ref')} title path {surface_title!r}")
+            elif alias_strength == "weak":
+                score += 20
+                reasons.append(f"surface {surface.get('ref')} title path-prefix {surface_title!r}")
+            elif root_norm and len(root_norm) >= 4 and root_norm in surface_norm:
+                score += 45
+                reasons.append(f"surface {surface.get('ref')} title contains {ROOT.name!r}")
+
+    return score, reasons
+
+
+def iter_workspaces(tree):
+    for window in tree.get("windows", []):
+        for workspace in window.get("workspaces", []):
+            yield window, workspace
+
+
+def workspace_by_ref(tree, ref):
+    for window, workspace in iter_workspaces(tree):
+        if workspace.get("ref") == ref:
+            return window, workspace
+    return None, None
+
+
+def workspaces_by_title(tree, title):
+    if not title:
+        return []
+    return [(window, workspace) for window, workspace in iter_workspaces(tree) if (workspace.get("title") or "") == title]
+
+
+def binding_record(workspace, source):
+    return {
+        "ref": workspace.get("ref"),
+        "title": workspace.get("title") or "",
+        "source": source,
+        "updated_at": utc_now(),
+    }
+
+
+def bound_workspace(tree, identify, existing, args):
+    if args.bind:
+        window, workspace = workspace_by_ref(tree, args.bind)
+        if workspace is None:
+            raise SystemExit(f"rt-refresh: requested workspace binding not found: {args.bind}")
+        return window, workspace, binding_record(workspace, "--bind")
+
+    if args.bind_current:
+        ref = current_workspace_ref(identify, tree)
+        if not ref:
+            raise SystemExit("rt-refresh: could not identify caller/current cmux workspace for --bind-current")
+        window, workspace = workspace_by_ref(tree, ref)
+        if workspace is None:
+            raise SystemExit(f"rt-refresh: caller/current workspace not found in cmux tree: {ref}")
+        return window, workspace, binding_record(workspace, "--bind-current")
+
+    existing_binding = existing.get("workspace_binding") or {}
+    existing_ref = existing_binding.get("ref")
+
+    # cmux's `surface.list` (rt-refresh's authoritative kind source) ignores its
+    # workspace argument and always returns the CALLER's focused workspace. So the
+    # only workspace rt-refresh can map correctly is the one the caller is actually
+    # in. When the caller is inside a cmux workspace, prefer it: a stored binding
+    # that points elsewhere is stale (agents moved / the old workspace was
+    # repurposed) and would otherwise be mapped against the focused workspace's
+    # bindings, silently producing a garbage agent map. Fall back to the stored
+    # binding / title-rebind / project scoring only when the caller has no workspace
+    # context (e.g. a detached rt-watch or cron refresh). Explicit --bind/--bind-current
+    # above still override this.
+    caller_ref = current_workspace_ref(identify, tree)
+    if caller_ref:
+        caller_window, caller_workspace = workspace_by_ref(tree, caller_ref)
+        if caller_workspace is not None:
+            if existing_ref and existing_ref != caller_ref:
+                print(
+                    f"rt-refresh: project was bound to {existing_ref} "
+                    f"({existing_binding.get('title', '')!r}) but caller is in {caller_ref} "
+                    f"({caller_workspace.get('title', '')!r}); agents appear to have moved — "
+                    f"rebinding to {caller_ref}. Use --bind {existing_ref} to force the old binding.",
+                    file=sys.stderr,
+                )
+            source = "existing" if existing_ref == caller_ref else "caller-rebind"
+            return caller_window, caller_workspace, binding_record(caller_workspace, source)
+
+    if existing_ref:
+        window, workspace = workspace_by_ref(tree, existing_ref)
+        if workspace is not None:
+            return window, workspace, binding_record(workspace, "existing")
+
+    existing_title = existing_binding.get("title")
+    title_matches = workspaces_by_title(tree, existing_title)
+    if len(title_matches) == 1:
+        window, workspace = title_matches[0]
+        print(
+            f"rt-refresh: rebound workspace binding by title {existing_title!r}: {existing_ref} -> {workspace.get('ref')}",
+            file=sys.stderr,
+        )
+        return window, workspace, binding_record(workspace, "title-rebind")
+    if len(title_matches) > 1:
+        print(
+            f"rt-refresh: workspace binding title {existing_title!r} is ambiguous; falling back to project scoring",
+            file=sys.stderr,
+        )
+
+    return None, None, None
+
+
+def project_workspace(tree, identify, exact_title=""):
+    caller = caller_cmux_context(identify, tree)
+    candidates = []
+    all_workspaces = []
+    for window, workspace in iter_workspaces(tree):
+        all_workspaces.append((window, workspace))
+        score, reasons = workspace_project_score(workspace, exact_title)
+        if score > 0:
+            candidates.append((score, window, workspace, reasons))
+
+    if not candidates:
+        titles = ", ".join(f"{workspace.get('ref')}:{workspace.get('title')!r}" for _, workspace in all_workspaces)
+        raise SystemExit(f"rt-refresh: could not match project {ROOT} to a cmux workspace; candidates: {titles}")
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    top_score = candidates[0][0]
+    tied = [item for item in candidates if item[0] == top_score]
+    if len(tied) > 1:
+        details = ", ".join(
+            f"{workspace.get('ref')}:{workspace.get('title')!r} reasons={'; '.join(reasons)}"
+            for _, _, workspace, reasons in tied
+        )
+        raise SystemExit(f"rt-refresh: ambiguous cmux workspace for project {ROOT}: {details}")
+
+    _, window, workspace, _ = candidates[0]
+    return window, workspace, caller
+
+
+DEFAULT_KIND_MAP = {
+    "claude": "claude",
+    "codex": "codex",
+    "hermes": "hermes",
+    "hermes-agent": "hermes",
+}
+
+
+def build_kind_map(agents_doc):
+    """Build cmux-kind → agent-name map from agents.yaml.
+
+    Each agent can declare `kind:` (the cmux resume_binding kind).
+    If not declared, the agent name itself is used as the kind.
+    Falls back to DEFAULT_KIND_MAP for built-in agents.
+    """
+    kind_map = dict(DEFAULT_KIND_MAP)
+    for name, spec in (agents_doc.get("agents") or {}).items():
+        kind = (spec.get("kind") or spec.get("harness") or name).lower()
+        kind_map[kind] = name
+        # Also map the agent name itself
+        kind_map[name.lower()] = name
+    return kind_map
+
+
+def surface_meta(workspace_ref):
+    """ref -> {kind, checkpoint_id, cwd, title} for every TERMINAL surface in the workspace.
+
+    `kind` comes from cmux's authoritative resume_binding (claude|codex|hermes-agent),
+    which cmux stamps once an agent has checkpointed (done its first turn). Fresh agents
+    (pre-first-turn) and non-agent surfaces have kind=None and get resolved later by an
+    optional screen-banner probe.
+
+    NOTE: as of cmux 0.64.x, `surface.list` ignores its `workspace` argument (ref, UUID,
+    and index all return the caller's *focused* workspace). So this metadata only lines up
+    with `workspace_ref` when that workspace is the caller's focused one — which is why
+    bound_workspace() prefers the caller's workspace for default refreshes.
+    """
+    try:
+        data = run_json("cmux", "rpc", "surface.list", json.dumps({"workspace": workspace_ref}))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
+        print(f"rt-refresh: surface.list failed ({exc}); agent map will be empty", file=sys.stderr)
+        return {}
+    out = {}
+    for surface in data.get("surfaces", []):
+        if surface.get("type") != "terminal":
+            continue
+        ref = surface.get("ref")
+        if not ref:
+            continue
+        binding = surface.get("resume_binding") or {}
+        out[ref] = {
+            "kind": binding.get("kind"),
+            "checkpoint_id": binding.get("checkpoint_id"),
+            "updated_at": binding.get("updated_at"),
+            "cwd": binding.get("cwd") or surface.get("requested_working_directory"),
+            "title": surface.get("title") or "",
+        }
+    return out
+
+
+def load_agent_config():
+    """Read agents.yaml once -> (instances_cfg, detect_cfg).
+
+    instances_cfg: {base: [{id, match}]} (default one instance id=base)
+    detect_cfg:    {base: [screen-signature, ...]} from each agent's detect.screen
+    """
+    try:
+        doc = load_agents_doc(ROOT, "rt-refresh")
+    except SystemExit:
+        doc = {}
+    instances, detect = {}, {}
+    for base, cfg in (doc.get("agents") or {}).items():
+        base_l = str(base).lower()
+        cfg = cfg if isinstance(cfg, dict) else {}
+        norm = []
+        for inst in (cfg.get("instances") or [{"id": base_l}]):
+            if isinstance(inst, str):
+                inst = {"id": inst}
+            inst = inst or {}
+            norm.append({"id": str(inst.get("id") or base_l).lower(), "match": inst.get("match") or {}})
+        instances[base_l] = norm
+        signatures = (cfg.get("detect") or {}).get("screen") or []
+        if signatures:
+            detect[base_l] = [str(sig) for sig in signatures]
+    return instances, detect
+
+
+def probe_screen_agent(surface_ref, workspace_ref, detect_cfg):
+    """Identify a binding-less surface by matching agents.yaml detect.screen signatures.
+
+    Runs only for surfaces cmux hasn't bound yet (fresh, pre-checkpoint agents). A fresh
+    agent still shows its welcome banner, so matching a model-independent signature (e.g.
+    "OpenAI Codex", "Welcome to Hermes Agent") is reliable; watchers and plain shells
+    match nothing and are excluded. This probe runs in rt-refresh, never in the routed
+    agent's own context.
+    """
+    if not detect_cfg:
+        return None
+    try:
+        screen = subprocess.run(
+            ["cmux", "read-screen", "--workspace", workspace_ref, "--surface", surface_ref, "--lines", "40"],
+            check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3,
+        ).stdout.lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for name, signatures in detect_cfg.items():
+        if any(sig.lower() in screen for sig in signatures):
+            return name
+    return None
+
+
+def assign_agents(surfaces, meta_by_ref, instances_cfg, detect_cfg, workspace_ref, kind_map):
+    """Map agent terminal surfaces to runtime keys.
+
+    Position comes from cmux's resume_binding, which is the authoritative real-time
+    identity (it survives kill+resume and surface drift). Surfaces without a binding yet
+    (fresh, pre-checkpoint agents) fall back to a screen-banner probe. The probe never
+    overrides an existing binding — detect.screen signatures appear too often in ordinary
+    terminal output to be trusted over cmux.
+
+    Single instance keys by base name; multiple surfaces of one harness match configured
+    instances by cwd (primary anchor) then title, else stable checkpoint order, with
+    surplus as base#N.
+    """
+    by_agent = {}
+    for surface in surfaces:
+        meta = meta_by_ref.get(surface["surface_ref"]) or {}
+        binding_kind = (meta.get("kind") or "").lower()
+        binding_name = kind_map.get(binding_kind) if binding_kind else None
+
+        # cmux's resume_binding is the authoritative, real-time agent identity — it
+        # survives kill+resume and surface drift. Trust it. The screen-banner probe is
+        # ONLY a fallback for surfaces cmux hasn't bound yet (fresh, pre-checkpoint
+        # agents still showing their welcome banner). We deliberately do NOT let the
+        # probe override an existing binding: detect.screen signatures ("OpenAI Codex",
+        # "Claude Code", "⚕", ...) routinely show up in normal terminal output — agents
+        # reading agents.yaml, reviewing each other, printing this very file — so a
+        # substring match is far too weak to overrule cmux. (This poisoning was a real
+        # bug: a codex surface displaying the text "Claude Code" got mislabeled claude.)
+        # When a binding exists we skip the probe entirely — safer and faster.
+        if binding_name:
+            name = binding_name
+        else:
+            name = probe_screen_agent(surface["surface_ref"], workspace_ref, detect_cfg)
+
+        if not name:
+            continue
+        enriched = dict(surface)
+        enriched["session_checkpoint_id"] = meta.get("checkpoint_id")
+        enriched["binding_updated_at"] = meta.get("updated_at")
+        enriched["cwd"] = meta.get("cwd")
+        by_agent.setdefault(name, []).append(enriched)
+
+    agents = {}
+    for base, surfs in by_agent.items():
+        insts = instances_cfg.get(base) or [{"id": base, "match": {}}]
+        if len(surfs) == 1 and len(insts) <= 1:
+            agents[insts[0]["id"] if insts else base] = surfs[0]
+            continue
+        # Newest binding first: the surface whose resume_binding was updated most
+        # recently is the live session. Older same-kind surfaces are stale — the agent
+        # exited and cmux kept the binding after the surface reverted to a plain shell.
+        ordered = sorted(surfs, key=lambda s: (s.get("binding_updated_at") or 0), reverse=True)
+        if len(insts) <= 1:
+            # Single-instance agent (per agents.yaml) with multiple same-kind surfaces:
+            # keep only the freshest, drop the stale duplicates, so the agent resolves
+            # to its live surface instead of a defunct one (and isn't split into base#1).
+            agents[insts[0]["id"]] = ordered[0]
+            continue
+        used = set()
+        for inst in insts:
+            match = inst.get("match") or {}
+            for surface in ordered:
+                if surface["surface_ref"] in used:
+                    continue
+                cwd = surface.get("cwd") or ""
+                title = (surface.get("title") or "").lower()
+                if (match.get("cwd") and cwd.startswith(match["cwd"])) or (
+                    match.get("title") and match["title"].lower() in title
+                ):
+                    agents[inst["id"]] = surface
+                    used.add(surface["surface_ref"])
+                    break
+        leftover_insts = [inst for inst in insts if inst["id"] not in agents]
+        leftover_surfs = [s for s in ordered if s["surface_ref"] not in used]
+        for inst, surface in zip(leftover_insts, leftover_surfs):
+            agents[inst["id"]] = surface
+            used.add(surface["surface_ref"])
+        for i, surface in enumerate([s for s in ordered if s["surface_ref"] not in used], start=1):
+            agents[f"{base}#{i}"] = surface
+    return agents
+
+
+def merge_status(agent_name, surface, existing_agents):
+    existing = (existing_agents or {}).get(agent_name) or {}
+    if existing.get("surface_ref") == surface.get("surface_ref"):
+        for key in (
+            "status",
+            "status_source",
+            "status_updated_at",
+            "last_event_seq",
+            "last_event_name",
+        ):
+            if key in existing:
+                surface[key] = existing[key]
+    return surface
+
+
+def atomic_write_json(path, data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.tmp.", dir=STATE_DIR)
+    with os.fdopen(fd, "w") as tmp:
+        json.dump(data, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+    shutil.move(tmp_name, path)
+
+
+def main():
+    args = parse_args()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+    tree = run_json("cmux", "tree", "--all", "--json", "--id-format", "both")
+    identify = run_json("cmux", "identify", "--json", "--id-format", "both")
+    existing = read_existing_runtime()
+    caller = caller_cmux_context(identify, tree)
+    window, workspace, workspace_binding = bound_workspace(tree, identify, existing, args)
+    if workspace is None:
+        window, workspace, caller = project_workspace(tree, identify, configured_workspace_title())
+
+    surfaces = []
+    for pane in workspace.get("panes", []):
+        for surface in pane.get("surfaces", []):
+            if surface.get("type") != "terminal":
+                continue
+            surfaces.append(
+                {
+                    "workspace_ref": workspace.get("ref"),
+                    "pane_ref": pane.get("ref") or surface.get("pane_ref"),
+                    "surface_ref": surface.get("ref"),
+                    "title": surface.get("title") or "",
+                    "selected": bool(surface.get("selected")),
+                    "focused": bool(surface.get("focused")),
+                    "here": bool(surface.get("here")),
+                    "status": "idle_unknown",
+                    "status_source": "rt-refresh",
+                    "status_updated_at": utc_now(),
+                }
+            )
+
+    meta_by_ref = surface_meta(workspace.get("ref"))
+    instances_cfg, detect_cfg = load_agent_config()
+    agents_doc = load_agents_doc(ROOT, "rt-refresh") if ROOT else {}
+    kind_map = build_kind_map(agents_doc)
+    agents = assign_agents(surfaces, meta_by_ref, instances_cfg, detect_cfg, workspace.get("ref"), kind_map)
+
+    acquire_lock(LEDGER_LOCK)
+    try:
+        existing_agents = existing.get("agents") or {}
+        live_surfaces = {surface["surface_ref"] for surface in surfaces}
+        # Build a surface→name map from the fresh assignment to detect
+        # stale mappings in the old runtime (e.g. surface:1 was "claude"
+        # in old runtime but is now correctly "hermes" — the old "claude"
+        # entry must NOT be carried forward as stale).
+        fresh_surface_to_name = {}
+        for name, surface in agents.items():
+            sr = surface.get("surface_ref")
+            if sr:
+                fresh_surface_to_name[sr] = name
+
+        for name, surface in list(agents.items()):
+            agents[name] = merge_status(name, surface, existing_agents)
+        for name, old in existing_agents.items():
+            if name in agents:
+                continue
+            old_surface = old.get("surface_ref")
+            if old_surface and old_surface not in live_surfaces:
+                stale = dict(old)
+                stale["status"] = "blocked_or_stale"
+                stale["status_source"] = "rt-refresh"
+                stale["status_updated_at"] = utc_now()
+                agents[name] = stale
+            elif old_surface and old_surface in live_surfaces:
+                # Surface is live but assigned to a different agent now.
+                # The old entry is a stale mapping (surface reused by
+                # another agent after restart). Drop it — don't carry
+                # forward a ghost that would confuse rt-say/rt-resolve.
+                pass
+
+        runtime = {
+            "schema": "roundtable.runtime.v1",
+            "project": str(ROOT),
+            "updated_at": utc_now(),
+            "workspace_ref": workspace.get("ref"),
+            "workspace_id": workspace.get("id") or caller.get("workspace_id"),
+            "workspace_title": workspace.get("title"),
+            "window_ref": (window or {}).get("ref") or caller.get("window_ref"),
+            "caller": caller,
+            "agents": agents,
+            "surfaces": surfaces,
+        }
+        if workspace_binding:
+            runtime["workspace_binding"] = workspace_binding
+        atomic_write_json(RUNTIME, runtime)
+    finally:
+        release_lock(LEDGER_LOCK)
+
+    print(f"wrote {RUNTIME}")
+
+
+if __name__ == "__main__":
+    main()

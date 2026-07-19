@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TEMPLATES = ROOT / "templates"
+
+PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+FILES = {
+    # Per-harness entrypoints — thin (role + always-load). Each harness only auto-reads its OWN
+    # file: Claude/Hermes don't natively read AGENTS.md (that's Codex's), and Claude bridges to
+    # shared context via @-import — so each gets a dedicated entrypoint, not one shared AGENTS.md.
+    "AGENTS.md": "AGENTS.md.tmpl",   # Codex
+    "CLAUDE.md": "CLAUDE.md.tmpl",   # Claude (@-imports ROUTING.md + README.md)
+    "HERMES.md": "HERMES.md.tmpl",   # Hermes
+    # Shared always-loaded routing hub: the single load_if manifest for all three.
+    "ROUTING.md": "ROUTING.md.tmpl",
+    "README.md": "README.md.tmpl",
+    "BRIEF.md": "BRIEF.md.tmpl",
+    "decision.md": "decision.md.tmpl",
+    ".gitignore": "root-gitignore.tmpl",
+    ".roundtable/agents.yaml": "agents.yaml.tmpl",
+    ".roundtable/.gitignore": "roundtable-gitignore.tmpl",
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="roundtable-init",
+        description="Bootstrap a roundtable project that uses global rt-* tools.",
+    )
+    parser.add_argument("project_name")
+    parser.add_argument("-p", "--parent", default=".")
+    parser.add_argument("--no-git", action="store_true")
+    return parser.parse_args()
+
+
+def render(template, values):
+    text = template
+    for key, value in values.items():
+        text = text.replace("${" + key + "}", value)
+    return text
+
+
+def write_from_template(target, template_name, values):
+    template_path = TEMPLATES / template_name
+    if not template_path.is_file():
+        raise SystemExit(f"roundtable-init: missing template: {template_path}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render(template_path.read_text(), values))
+
+
+def run_git(project_dir, args):
+    return subprocess.run(["git", *args], cwd=project_dir, text=True, check=True)
+
+
+def git_init(project_dir, project_name):
+    run_git(project_dir, ["init", "-q", "-b", "main"])
+    run_git(project_dir, ["add", "."])
+    cmd = ["git"]
+    if subprocess.run(["git", "config", "--get", "user.name"], cwd=project_dir, stdout=subprocess.DEVNULL).returncode != 0:
+        cmd.extend(["-c", "user.name=roundtable-init"])
+    if subprocess.run(["git", "config", "--get", "user.email"], cwd=project_dir, stdout=subprocess.DEVNULL).returncode != 0:
+        cmd.extend(["-c", "user.email=bot@roundtable.local"])
+    cmd.extend(["commit", "-q", "-m", f"Initial: {project_name} bootstrapped via roundtable-init"])
+    subprocess.run(cmd, cwd=project_dir, text=True, check=True)
+
+
+def main():
+    args = parse_args()
+    project_name = args.project_name
+    if not PROJECT_RE.match(project_name):
+        raise SystemExit("roundtable-init: project name must match ^[A-Za-z0-9][A-Za-z0-9._-]*$; no slashes or whitespace")
+    parent = Path(args.parent).expanduser().resolve()
+    project_dir = parent / project_name
+    if project_dir.exists():
+        raise SystemExit(f"roundtable-init: target already exists: {project_dir}")
+    if not TEMPLATES.is_dir():
+        raise SystemExit(f"roundtable-init: templates directory missing: {TEMPLATES}")
+
+    values = {
+        "project_name": project_name,
+        "project_dir": str(project_dir),
+        "date": date.today().isoformat(),
+    }
+
+    project_dir.mkdir(parents=True)
+    for dirname in ("handoff", "log", "skills"):
+        path = project_dir / dirname
+        path.mkdir()
+        (path / ".gitkeep").write_text("")
+
+    # project-level skills: ./skills/ is the single source.
+    # Wire harness-specific skill discovery if that harness is installed.
+    if (Path.home() / ".claude").is_dir():
+        claude_dir = project_dir / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "skills").symlink_to(Path("..") / "skills")
+
+    for rel, template in FILES.items():
+        write_from_template(project_dir / rel, template, values)
+
+    if not args.no_git:
+        git_init(project_dir, project_name)
+
+    print(f"created {project_dir}")
+    print("next:")
+    print(f"  cd {project_dir}")
+    print(f"  # name the cmux workspace {project_name!r}, or bind the current workspace explicitly:")
+    print("  rt-refresh --bind-current")
+    print("  rt-watch-ensure")
+    print("  rt-resolve codex")
+
+
+if __name__ == "__main__":
+    main()

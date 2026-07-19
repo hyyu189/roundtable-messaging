@@ -1,0 +1,36 @@
+schema: roundtable.agents.v1
+project: ${project_dir}
+# submit: how rt-say submits to each agent by state (read by rt-say).
+# detect.screen: model-independent banner signatures used by rt-refresh to place a
+#   fresh agent (one that hasn't checkpointed yet, so has no cmux resume_binding).
+# instances: one per running session; add `match: {cwd|title}` to pin multi-instance ids.
+agents:
+  claude:
+    harness: claude-code
+    instances:
+      - id: claude
+    submit:
+      idle: enter
+      busy: send_only
+    detect:
+      screen: ["Claude Code"]
+
+  codex:
+    harness: codex
+    instances:
+      - id: codex
+    submit:
+      idle: enter
+      busy: tab
+    detect:
+      screen: ["OpenAI Codex"]
+
+  hermes:
+    harness: hermes-agent
+    instances:
+      - id: hermes
+    submit:
+      idle: enter
+      busy: steer
+    detect:
+      screen: ["Welcome to Hermes Agent", "⚕"]

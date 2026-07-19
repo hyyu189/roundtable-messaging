@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from _rtlib import find_project_root, load_agents_doc
+
+TOOL_DIR = Path(__file__).resolve().parent
+
+
+ROOT = find_project_root("rt-say")
+STATE_DIR = ROOT / ".roundtable"
+RUNTIME = STATE_DIR / "runtime.json"
+LOCK_DIR = STATE_DIR / "locks"
+MSG_DIR = STATE_DIR / "messages"
+LEDGER_LOCK = LOCK_DIR / "ledger.lock"
+LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3, "acked": 4}
+
+
+def usage():
+    print("usage: rt-say [--verbose] <agent-or-instance> <kind> <body...>", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, text=True, check=True, **kwargs)
+
+
+def run_json(*args):
+    return json.loads(subprocess.check_output(args, text=True))
+
+
+def acquire_lock(path, timeout=None):
+    deadline = None if timeout is None else time.time() + timeout
+    while True:
+        try:
+            path.mkdir(parents=True)
+            return
+        except FileExistsError:
+            if timeout is None or time.time() >= deadline:
+                raise SystemExit(f"rt-say: lock busy: {path}")
+            time.sleep(0.05)
+
+
+def release_lock(path):
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def read_runtime(refresh=False):
+    """Read runtime.json. Only refresh if explicitly requested or file is missing.
+
+    Do NOT auto-refresh here — refreshing can shuffle the topology map between
+    the caller's manual rt-refresh + rt-resolve and the actual send, causing
+    the message to go to the wrong surface. The caller is responsible for
+    ensuring the map is current (rt-refresh before rt-say).
+    """
+    if refresh or not RUNTIME.exists() or RUNTIME.stat().st_size == 0:
+        run(str(TOOL_DIR / "rt-refresh"), stdout=subprocess.DEVNULL)
+    runtime = json.loads(RUNTIME.read_text())
+    if runtime.get("project") != str(ROOT):
+        raise SystemExit(f"rt-say: runtime project mismatch: {runtime.get('project')} != {ROOT}")
+    return runtime
+
+
+def guard_route_in_runtime(runtime, route):
+    runtime_workspace = runtime.get("workspace_ref")
+    if route.get("workspace") != runtime_workspace:
+        raise SystemExit(
+            f"rt-say: refusing route outside current project runtime: route workspace={route.get('workspace')} runtime workspace={runtime_workspace}"
+        )
+    route_surface = route.get("surface")
+    live_surfaces = {surface.get("surface_ref") for surface in runtime.get("surfaces") or []}
+    agent_surfaces = {agent.get("surface_ref") for agent in (runtime.get("agents") or {}).values()}
+    if route_surface not in (live_surfaces | agent_surfaces):
+        raise SystemExit(f"rt-say: refusing route to surface not present in current project runtime: {route_surface}")
+
+
+def infer_sender(runtime):
+    caller_surface = ""
+    try:
+        caller_surface = (run_json("cmux", "identify", "--json").get("caller") or {}).get("surface_ref") or ""
+    except subprocess.CalledProcessError:
+        pass
+    for name, agent in (runtime.get("agents") or {}).items():
+        if agent.get("surface_ref") == caller_surface:
+            return name
+    # No match in current runtime — caller may be on a fresh surface.
+    # Do NOT auto-refresh (same reasoning as read_runtime). Just return None
+    # and let the caller set RT_FROM or run rt-refresh manually.
+    return os.environ.get("RT_FROM", "")
+
+
+def parse_resolve(agent):
+    output = subprocess.check_output([str(TOOL_DIR / "rt-resolve"), agent], text=True).strip()
+    result = {}
+    for part in output.split():
+        if "=" in part:
+            key, value = part.split("=", 1)
+            result[key] = value
+    return result
+
+
+def next_event_id(ledger, msg_id, lifecycle):
+    count = 0
+    if ledger.exists():
+        with ledger.open() as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("msg_id") == msg_id and record.get("lifecycle") == lifecycle:
+                    count += 1
+    return f"{msg_id}:{lifecycle}:{count + 1}"
+
+
+def append_ledger(sender, record):
+    ledger = MSG_DIR / f"{sender}.jsonl"
+    acquire_lock(LEDGER_LOCK, timeout=10.0)
+    try:
+        record = dict(record)
+        record["event_id"] = next_event_id(ledger, record["msg_id"], record["lifecycle"])
+        with ledger.open("a") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    finally:
+        release_lock(LEDGER_LOCK)
+
+
+def base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, lifecycle, source, correlation=None):
+    return {
+        "schema": "roundtable.message_event.v1",
+        "msg_id": msg_id,
+        "event_id": "",
+        "ts": utc_now(),
+        "from": sender,
+        "to": target,
+        "kind": kind,
+        "body": body,
+        "rendered_text": rendered,
+        "send_text": send_text,
+        "workspace_ref": route.get("workspace"),
+        "surface_ref": route.get("surface"),
+        "pane_ref": route.get("pane"),
+        "submit": submit or "none",
+        "lifecycle": lifecycle,
+        "refs": refs,
+        "correlation": correlation or {},
+        "source": source,
+    }
+
+
+def text_length(value):
+    return len(value)
+
+
+def terminal_single_line(value):
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def submit_settle_delay(value):
+    length = text_length(value)
+    if length < 500:
+        return 0.05
+    if length < 1200:
+        return 0.20
+    if length < 2500:
+        return 0.40
+    return 0.75
+
+
+def event_surface(frame):
+    payload = frame.get("payload") or {}
+    params = payload.get("params") or {}
+    result = payload.get("result") or {}
+    return (
+        frame.get("surface_ref")
+        or payload.get("surface_ref")
+        or params.get("surface_ref")
+        or result.get("surface_ref")
+        or params.get("surface_id")
+        or frame.get("surface_id")
+        or payload.get("surface_id")
+        or result.get("surface_id")
+    )
+
+
+def event_text_length(frame):
+    payload = frame.get("payload") or {}
+    params = payload.get("params") or {}
+    for key in ("text_length", "length", "input_length"):
+        if key in frame:
+            return frame[key]
+        if key in payload:
+            return payload[key]
+        if key in params:
+            return params[key]
+    return None
+
+
+def wait_surface_input(proc, surface, expected_length, started_at):
+    deadline = time.time() + 1.0
+    try:
+        while time.time() < deadline:
+            readable, _, _ = select.select([proc.stdout], [], [], max(0.0, deadline - time.time()))
+            if not readable:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event_surface(frame) != surface:
+                continue
+            length = event_text_length(frame)
+            if length is not None and int(length) != expected_length:
+                continue
+            occurred = frame.get("occurred_at")
+            return {
+                "surface_input_seq": frame.get("seq"),
+                "surface_input_text_length": length,
+                "surface_input_delta_ms": int((time.time() - started_at) * 1000),
+                "surface_input_occurred_at": occurred,
+            }
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    return {
+        "surface_input_seq": None,
+        "surface_input_text_length": None,
+        "surface_input_delta_ms": None,
+        "surface_input_timeout": True,
+    }
+
+
+BUSY_STATUSES = {"busy", "running", "in_tool", "waiting_permission"}
+# agents.yaml submit value -> the key rt-say presses after sending text.
+# "send_only" means no submit key (interrupt-safe); "steer" submits with Enter but
+# the body is prefixed with /steer (see steer_prefix).
+SUBMIT_KEY = {"enter": "Enter", "tab": "Tab", "send_only": "none", "steer": "Enter"}
+
+
+def load_submit_config(root):
+    """{agent_base: {idle, busy}} from agents.yaml submit blocks; default enter/enter."""
+    try:
+        doc = load_agents_doc(root, "rt-say")
+    except SystemExit:
+        doc = {}
+    cfg = {}
+    for base, agent in (doc.get("agents") or {}).items():
+        submit = (agent or {}).get("submit") if isinstance(agent, dict) else None
+        submit = submit or {}
+        cfg[str(base).lower()] = {
+            "idle": str(submit.get("idle") or "enter").lower(),
+            "busy": str(submit.get("busy") or "enter").lower(),
+        }
+    return cfg
+
+
+def submit_mode(target, status, submit_cfg):
+    spec = submit_cfg.get(target) or {"idle": "enter", "busy": "enter"}
+    return spec.get("busy", "enter") if status in BUSY_STATUSES else spec.get("idle", "enter")
+
+
+def submit_policy(target, status, submit_cfg):
+    return SUBMIT_KEY.get(submit_mode(target, status, submit_cfg), "Enter")
+
+
+def steer_prefix(target, status, submit_cfg):
+    """True when this agent's busy-submit is /steer and it isn't idle (non-interrupting inject)."""
+    return (submit_cfg.get(target) or {}).get("busy") == "steer" and status != "idle"
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = False
+    if "--verbose" in args:
+        verbose = True
+        args = [arg for arg in args if arg != "--verbose"]
+    if len(args) < 2:
+        usage()
+    target = args[0].lower()
+    kind = args[1]
+    body_arg = " ".join(args[2:])
+    ack_mode = os.environ.get("RT_ACK_MODE") == "1"
+    if kind == "sync-ack" and not ack_mode:
+        raise SystemExit("rt-say: sync-ack is reserved for rt-ack; use rt-ack <msg_id>[,<msg_id>...] [body]")
+    if len(args) < 3 and not ack_mode:
+        usage()
+
+    STATE_DIR.mkdir(exist_ok=True)
+    LOCK_DIR.mkdir(exist_ok=True)
+    MSG_DIR.mkdir(exist_ok=True)
+
+    runtime = read_runtime()
+    sender = infer_sender(runtime)
+    if not sender:
+        raise SystemExit("rt-say: could not infer sender from current cmux surface; set RT_FROM")
+    route = parse_resolve(target)
+    # Re-read runtime AFTER resolve — rt-resolve may have refreshed the map.
+    # All guards must run against this single post-resolve snapshot.
+    runtime = read_runtime()
+    guard_route_in_runtime(runtime, route)
+    target_agent = route.get("agent", target)
+    # Verify the resolved surface actually belongs to the target agent.
+    # Multi-instance: rt-resolve reports agent=<base>, but runtime keys by
+    # instance id (e.g. codex#1, codex-build). Accept both base and instance.
+    route_surface = route.get("surface")
+    resolved_names = {route.get("agent"), route.get("instance"), target}
+    agents = runtime.get("agents") or {}
+    for name, agent_data in agents.items():
+        if agent_data.get("surface_ref") == route_surface and name not in resolved_names:
+            raise SystemExit(
+                f"rt-say: route mismatch — target '{target}' resolved to surface {route_surface} "
+                f"but that surface belongs to agent '{name}'. Run rt-refresh then rt-resolve {target} to fix."
+            )
+    if sender == target_agent and os.environ.get("RT_ALLOW_SELF_SEND", "0") != "1":
+        raise SystemExit(f"rt-say: refusing self-send from {sender} to {target}")
+
+    status = route.get("status", "unknown")
+    submit_cfg = load_submit_config(ROOT)
+    submit = submit_policy(target_agent, status, submit_cfg)
+    refs = [ref for ref in os.environ.get("RT_ACK_REFS", "").split(",") if ref] if ack_mode else []
+    if kind == "sync-ack" and not refs:
+        for part in body_arg.split():
+            if part.startswith("refs="):
+                refs = [ref for ref in part.removeprefix("refs=").split(",") if ref]
+                break
+    body = os.environ.get("RT_ACK_BODY") if ack_mode else body_arg
+    if ack_mode and body == "":
+        body = None
+
+    send_lock = LOCK_DIR / f"send-{target}.lock"
+    acquire_lock(send_lock)
+    try:
+        meta = {"pid": os.getpid(), "from": sender, "to": target, "created_at": utc_now()}
+        (send_lock / "meta.json").write_text(json.dumps(meta, ensure_ascii=False) + "\n")
+
+        msg_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{sender}-to-{target}-{os.getpid()}"
+        meta["msg_id"] = msg_id
+        (send_lock / "meta.json").write_text(json.dumps(meta, ensure_ascii=False) + "\n")
+        from_tag = sender.upper()
+        to_tag = target.upper()
+        rendered = f"[{from_tag}→{to_tag} {kind} id={msg_id}] {body_arg}".rstrip()
+        send_text = terminal_single_line(rendered)
+        if steer_prefix(target_agent, status, submit_cfg):
+            send_text = f"/steer {send_text}"
+
+        pending = base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, "pending", "rt-say")
+        append_ledger(sender, pending)
+
+        watcher = subprocess.Popen(
+            [
+                "cmux",
+                "events",
+                "--category",
+                "surface",
+                "--name",
+                "surface.input_sent",
+                "--no-ack",
+                "--no-heartbeat",
+                "--limit",
+                "10",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        started_at = time.time()
+        run("cmux", "send", "--workspace", route["workspace"], "--surface", route["surface"], send_text, stdout=subprocess.DEVNULL)
+        correlation = wait_surface_input(watcher, route["surface"], text_length(send_text), started_at)
+        injected = base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, "injected", "rt-say", correlation)
+        append_ledger(sender, injected)
+
+        if submit != "none":
+            settle_delay = submit_settle_delay(send_text)
+            time.sleep(settle_delay)
+            correlation["submit_settle_delay_ms"] = int(settle_delay * 1000)
+            run("cmux", "send-key", "--workspace", route["workspace"], "--surface", route["surface"], submit, stdout=subprocess.DEVNULL)
+        submitted = base_record(msg_id, sender, target, kind, body, rendered, send_text, route, submit, refs, "submitted", "rt-say", correlation)
+        append_ledger(sender, submitted)
+    finally:
+        release_lock(send_lock)
+
+    if verbose:
+        print(f"sent id={msg_id} from={sender} to={target} workspace={route['workspace']} surface={route['surface']} submit={submit}")
+    else:
+        print(f"sent {msg_id}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+from pathlib import Path
+
+from _rtlib import LIFECYCLE_ORDINAL, current_records, find_project_root, read_records, run_json
+
+TOOL_DIR = Path(__file__).resolve().parent
+ROOT = find_project_root("rt-inbox")
+STATE_DIR = ROOT / ".roundtable"
+RUNTIME = STATE_DIR / "runtime.json"
+MSG_DIR = STATE_DIR / "messages"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog="rt-inbox")
+    parser.add_argument("agent", nargs="?", help="agent or instance to inspect; defaults to inferred sender")
+    parser.add_argument("--all", action="store_true", help="include acked messages")
+    parser.add_argument("-f", "--format", choices=("text", "json"), default="text")
+    return parser.parse_args()
+
+
+def load_runtime(refresh=False):
+    if refresh or not RUNTIME.exists() or RUNTIME.stat().st_size == 0:
+        subprocess.run([str(TOOL_DIR / "rt-refresh")], check=True, stdout=subprocess.DEVNULL)
+    try:
+        return json.loads(RUNTIME.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def infer_agent():
+    env_from = os.environ.get("RT_FROM", "")
+    if env_from:
+        return env_from.lower()
+
+    runtime = load_runtime(refresh=False)
+    caller_surface = ""
+    try:
+        caller_surface = (run_json("cmux", "identify", "--json").get("caller") or {}).get("surface_ref") or ""
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+    for name, agent in (runtime.get("agents") or {}).items():
+        if agent.get("surface_ref") == caller_surface:
+            return name
+    if caller_surface:
+        runtime = load_runtime(refresh=True)
+        for name, agent in (runtime.get("agents") or {}).items():
+            if agent.get("surface_ref") == caller_surface:
+                return name
+    raise SystemExit("rt-inbox: could not infer agent from current cmux surface; pass agent or set RT_FROM")
+
+
+def one_line(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def truncate(value, width=80):
+    text = one_line(value)
+    if len(text) <= width:
+        return text
+    return text[: width - 3] + "..."
+
+
+def visible_records(agent, include_all):
+    all_records = read_records(MSG_DIR)
+    acked_refs = set()
+    for record in all_records:
+        if record.get("kind") != "sync-ack":
+            continue
+        refs = list(record.get("refs") or [])
+        if not refs:
+            for part in one_line(record.get("body", "")).split():
+                if part.startswith("refs="):
+                    refs.extend(ref for ref in part.removeprefix("refs=").split(",") if ref)
+                    break
+        acked_refs.update(refs)
+
+    records = list(current_records(all_records).values())
+    records.sort(key=lambda item: item.get("ts", ""))
+    visible = []
+    for record in records:
+        if (record.get("to") or "").lower() != agent:
+            continue
+        if record.get("kind") == "sync-ack":
+            continue
+        if not include_all and record.get("msg_id") in acked_refs:
+            continue
+        if not include_all and LIFECYCLE_ORDINAL.get(record.get("lifecycle"), -1) >= LIFECYCLE_ORDINAL["acked"]:
+            continue
+        visible.append(record)
+    return visible
+
+
+def print_text(records):
+    for record in records:
+        print(
+            f"{record.get('msg_id', '')}  "
+            f"{record.get('from', '')}  "
+            f"{record.get('kind', '')}  "
+            f"{record.get('lifecycle', '')}  "
+            f"{truncate(record.get('body', ''))}"
+        )
+
+
+def main():
+    args = parse_args()
+    agent = (args.agent or infer_agent()).lower()
+    records = visible_records(agent, args.all)
+    if args.format == "json":
+        print(json.dumps(records, ensure_ascii=False, indent=2))
+        return
+    print_text(records)
+
+
+if __name__ == "__main__":
+    main()

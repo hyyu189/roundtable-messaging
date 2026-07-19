@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from _rtlib import find_project_root, load_agents_doc
+
+TOOL_DIR = Path(__file__).resolve().parent
+
+
+def usage():
+    print("usage: rt-resolve <agent-or-instance>", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def valid_ref(prefix, value):
+    if value.startswith(f"{prefix}:"):
+        return True
+    parts = value.split("-")
+    return len(parts) == 5 and all(parts)
+
+
+def load_agents(root):
+    data = load_agents_doc(root, "rt-resolve")
+    return data.get("agents") or {}
+
+
+def resolve_config_target(root, target):
+    agents = load_agents(root)
+    target = target.lower()
+    for base, cfg in agents.items():
+        base_l = str(base).lower()
+        instances = cfg.get("instances") if isinstance(cfg, dict) else None
+        if not instances:
+            instances = [{"id": base_l, "session_id": None}]
+        normalized = []
+        for inst in instances:
+            if isinstance(inst, str):
+                inst = {"id": inst, "session_id": None}
+            item = dict(inst or {})
+            item["id"] = str(item.get("id") or base_l).lower()
+            item.setdefault("session_id", None)
+            normalized.append(item)
+        for inst in normalized:
+            if inst["id"] == target:
+                return base_l, inst
+        if base_l == target:
+            if len(normalized) == 1:
+                return base_l, normalized[0]
+            raise SystemExit(f"rt-resolve: {target} has multiple instances; use one of: " + ", ".join(i["id"] for i in normalized))
+    return target, {"id": target, "session_id": None}
+
+
+def load_runtime(root):
+    runtime = root / ".roundtable" / "runtime.json"
+    if not runtime.exists() or runtime.stat().st_size == 0:
+        subprocess.run([str(TOOL_DIR / "rt-refresh")], check=True, stdout=subprocess.DEVNULL)
+    try:
+        return json.loads(runtime.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def pick_runtime_agent(runtime, base, instance):
+    agents = runtime.get("agents") or {}
+    inst_id = instance.get("id")
+    session_id = instance.get("session_id")
+    candidates = []
+    for key in (inst_id, base):
+        if key and key in agents:
+            candidates.append((key, agents[key]))
+    if session_id:
+        for key, value in agents.items():
+            if value.get("session_id") == session_id:
+                return key, value
+        if candidates:
+            key, value = candidates[0]
+            value = dict(value)
+            value["session_id"] = session_id
+            return key, value
+        return None, None
+    return candidates[0] if candidates else (None, None)
+
+
+def main():
+    if len(sys.argv) != 2:
+        usage()
+    root = find_project_root("rt-resolve")
+    requested = sys.argv[1].lower()
+    base, instance = resolve_config_target(root, requested)
+    runtime = load_runtime(root)
+    key, data = pick_runtime_agent(runtime, base, instance)
+    if not data:
+        subprocess.run([str(TOOL_DIR / "rt-refresh")], check=True, stdout=subprocess.DEVNULL)
+        runtime = load_runtime(root)
+        key, data = pick_runtime_agent(runtime, base, instance)
+    if not data:
+        raise SystemExit(f"rt-resolve: unknown or unresolved agent: {requested}")
+
+    workspace = data.get("workspace_ref") or ""
+    surface = data.get("surface_ref") or ""
+    pane = data.get("pane_ref") or ""
+    if not valid_ref("surface", surface):
+        raise SystemExit(f"rt-resolve: refused non-ref surface handle: {surface}")
+    if not valid_ref("workspace", workspace):
+        raise SystemExit(f"rt-resolve: refused non-ref workspace handle: {workspace}")
+    if not valid_ref("pane", pane):
+        raise SystemExit(f"rt-resolve: refused non-ref pane handle: {pane}")
+
+    status = data.get("status") or "unknown"
+    extra = f" agent={base} instance={instance.get('id') or requested}"
+    if instance.get("session_id"):
+        extra += f" session_id={instance['session_id']}"
+    print(f"workspace={workspace} surface={surface} pane={pane} status={status}{extra}")
+
+
+if __name__ == "__main__":
+    main()
