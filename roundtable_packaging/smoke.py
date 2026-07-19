@@ -1,0 +1,222 @@
+"""Exercise durable send, inbox, ack, and drain without a cmux executable."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+MESSAGE_ID_RE = re.compile(r"sent maildir-only (?P<id>\S+)")
+
+
+class SmokeFailure(RuntimeError):
+    pass
+
+
+def default_bin_dir() -> Path:
+    installed = Path(sys.executable).absolute().parent
+    if (installed / "rt-say").is_file():
+        return installed
+    return SOURCE_ROOT / "bin"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run an isolated Roundtable maildir smoke test without cmux."
+    )
+    parser.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=default_bin_dir(),
+        help="directory containing rt-say, rt-inbox, and rt-ack",
+    )
+    return parser.parse_args(argv)
+
+
+def tool_command(bin_dir: Path, name: str) -> list[str]:
+    path = (bin_dir / name).expanduser().absolute()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise SmokeFailure(f"missing executable: {path}")
+    try:
+        first_line = path.read_text(errors="ignore").splitlines()[0]
+    except (OSError, IndexError):
+        first_line = ""
+    if first_line.startswith("#!/usr/bin/env python"):
+        return [sys.executable, str(path)]
+    return [str(path)]
+
+
+def run_tool(
+    commands: dict[str, list[str]],
+    name: str,
+    *arguments: str,
+    cwd: Path,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [*commands[name], *arguments],
+        cwd=cwd,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SmokeFailure(
+            f"{name} exited {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return result
+
+
+def write_project(root: Path) -> None:
+    state = root / ".roundtable"
+    state.mkdir(parents=True)
+    (state / "agents.yaml").write_text(
+        "schema: roundtable.agents.v1\n"
+        f"project: {root}\n"
+        "agents:\n"
+        "  codex:\n"
+        "    harness: codex\n"
+        "    instances:\n"
+        "      - id: codex\n"
+        "  claude:\n"
+        "    harness: claude-code\n"
+        "    instances:\n"
+        "      - id: claude\n"
+    )
+
+
+def smoke(bin_dir: Path) -> dict:
+    commands = {
+        name: tool_command(bin_dir, name)
+        for name in ("rt-say", "rt-inbox", "rt-ack")
+    }
+    with tempfile.TemporaryDirectory(prefix="roundtable-no-cmux-") as temporary:
+        workspace = Path(temporary)
+        home = workspace / "home"
+        project = workspace / "project"
+        home.mkdir()
+        project.mkdir()
+        write_project(project)
+
+        environment = os.environ.copy()
+        isolated_path = f"{Path(sys.executable).absolute().parent}:/usr/bin:/bin"
+        if shutil.which("cmux", path=isolated_path) is not None:
+            raise SmokeFailure("isolated smoke PATH unexpectedly contains cmux")
+        environment.update(
+            {
+                "HOME": str(home),
+                "PATH": isolated_path,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "ROUNDTABLE_PROJECT_DIR": str(project),
+                "RT_FALLBACK_PROJECT": "",
+                "RT_FROM": "codex",
+                "RT_PROJECTS_FILE": "/dev/null",
+                "CMUX_SURFACE_ID": "",
+                "CODEX_THREAD_ID": "",
+            }
+        )
+        sent = run_tool(
+            commands,
+            "rt-say",
+            "--no-nudge",
+            "claude",
+            "directive",
+            "offline delivery smoke",
+            cwd=project,
+            environment=environment,
+        )
+        match = MESSAGE_ID_RE.search(sent.stdout)
+        if match is None:
+            raise SmokeFailure(f"could not parse rt-say output: {sent.stdout.strip()}")
+        message_id = match.group("id")
+
+        listed = run_tool(
+            commands,
+            "rt-inbox",
+            "claude",
+            "--format",
+            "json",
+            cwd=project,
+            environment=environment,
+        )
+        records = json.loads(listed.stdout)
+        if (
+            not records
+            or {record.get("msg_id") for record in records} != {message_id}
+            or not any(
+                record.get("delivery_source") == "maildir" for record in records
+            )
+        ):
+            raise SmokeFailure(
+                "recipient inbox does not contain the sent maildir message"
+            )
+
+        ack_environment = dict(environment)
+        ack_environment["RT_FROM"] = ""
+        run_tool(
+            commands,
+            "rt-ack",
+            message_id,
+            "smoke received",
+            cwd=project,
+            environment=ack_environment,
+        )
+        ack_files = list(
+            (project / ".roundtable" / "inbox" / "codex" / "new").glob("ack-*.md")
+        )
+        if len(ack_files) != 1 or f"refs={message_id}" not in ack_files[0].read_text():
+            raise SmokeFailure("sender mailbox does not contain the expected quiet ack")
+
+        new_path = (
+            project
+            / ".roundtable"
+            / "inbox"
+            / "claude"
+            / "new"
+            / f"{message_id}.md"
+        )
+        current = new_path.parents[1] / "cur"
+        current.mkdir(exist_ok=True)
+        new_path.rename(current / new_path.name)
+        drained = run_tool(
+            commands,
+            "rt-inbox",
+            "claude",
+            "--format",
+            "json",
+            cwd=project,
+            environment=environment,
+        )
+        if json.loads(drained.stdout) != []:
+            raise SmokeFailure("recipient inbox is not empty after drain")
+
+        return {
+            "status": "passed",
+            "transport": "maildir",
+            "cmux": "absent",
+            "message_id": message_id,
+            "ack_files": len(ack_files),
+            "recipient_inbox_after_drain": 0,
+        }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        print(json.dumps(smoke(args.bin_dir), sort_keys=True))
+        return 0
+    except (SmokeFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
+        print(f"roundtable no-cmux smoke failed: {error}", file=sys.stderr)
+        return 1

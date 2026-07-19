@@ -47,6 +47,16 @@ The source fallback builds a local project wheel without network access and
 creates its private environment with access to the bootstrap interpreter's
 PyYAML. This mode is for development and verification.
 
+Verify the installed maildir core in an isolated HOME and PATH:
+
+```bash
+roundtable-smoke-no-cmux
+```
+
+The command refuses a smoke PATH containing cmux and exercises send, inbox,
+quiet acknowledgement, and drain without touching the real registry, projects,
+or daemon.
+
 ## Offline release install
 
 A release archive will include a `wheels/` directory containing the Roundtable

@@ -79,6 +79,7 @@ when an existing path is not owned by its managed manifest. Uninstallation
 preserves the project registry, runtime state, and every project-local mailbox:
 
 ```bash
+roundtable-smoke-no-cmux
 roundtable-uninstall
 ```
 

@@ -32,6 +32,7 @@ test = [
 ]
 
 [project.scripts]
+roundtable-smoke-no-cmux = "roundtable_packaging.smoke:main"
 roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
 
 [tool.setuptools]

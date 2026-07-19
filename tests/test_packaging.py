@@ -156,6 +156,17 @@ def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path
     assert root_probe.returncode == 0, root_probe.stderr
     assert root_probe.stdout.strip() == str(prefix / "current")
 
+    smoke = subprocess.run(
+        [str(link_dir / "roundtable-smoke-no-cmux")],
+        env=packaging_env(home),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert smoke.returncode == 0, smoke.stderr
+    assert json.loads(smoke.stdout)["status"] == "passed"
+
     wrapper_hashes = {
         path: digest(Path(path))
         for path in manifest["files"]
