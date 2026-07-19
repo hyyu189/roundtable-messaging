@@ -380,6 +380,7 @@ def say_project(tmp_path, *, target_status="idle"):
     trace_dir = tmp_path / "cmux-trace"
     trace_dir.mkdir()
     env["CMUX_FAKE_TRACE_DIR"] = str(trace_dir)
+    env["RT_FROM"] = "codex"
     return project, state, env, trace_dir
 
 
@@ -423,7 +424,7 @@ def test_rt_resolve_uses_fallback_project_when_cwd_is_not_project(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "workspace=workspace:7" in proc.stdout
     assert "surface=surface:8" in proc.stdout
-    assert sentinel.read_text().splitlines() == ["identify --json --id-format both"]
+    assert not sentinel.exists()
     assert runtime_path.read_text() == runtime_before
 
 
@@ -698,11 +699,8 @@ def test_rt_say_default_maildir_writes_exact_mail_without_legacy_nudge(tmp_path)
     assert records[0]["workspace_ref"] is None
     assert records[0]["surface_ref"] is None
     calls = read_cmux_calls(trace_dir)
-    send_calls = [call for call in calls if call[:1] == ["send"]]
-    key_calls = [call for call in calls if call[:1] == ["send-key"]]
-    assert send_calls == []
+    assert calls == []
     assert records[0]["send_text"] == f"[CODEX→CLAUDE question id={msg_id}] line 1 line 2 with spaces"
-    assert key_calls == []
 
 
 def test_rt_say_explicit_legacy_preserves_busy_submit_policy_per_harness(tmp_path):
@@ -942,13 +940,18 @@ def test_rt_say_no_nudge_rejects_same_multi_instance_but_allows_sibling(tmp_path
     assert read_cmux_calls(trace_dir) == []
 
 
-def test_rt_say_default_and_legacy_keep_live_caller_while_no_nudge_uses_explicit_sender(tmp_path):
-    project, state, env, _trace_dir = say_project(tmp_path / "maildir")
+def test_default_maildir_uses_harness_identity_while_legacy_keeps_live_caller(
+    tmp_path,
+):
+    project, state, env, trace_dir = say_project(tmp_path / "maildir")
     env["RT_FROM"] = "claude"
-    proc = run_tool("rt-say", "hermes", "fyi", "caller wins", cwd=project, env=env)
+    proc = run_tool(
+        "rt-say", "hermes", "fyi", "harness identity wins", cwd=project, env=env
+    )
     assert proc.returncode == 0, proc.stderr
-    assert len(read_ledger(state, "codex")) == 1
-    assert read_ledger(state, "claude") == []
+    assert read_ledger(state, "codex") == []
+    assert len(read_ledger(state, "claude")) == 1
+    assert read_cmux_calls(trace_dir) == []
 
     project, state, env, _trace_dir = say_project(tmp_path / "legacy")
     env["RT_FROM"] = "claude"
@@ -1923,7 +1926,9 @@ def test_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_pa
     assert read_cmux_calls(trace_dir) == []
 
 
-def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
+def test_maildir_sender_uses_harness_identity_without_probing_ambient_cmux(
+    tmp_path,
+):
     project, state, env, trace_dir = say_project(tmp_path)
     env.update(
         {
@@ -1941,17 +1946,18 @@ def test_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_p
         }
     )
 
-    proc = run_tool("rt-say", "claude", "fyi", "self send", cwd=project, env=env)
+    proc = run_tool(
+        "rt-say", "claude", "fyi", "harness identity", cwd=project, env=env
+    )
 
-    assert proc.returncode != 0
-    assert "refusing self-send from claude to claude" in proc.stderr
-    assert not (state / "inbox").exists()
-    assert read_ledger(state, sender="codex") == []
-    calls = read_cmux_calls(trace_dir)
-    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+    assert proc.returncode == 0, proc.stderr
+    assert [record["from"] for record in read_ledger(state, sender="codex")] == [
+        "codex"
+    ]
+    assert read_cmux_calls(trace_dir) == []
 
 
-def test_maildir_best_effort_caller_probe_failure_is_silent(tmp_path):
+def test_maildir_default_does_not_probe_even_an_unhealthy_cmux(tmp_path):
     project, state, env, trace_dir = say_project(tmp_path)
     env.update({"RT_FROM": "codex", "CMUX_FAKE_FAIL_IDENTIFY": "1"})
 
@@ -1960,8 +1966,7 @@ def test_maildir_best_effort_caller_probe_failure_is_silent(tmp_path):
     assert proc.returncode == 0
     assert proc.stderr == ""
     assert proc.stdout.startswith("sent maildir-only ")
-    calls = read_cmux_calls(trace_dir)
-    assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
+    assert read_cmux_calls(trace_dir) == []
 
 
 def test_default_maildir_sender_uses_unique_codex_thread_environment_without_cmux(tmp_path):
@@ -1993,8 +1998,8 @@ def test_default_maildir_sender_uses_unique_codex_thread_environment_without_cmu
     assert [call for call in calls if call[:1] in (["send"], ["send-key"])] == []
 
 
-def test_default_maildir_sender_keeps_live_caller_authority_over_stale_environment(tmp_path):
-    project, state, env, _trace_dir = say_project(tmp_path)
+def test_default_maildir_sender_ignores_terminal_surface_identity(tmp_path):
+    project, state, env, trace_dir = say_project(tmp_path)
     runtime_path = state / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
     hermes_route = {
@@ -2022,11 +2027,16 @@ def test_default_maildir_sender_keeps_live_caller_authority_over_stale_environme
         }
     )
 
-    proc = run_tool("rt-say", "hermes", "fyi", "caller wins", cwd=project, env=env)
+    proc = run_tool(
+        "rt-say", "hermes", "fyi", "harness identity wins", cwd=project, env=env
+    )
 
     assert proc.returncode == 0, proc.stderr
-    assert read_ledger(state, sender="codex") == []
-    assert [record["from"] for record in read_ledger(state, sender="claude")] == ["claude"]
+    assert [record["from"] for record in read_ledger(state, sender="codex")] == [
+        "codex"
+    ]
+    assert read_ledger(state, sender="claude") == []
+    assert read_cmux_calls(trace_dir) == []
 
 
 def test_maildir_rt_ack_uses_unique_codex_thread_environment_without_cmux(tmp_path):

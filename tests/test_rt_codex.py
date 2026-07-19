@@ -96,6 +96,48 @@ def add_mail(project: Path, msg_id: str) -> Path:
     return path
 
 
+def test_needs_human_notification_falls_back_to_macos_without_cmux(
+    tmp_path,
+    monkeypatch,
+):
+    project = write_project(tmp_path / "project")
+    events = []
+    commands = []
+
+    monkeypatch.setattr(
+        wake.shutil,
+        "which",
+        lambda name: "/usr/bin/osascript" if name == "osascript" else None,
+    )
+    monkeypatch.setattr(
+        wake,
+        "log_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(wake.subprocess, "run", run)
+
+    wake.notify_needs_human(
+        project,
+        "thread-1",
+        "generation-1",
+        "turn-1",
+        "approval",
+        "approval required",
+    )
+
+    assert commands and commands[0][0] == "/usr/bin/osascript"
+    assert [event for event, _fields in events] == [
+        "wake_needs_human",
+        "needs_human_notification_sent",
+    ]
+    assert events[-1][1]["provider"] == "macos"
+
+
 def thread(project: Path, status: str = "idle", thread_id: str = "thread-1") -> dict:
     return {
         "id": thread_id,

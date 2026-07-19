@@ -1,4 +1,4 @@
-"""Exercise durable send, inbox, ack, and drain without a cmux executable."""
+"""Exercise the terminal-independent send, inbox, ack, and drain baseline."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +29,7 @@ def default_bin_dir() -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run an isolated Roundtable maildir smoke test without cmux."
+        description="Run the isolated terminal-independent Roundtable baseline."
     )
     parser.add_argument(
         "--bin-dir",
@@ -102,7 +101,7 @@ def smoke(bin_dir: Path) -> dict:
         name: tool_command(bin_dir, name)
         for name in ("rt-say", "rt-inbox", "rt-ack")
     }
-    with tempfile.TemporaryDirectory(prefix="roundtable-no-cmux-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="roundtable-terminal-smoke-") as temporary:
         workspace = Path(temporary)
         home = workspace / "home"
         project = workspace / "project"
@@ -111,26 +110,51 @@ def smoke(bin_dir: Path) -> dict:
         write_project(project)
 
         environment = os.environ.copy()
-        isolated_path = f"{Path(sys.executable).absolute().parent}:/usr/bin:/bin"
-        if shutil.which("cmux", path=isolated_path) is not None:
-            raise SmokeFailure("isolated smoke PATH unexpectedly contains cmux")
+        adapter_bin = workspace / "optional-adapter-bin"
+        adapter_bin.mkdir()
+        adapter_sentinel = workspace / "terminal-adapter-invoked"
+        fake_cmux = adapter_bin / "cmux"
+        fake_cmux.write_text(
+            "#!/bin/sh\n"
+            'printf "invoked\\n" > "$RT_SMOKE_ADAPTER_SENTINEL"\n'
+            "exit 99\n"
+        )
+        fake_cmux.chmod(0o755)
+        isolated_path = (
+            f"{adapter_bin}:{Path(sys.executable).absolute().parent}:/usr/bin:/bin"
+        )
+        state = project / ".roundtable"
+        (state / "runtime.json").write_text(
+            json.dumps(
+                {
+                    "schema": "roundtable.runtime.v1",
+                    "project": str(project),
+                    "workspace_ref": "stale:workspace",
+                    "agents": {
+                        "codex": {"surface_ref": "stale:codex"},
+                        "claude": {"surface_ref": "stale:claude"},
+                    },
+                }
+            )
+            + "\n"
+        )
         environment.update(
             {
                 "HOME": str(home),
                 "PATH": isolated_path,
                 "PYTHONDONTWRITEBYTECODE": "1",
-                "ROUNDTABLE_PROJECT_DIR": str(project),
+                "ROUNDTABLE_PROJECT_DIR": "",
                 "RT_FALLBACK_PROJECT": "",
                 "RT_FROM": "codex",
                 "RT_PROJECTS_FILE": "/dev/null",
                 "CMUX_SURFACE_ID": "",
                 "CODEX_THREAD_ID": "",
+                "RT_SMOKE_ADAPTER_SENTINEL": str(adapter_sentinel),
             }
         )
         sent = run_tool(
             commands,
             "rt-say",
-            "--no-nudge",
             "claude",
             "directive",
             "offline delivery smoke",
@@ -201,11 +225,15 @@ def smoke(bin_dir: Path) -> dict:
         )
         if json.loads(drained.stdout) != []:
             raise SmokeFailure("recipient inbox is not empty after drain")
+        if adapter_sentinel.exists():
+            raise SmokeFailure("terminal baseline invoked an optional adapter")
 
         return {
             "status": "passed",
+            "profile": "terminal-baseline",
             "transport": "maildir",
-            "cmux": "absent",
+            "terminal_emulator": "not-required",
+            "optional_adapters_loaded": [],
             "message_id": message_id,
             "ack_files": len(ack_files),
             "recipient_inbox_after_drain": 0,
@@ -218,5 +246,5 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(smoke(args.bin_dir), sort_keys=True))
         return 0
     except (SmokeFailure, OSError, UnicodeError, json.JSONDecodeError) as error:
-        print(f"roundtable no-cmux smoke failed: {error}", file=sys.stderr)
+        print(f"roundtable terminal smoke failed: {error}", file=sys.stderr)
         return 1

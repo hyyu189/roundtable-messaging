@@ -22,7 +22,7 @@ from _rtlib import (
 TOOL_DIR = Path(__file__).resolve().parent
 
 
-ROOT = find_project_root("rt-refresh")
+ROOT = find_project_root("rt-refresh", allow_cmux_workspace=True)
 STATE_DIR = ROOT / ".roundtable"
 RUNTIME = STATE_DIR / "runtime.json"
 LOCK_DIR = STATE_DIR / "locks"

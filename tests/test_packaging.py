@@ -157,7 +157,7 @@ def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path
     assert root_probe.stdout.strip() == str(prefix / "current")
 
     smoke = subprocess.run(
-        [str(link_dir / "roundtable-smoke-no-cmux")],
+        [str(link_dir / "roundtable-smoke")],
         env=packaging_env(home),
         text=True,
         stdout=subprocess.PIPE,
@@ -293,6 +293,56 @@ def test_modified_wrapper_makes_uninstall_fail_closed(tmp_path):
     assert wrapper.exists()
     assert (prefix / "current").is_symlink()
     assert (prefix / "install-manifest.json").exists()
+
+
+def test_same_version_reinstall_rejects_modified_installed_tool(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    installed = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    tool = prefix / "current" / "bin" / "rt-say"
+    tool.write_text("#!/bin/sh\nexit 99\n")
+    repeated = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+
+    assert repeated.returncode == 1
+    assert "managed tool is missing or modified: rt-say" in repeated.stderr
+    assert tool.read_text() == "#!/bin/sh\nexit 99\n"
+
+
+def test_install_shell_rejects_unsupported_bootstrap_python(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+
+    process = run_script(
+        INSTALL,
+        "--prefix",
+        str(home / ".roundtable"),
+        "--link-dir",
+        str(home / ".local" / "bin"),
+        home=home,
+        env={"ROUNDTABLE_BOOTSTRAP_PYTHON": "/usr/bin/false"},
+    )
+
+    assert process.returncode == 1
+    assert "must be CPython 3.11 through 3.14" in process.stderr
+    assert not (home / ".roundtable").exists()
 
 
 def test_tampered_manifest_cannot_delete_outside_prefix(tmp_path):

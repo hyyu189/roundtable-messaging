@@ -23,6 +23,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
 ]
 
@@ -32,7 +33,7 @@ test = [
 ]
 
 [project.scripts]
-roundtable-smoke-no-cmux = "roundtable_packaging.smoke:main"
+roundtable-smoke = "roundtable_packaging.smoke:main"
 roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
 
 [tool.setuptools]
@@ -65,9 +66,11 @@ package-dir = { "" = "bin", "roundtable_packaging" = "roundtable_packaging" }
 [tool.setuptools.data-files]
 "share/roundtable" = ["LICENSE", "NOTICE"]
 "share/roundtable/docs" = [
+  "docs/architecture.md",
   "docs/compatibility.md",
   "docs/install.md",
   "docs/legacy-v1-keyboard.md",
+  "docs/release.md",
   "docs/rt-codex-phase3.md",
   "docs/wp21-quiet-ack-nudge-retirement.md",
 ]

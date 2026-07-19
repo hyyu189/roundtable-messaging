@@ -9,7 +9,7 @@ MANAGED_MARKER = ".roundtable-managed.json"
 
 TOOLS = (
     "roundtable-init",
-    "roundtable-smoke-no-cmux",
+    "roundtable-smoke",
     "roundtable-uninstall",
     "rt-ack",
     "rt-claude",

@@ -122,9 +122,11 @@ the registry menu only on a TTY; non-interactive use fails with exit 2 instead
 of waiting for input. Codex retains its `--remote unix://` injection, while
 Claude and Hermes receive their original arguments unchanged.
 
-All three installed SessionStart mechanisms already call `rt-watch-ensure`,
-which delegates to `rt-startup-advisory` outside a project. No harness-private
-hook rewrite is required for WP4.
+At the time of this historical Phase 3 proof, the local harness configurations
+called `rt-watch-ensure`. That watcher and its SessionStart path are now
+retired. The current release treats `rt-startup-advisory` as an optional cmux
+integration and still requires ownership-safe Claude/Hermes hook onboarding;
+see `architecture.md`.
 
 Installing the bridge does not migrate an already-running embedded TUI. The
 current cmux Codex session must only be restarted through `rt-codex` during the

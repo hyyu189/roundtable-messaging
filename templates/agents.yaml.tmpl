@@ -1,37 +1,20 @@
 schema: roundtable.agents.v1
 project: ${project_dir}
-# submit: retained only for the explicit --legacy-nudge-only emergency path.
-# Normal rt-say delivery is always maildir; no delivery field is required.
-# detect.screen: model-independent banner signatures used by rt-refresh to place a
-#   fresh agent (one that hasn't checkpointed yet, so has no cmux resume_binding).
-# instances: one per running session; add `match: {cwd|title}` to pin multi-instance ids.
+# instances: one per running session. Identity comes from the harness launcher,
+# never from a terminal surface. Optional cmux topology match/detect and legacy
+# keyboard-submit settings may be added separately when that adapter is used.
 agents:
   claude:
     harness: claude-code
     instances:
       - id: claude
-    submit:
-      idle: enter
-      busy: send_only
-    detect:
-      screen: ["Claude Code"]
 
   codex:
     harness: codex
     instances:
       - id: codex
-    submit:
-      idle: enter
-      busy: tab
-    detect:
-      screen: ["OpenAI Codex"]
 
   hermes:
     harness: hermes-agent
     instances:
       - id: hermes
-    submit:
-      idle: enter
-      busy: steer
-    detect:
-      screen: ["Welcome to Hermes Agent", "⚕"]

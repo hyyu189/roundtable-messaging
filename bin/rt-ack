@@ -74,11 +74,10 @@ def main():
         env["RT_ACK_BODY"] = body
         env["RT_FROM"] = explicit_sender or inferred_sender
         # Every ref has already agreed on the message recipient and any
-        # explicit RT_FROM has been checked against it. Keep an ambient cmux
-        # caller from overriding that validated acknowledger identity.
+        # explicit RT_FROM has been checked against it. The normal maildir path
+        # consumes this validated harness identity without a terminal adapter.
         command = [
             str(TOOL_DIR / "rt-say"),
-            "--no-nudge",
             target,
             "sync-ack",
             visible_body,

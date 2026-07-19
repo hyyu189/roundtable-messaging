@@ -24,6 +24,9 @@ from pathlib import Path
 
 from . import LAUNCH_AGENT_LABELS, MANAGED_MARKER, MANIFEST_SCHEMA, TOOLS, VERSION
 
+SUPPORTED_PYTHON_MIN = (3, 11)
+SUPPORTED_PYTHON_MAX = (3, 14)
+
 
 class InstallError(RuntimeError):
     """A fail-closed packaging or ownership error."""
@@ -65,6 +68,56 @@ def _sha256_path(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _probe_python(path: Path) -> tuple[str, tuple[int, int, int]]:
+    process = subprocess.run(
+        [
+            str(path),
+            "-c",
+            (
+                "import json,sys;"
+                "print(json.dumps({'implementation':sys.implementation.name,"
+                "'version':list(sys.version_info[:3])}))"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or f"exit {process.returncode}"
+        raise InstallError(f"cannot inspect bootstrap Python {path}: {detail}")
+    try:
+        value = json.loads(process.stdout)
+        implementation = value["implementation"]
+        raw_version = value["version"]
+        version = tuple(int(part) for part in raw_version)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise InstallError(f"invalid bootstrap Python probe from {path}") from error
+    if (
+        not isinstance(implementation, str)
+        or len(version) != 3
+        or any(part < 0 for part in version)
+    ):
+        raise InstallError(f"invalid bootstrap Python probe from {path}")
+    return implementation, version
+
+
+def _validate_bootstrap_python(path: Path) -> tuple[int, int, int]:
+    implementation, version = _probe_python(path)
+    if (
+        implementation != "cpython"
+        or not SUPPORTED_PYTHON_MIN <= version[:2] <= SUPPORTED_PYTHON_MAX
+    ):
+        raise InstallError(
+            f"bootstrap Python must be CPython "
+            f"{SUPPORTED_PYTHON_MIN[0]}.{SUPPORTED_PYTHON_MIN[1]} through "
+            f"{SUPPORTED_PYTHON_MAX[0]}.{SUPPORTED_PYTHON_MAX[1]}; "
+            f"found {implementation} {'.'.join(str(part) for part in version)} at {path}"
+        )
+    return version
 
 
 def _json_bytes(value: object) -> bytes:
@@ -280,13 +333,10 @@ def _preflight_install(
 
     version_dir = _version_dir(prefix)
     if version_dir.exists():
-        marker = version_dir / MANAGED_MARKER
         try:
-            value = json.loads(marker.read_text())
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            value = None
-        if not isinstance(value, dict) or value.get("version") != VERSION:
-            conflicts.append(f"{version_dir}: missing matching managed marker")
+            _validate_version_dir(version_dir)
+        except InstallError as error:
+            conflicts.append(str(error))
 
     if conflicts:
         rendered = "\n".join(f"  - {item}" for item in conflicts)
@@ -396,6 +446,12 @@ def _create_version(
 ) -> Path:
     destination = _version_dir(prefix)
     if destination.exists():
+        _validate_version_dir(
+            destination,
+            expected_project_wheel_sha256=(
+                None if source_mode else _sha256_path(project_wheel)
+            ),
+        )
         return destination
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +509,10 @@ def _create_version(
             "schema": MANIFEST_SCHEMA,
             "version": VERSION,
             "project_wheel_sha256": _sha256_path(project_wheel),
+            "tools": {
+                tool: _sha256_path(destination / "bin" / tool)
+                for tool in TOOLS
+            },
         }
         _atomic_write(
             destination / MANAGED_MARKER,
@@ -465,6 +525,58 @@ def _create_version(
         if destination.exists() and not marker.exists():
             shutil.rmtree(destination)
         raise
+
+
+def _validate_version_dir(
+    destination: Path,
+    *,
+    expected_project_wheel_sha256: str | None = None,
+) -> dict:
+    marker_path = destination / MANAGED_MARKER
+    try:
+        marker = json.loads(marker_path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InstallError(
+            f"{destination}: cannot read matching managed marker"
+        ) from error
+    if (
+        not isinstance(marker, dict)
+        or marker.get("schema") != MANIFEST_SCHEMA
+        or marker.get("version") != VERSION
+    ):
+        raise InstallError(f"{destination}: missing matching managed marker")
+    project_digest = marker.get("project_wheel_sha256")
+    if not isinstance(project_digest, str) or len(project_digest) != 64:
+        raise InstallError(f"{destination}: invalid project wheel digest")
+    if (
+        expected_project_wheel_sha256 is not None
+        and project_digest != expected_project_wheel_sha256
+    ):
+        raise InstallError(
+            f"{destination}: installed project wheel does not match this release"
+        )
+    tool_digests = marker.get("tools")
+    if not isinstance(tool_digests, dict) or set(tool_digests) != set(TOOLS):
+        raise InstallError(f"{destination}: invalid managed tool digest set")
+    for tool, expected in tool_digests.items():
+        path = destination / "bin" / tool
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or not path.is_file()
+            or not os.access(path, os.X_OK)
+            or _sha256_path(path) != expected
+        ):
+            raise InstallError(f"{destination}: managed tool is missing or modified: {tool}")
+    templates = destination / "templates"
+    expected_templates = destination / "share" / "roundtable" / "templates"
+    if (
+        not templates.is_symlink()
+        or templates.resolve(strict=False) != expected_templates.resolve(strict=False)
+        or not expected_templates.is_dir()
+    ):
+        raise InstallError(f"{destination}: managed templates are missing or modified")
+    return marker
 
 
 def _install_parser() -> argparse.ArgumentParser:
@@ -488,6 +600,7 @@ def install_main(argv: list[str] | None = None) -> int:
         bootstrap_python = _absolute(args.python)
         if not bootstrap_python.is_file() or not os.access(bootstrap_python, os.X_OK):
             raise InstallError(f"bootstrap Python is not executable: {bootstrap_python}")
+        _validate_bootstrap_python(bootstrap_python)
 
         source_root = _absolute(args.source_root) if args.source_root else None
         wheel_dir_arg = _absolute(args.wheel_dir) if args.wheel_dir else None

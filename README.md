@@ -20,8 +20,10 @@ separates durable delivery from wake-up:
 3. the recipient drains, acknowledges, and archives the message;
 4. an offline recipient keeps the message until it returns.
 
-The intended core path works in a normal macOS terminal without cmux. cmux
-remains an optional integration rather than a transport dependency.
+The core has no terminal-emulator dependency. Terminal.app, iTerm2, Ghostty,
+and other normal terminal hosts use the same delivery and harness-adapter path.
+cmux adds optional workspace/topology features rather than a different class of
+transport.
 
 ## Build Week scope
 
@@ -33,7 +35,9 @@ to make the rewrite reviewable.
 - [Development and attribution boundary](PROVENANCE.md)
 - [Contributor roles](CREDITS.md)
 - [Source commit ledger](docs/provenance/source-commits.tsv)
+- [Architecture and adapter boundaries](docs/architecture.md)
 - [Runtime compatibility and validation](docs/compatibility.md)
+- [Release artifact process](docs/release.md)
 
 Ocean directed the product. GPT-5.6 through Codex was the primary implementation
 environment. Fable 5 contributed specified early code, documentation,
@@ -46,10 +50,10 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 
 | Surface | Status |
 | --- | --- |
-| Core maildir delivery on macOS without cmux | Covered by the imported regression suite; judge-path packaging is in progress |
+| Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | npm Codex CLI `0.144.6` | Exact-release protocol smoke passed; clean daemon reload and full wake E2E remain a release gate |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
-| cmux | Optional topology integration; core delivery, inbox, ack, and launcher identity do not require it |
+| cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
 | tmux and cross-host SSH | Not yet supported |
 
 ## Release target
@@ -60,7 +64,8 @@ The Build Week P0 release is complete only when it provides:
 - a five-minute judge path from a packaged release;
 - verified support for the current npm Codex and an honestly tested standalone
   path;
-- a no-cmux terminal end-to-end path;
+- a terminal-emulator-independent end-to-end path across the mainstream
+  terminal UX matrix;
 - accurate diagnostics, recovery, tests, and public-safety checks.
 
 Same-host tmux support is P1. Cross-host transport, Linux service management,
@@ -79,7 +84,7 @@ when an existing path is not owned by its managed manifest. Uninstallation
 preserves the project registry, runtime state, and every project-local mailbox:
 
 ```bash
-roundtable-smoke-no-cmux
+roundtable-smoke
 roundtable-uninstall
 ```
 

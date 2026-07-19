@@ -236,19 +236,6 @@ def read_runtime(refresh=False):
     return runtime
 
 
-def read_existing_runtime():
-    """Best-effort read for caller authority without adding a topology dependency."""
-    try:
-        if not RUNTIME.is_file() or RUNTIME.stat().st_size == 0:
-            return None
-        runtime = json.loads(RUNTIME.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(runtime, dict) or runtime.get("project") != str(ROOT):
-        return None
-    return runtime
-
-
 def guard_route_in_runtime(runtime, route):
     runtime_workspace = runtime.get("workspace_ref")
     if route.get("workspace") != runtime_workspace:
@@ -542,22 +529,11 @@ def main():
         validate_agent_component(explicit_sender, "sender")
     if maildir_only:
         target_agent, target_instance = configured_target(ROOT, target)
-        if explicit_no_nudge:
-            # Preserve the compatibility flag's historical contract: an
-            # explicit sender does not require a live cmux caller probe.
-            sender = explicit_sender or infer_sender_from_harness_env(ROOT)
-            if not sender:
-                runtime = read_existing_runtime()
-                sender = infer_live_caller(runtime) if runtime is not None else ""
-        else:
-            # Normal delivery retains live-caller authority. Inherited app
-            # server identity is a fallback only when no live caller matches.
-            runtime = read_existing_runtime()
-            sender = (
-                (infer_live_caller(runtime) if runtime is not None else "")
-                or explicit_sender
-                or infer_sender_from_harness_env(ROOT)
-            )
+        # Identity belongs to the harness adapter, not the terminal emulator.
+        # Launchers inject RT_FROM; Codex app-server turns expose
+        # CODEX_THREAD_ID. The compatibility --no-nudge flag is intentionally
+        # identical to the normal maildir path.
+        sender = explicit_sender or infer_sender_from_harness_env(ROOT)
     else:
         runtime = read_runtime()
         # Preserve WP1 caller authority: a live cmux caller wins over all

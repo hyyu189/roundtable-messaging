@@ -7,9 +7,9 @@ manifest and stops before overwriting an unrelated or locally modified path.
 ## Current status
 
 The source-install path has passed clean-home installation, repeated-install,
-conflict, command, and uninstall tests. It is a development preview, not yet the
-Build Week release artifact. The release gate still requires an offline
-wheelhouse, archive checksums, and a clean-machine smoke test.
+conflict, command, and uninstall tests. A deterministic offline artifact builder
+is available, but its output remains a release candidate until the extracted
+archive, harness onboarding, and real wake matrix pass the promotion gates.
 
 Do not run the default command over an active pre-manifest `~/.roundtable`
 installation. Preview it in isolated paths instead:
@@ -35,7 +35,7 @@ state, not versioned program files.
 
 ## Source install
 
-Source installation requires Python 3.11 through 3.13 with PyYAML, setuptools
+Source installation requires CPython 3.11 through 3.14 with PyYAML, setuptools
 77 or newer, and wheel available to the bootstrap interpreter. On the
 development machine:
 
@@ -50,12 +50,17 @@ PyYAML. This mode is for development and verification.
 Verify the installed maildir core in an isolated HOME and PATH:
 
 ```bash
-roundtable-smoke-no-cmux
+roundtable-smoke
 ```
 
-The command refuses a smoke PATH containing cmux and exercises send, inbox,
-quiet acknowledgement, and drain without touching the real registry, projects,
-or daemon.
+The command exercises the common terminal baseline—send, inbox, quiet
+acknowledgement, and drain—without touching the real registry, projects, or
+daemon. Its isolated test environment loads no optional terminal adapter.
+
+This core smoke does not configure Claude or Hermes hooks, install the Codex
+wake services, or bind a Codex thread. See
+[Architecture and adapter boundaries](architecture.md) for the remaining
+harness-onboarding gates.
 
 ## Offline release install
 
@@ -69,6 +74,9 @@ wheel and compatible PyYAML wheels. From the unpacked archive:
 Release mode uses `--no-index --only-binary` and does not download
 dependencies. If an unpacked archive has a top-level `wheels/` directory,
 `install.sh` selects it automatically.
+
+See [Release artifact process](release.md) for locked inputs, deterministic
+archive generation, checksums, and promotion gates.
 
 ## Upgrade gate
 

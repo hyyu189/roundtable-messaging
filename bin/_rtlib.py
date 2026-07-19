@@ -253,9 +253,14 @@ def project_for_current_workspace():
     Returns the project root Path, or None.
     """
     try:
-        identify = json.loads(subprocess.check_output(
-            ["cmux", "identify", "--json", "--id-format", "both"], text=True
-        ))
+        identify = json.loads(
+            subprocess.check_output(
+                ["cmux", "identify", "--json", "--id-format", "both"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+        )
     except Exception:
         return None
     caller = identify.get("caller") or {}
@@ -298,7 +303,12 @@ def project_for_current_workspace():
     return None
 
 
-def find_project_root(tool):
+def find_project_root(tool, *, allow_cmux_workspace=False):
+    """Find a project without consulting a terminal API by default.
+
+    Core maildir commands use explicit configuration, cwd, or the documented
+    fallback. Only cmux adapter commands opt into workspace-based discovery.
+    """
     override = os.environ.get("ROUNDTABLE_PROJECT_DIR")
     if override:
         root = Path(override).expanduser().resolve()
@@ -311,13 +321,14 @@ def find_project_root(tool):
         if is_project_root(candidate):
             return candidate
 
-    bound = project_for_current_workspace()
-    if bound is not None:
-        return bound
-
     fallback = fallback_project_root()
     if fallback and is_project_root(fallback):
         return fallback
+
+    if allow_cmux_workspace:
+        bound = project_for_current_workspace()
+        if bound is not None:
+            return bound
 
     raise SystemExit(not_project_message(tool))
 

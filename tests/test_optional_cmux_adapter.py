@@ -35,6 +35,9 @@ def fake_cmux(tmp_path, body, exit_code=0):
     cmux = fake_bin / "cmux"
     cmux.write_text(
         "#!/bin/sh\n"
+        'if [ -n "${RT_TEST_CMUX_SENTINEL:-}" ]; then\n'
+        '  printf "called\\n" > "$RT_TEST_CMUX_SENTINEL"\n'
+        "fi\n"
         f"printf '%s\\n' '{body}'\n"
         f"exit {exit_code}\n"
     )
@@ -130,16 +133,17 @@ def test_inbox_without_identity_fails_cleanly_without_cmux(tmp_path):
     assert not (state / "runtime.json").exists()
 
 
-def test_inbox_ignores_non_object_runtime_and_cmux_response(tmp_path):
+def test_inbox_ignores_stale_runtime_and_does_not_probe_cmux(tmp_path):
     project = tmp_path / "project"
     state = write_project(project)
     (state / "runtime.json").write_text("[]\n")
     path = fake_cmux(tmp_path, "[]")
+    sentinel = tmp_path / "cmux-called"
 
     result = run_tool(
         "rt-inbox",
         cwd=project,
-        env=no_cmux_env(PATH=path),
+        env=no_cmux_env(PATH=path, RT_TEST_CMUX_SENTINEL=str(sentinel)),
     )
 
     assert result.returncode == 1
@@ -147,6 +151,73 @@ def test_inbox_ignores_non_object_runtime_and_cmux_response(tmp_path):
         "rt-inbox: could not infer agent; pass agent or set RT_FROM\n"
     )
     assert "Traceback" not in result.stderr
+    assert not sentinel.exists()
+
+
+def test_inbox_uses_unique_codex_thread_identity_without_cmux(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    msg_id = "20260718T120000Z-claude-to-codex-106"
+    write_mail(state, msg_id, "claude", "codex", "remote inbox")
+
+    result = run_tool(
+        "rt-inbox",
+        "--format",
+        "json",
+        cwd=project,
+        env=no_cmux_env(CODEX_THREAD_ID="thread-from-app-server"),
+    )
+
+    assert result.returncode == 0, result.stderr
+    records = json.loads(result.stdout)
+    assert [record["msg_id"] for record in records] == [msg_id]
+
+
+def test_core_project_fallback_does_not_probe_cmux(tmp_path):
+    project = tmp_path / "project"
+    write_project(project)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    path = fake_cmux(tmp_path, "{}")
+    sentinel = tmp_path / "cmux-called"
+
+    result = run_tool(
+        "rt-inbox",
+        "claude",
+        "--format",
+        "json",
+        cwd=outside,
+        env=no_cmux_env(
+            PATH=path,
+            RT_FALLBACK_PROJECT=str(project),
+            RT_TEST_CMUX_SENTINEL=str(sentinel),
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
+    assert not sentinel.exists()
+
+
+def test_missing_core_project_does_not_probe_cmux(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    path = fake_cmux(tmp_path, "{}")
+    sentinel = tmp_path / "cmux-called"
+
+    result = run_tool(
+        "rt-inbox",
+        "claude",
+        cwd=outside,
+        env=no_cmux_env(
+            PATH=path,
+            RT_TEST_CMUX_SENTINEL=str(sentinel),
+        ),
+    )
+
+    assert result.returncode == 1
+    assert "not in a roundtable project" in result.stderr
+    assert not sentinel.exists()
 
 
 def test_cmux_diagnostics_fail_cleanly_when_adapter_is_unavailable(tmp_path):
@@ -219,7 +290,7 @@ def test_ack_infers_sender_from_message_recipient_without_cmux(tmp_path):
     assert "Traceback" not in result.stderr
 
 
-def test_ack_validated_sender_is_not_overridden_by_ambient_cmux(tmp_path):
+def test_ack_validated_sender_does_not_invoke_ambient_cmux(tmp_path):
     project = tmp_path / "project"
     state = write_project(project)
     original = "20260718T120000Z-codex-to-claude-105"
@@ -241,6 +312,7 @@ def test_ack_validated_sender_is_not_overridden_by_ambient_cmux(tmp_path):
         tmp_path,
         '{"caller":{"workspace_ref":"workspace:1","surface_ref":"surface:3"}}',
     )
+    sentinel = tmp_path / "cmux-called"
 
     result = run_tool(
         "rt-ack",
@@ -250,12 +322,14 @@ def test_ack_validated_sender_is_not_overridden_by_ambient_cmux(tmp_path):
             PATH=path,
             CMUX_SURFACE_ID="surface-uuid",
             RT_FROM="claude",
+            RT_TEST_CMUX_SENTINEL=str(sentinel),
         ),
     )
 
     assert result.returncode == 0, result.stderr
     ack_file = next((state / "inbox" / "codex" / "new").glob("ack-*.md"))
     assert ack_file.read_text().startswith("[CLAUDE→CODEX sync-ack id=")
+    assert not sentinel.exists()
 
 
 def test_ack_rejects_explicit_sender_mismatch_before_delivery(tmp_path):

@@ -110,7 +110,7 @@ def pick_runtime_agent(runtime, base, instance):
 def main():
     if len(sys.argv) != 2:
         usage()
-    root = find_project_root("rt-resolve")
+    root = find_project_root("rt-resolve", allow_cmux_workspace=True)
     requested = sys.argv[1].lower()
     base, instance = resolve_config_target(root, requested)
     runtime = load_runtime(root)

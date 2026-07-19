@@ -1,0 +1,96 @@
+name: release-artifact
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out exact release history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-release.txt
+
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install --upgrade -r requirements-release.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="v$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$GITHUB_REF_NAME" = "$expected"
+
+      - name: Verify source and tests
+        run: |
+          python scripts/check_public_safety.py
+          python -m compileall -q bin roundtable_packaging scripts tests
+          python -m pytest -p no:cacheprovider -p no:rerunfailures -q tests
+
+      - name: Build locked offline artifact
+        run: python scripts/build_release.py --output-dir artifacts
+
+      - name: Verify outer checksum
+        run: shasum -a 256 --check artifacts/SHA256SUMS
+
+      - name: Exercise the exact extracted artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract_root="$RUNNER_TEMP/roundtable-release-extract"
+          prefix="$RUNNER_TEMP/roundtable-release-prefix"
+          link_dir="$RUNNER_TEMP/roundtable-release-bin"
+          mkdir -p "$extract_root"
+          shopt -s nullglob
+          artifacts=(artifacts/*.tar.gz)
+          test "${#artifacts[@]}" -eq 1
+          artifact="${artifacts[0]}"
+          tar -xzf "$artifact" -C "$extract_root"
+          payloads=("$extract_root"/*)
+          test "${#payloads[@]}" -eq 1
+          payload="${payloads[0]}"
+          test -d "$payload"
+          (
+            cd "$payload"
+            shasum -a 256 --check SHA256SUMS
+            ROUNDTABLE_BOOTSTRAP_PYTHON="$(command -v python)" \
+              ./install --prefix "$prefix" --link-dir "$link_dir"
+            "$link_dir/roundtable-smoke"
+            ./uninstall --prefix "$prefix"
+          )
+          test ! -e "$prefix/install-manifest.json"
+          test ! -e "$link_dir/rt-say"
+
+      - name: Upload candidate without publishing a release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: roundtable-messaging-macos
+          path: artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
