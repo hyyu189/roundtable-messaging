@@ -1,0 +1,20 @@
+source_commit	source_date	phase	fable_role	public_commit	status	notes
+dc6f1e61d3fdf8c6b88c34b8af62bebd58be077f	2026-06-29T16:56:21-07:00	pre_period_baseline	none		pending	Import only the minimum v1 context required to review the rewrite.
+0d49729dd2f56037158a57f6abe11224773e28ae	2026-07-15T19:25:06-07:00	build_week_v2	design_review		pending	Fable specification and approval found in design repo; implementation attributed to GPT-5.6 Codex.
+4651bc9cb9c4b391aebdd45d0e804b7bcec2a913	2026-07-15T20:17:49-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+30c704e8eda23861eea4c562ca85c0825f7ad84d	2026-07-15T20:25:24-07:00	build_week_v2	direct_code		pending	Exclude bin.bak-20260623T183827 completely.
+7b1752f2a4d784d4e6c7044f0ecb34200ef9a6a5	2026-07-16T18:19:46-07:00	build_week_v2	direct_code		pending	-
+706cb68e38fd5e1104a010616b78a4da74f38341	2026-07-16T19:01:17-07:00	build_week_v2	direct_docs_config		pending	-
+028008a248a23f16adf72ab2dcb15a674b2aa73b	2026-07-16T19:15:08-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+c691a0c91cc83bc5fd69e6c85ff119c14d043f10	2026-07-16T19:18:11-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+286db883ad6be415fd27570a60a9d2721e08ae75	2026-07-16T21:06:12-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+b545b29ca7249225f7c44aa78262613033306782	2026-07-16T21:20:25-07:00	build_week_v2	direct_docs_config		pending	-
+1fecae8342258f8a61109bc7673eecfa1ed09e0a	2026-07-16T21:39:31-07:00	build_week_v2	direct_code		pending	-
+05247b825c670c6a14eaaee6c1b29d86c5910f31	2026-07-16T22:13:20-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+b70a575cff856f1110668c5828f27429f4d23917	2026-07-16T22:26:24-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+fc26072e61bd807c19b83a9d1c552532c28e658d	2026-07-16T22:37:05-07:00	build_week_v2	direct_docs_config		pending	-
+b716987ebfc717e580f15e233596e54e09f25a5f	2026-07-16T22:43:51-07:00	build_week_v2	direct_docs_config		pending	Legacy v1 keyboard table is pre-period migration context.
+ec6f1f5401d1c566783ffa7ce542e0d19a4d29cb	2026-07-16T23:14:30-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
+0d7f78e9c45594559a981f7c5b8ee50808b15f5d	2026-07-16T23:37:30-07:00	build_week_v2	direct_docs_config		pending	-
+0686cdef50c6db146d71efbe3d27690757354a0c	2026-07-17T00:15:58-07:00	build_week_v2	direct_docs_config		pending	-
+bbc67d8f42a238e4887d389cb6766dc57ae76e47	2026-07-17T00:35:01-07:00	build_week_v2	spec_only_no_review		pending	Implementation attributed to GPT-5.6 Codex.

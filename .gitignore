@@ -1,0 +1,25 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.log
+
+# Roundtable runtime state belongs to each project, never to this product repo.
+.roundtable/
+
+# Local scratch and release staging
+.tmp/
+artifacts/
