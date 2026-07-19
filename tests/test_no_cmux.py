@@ -1,0 +1,298 @@
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN = ROOT / "bin"
+
+
+def no_cmux_env(**updates):
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": str(Path(sys.executable).resolve().parent),
+            "CMUX_SURFACE_ID": "",
+            "CODEX_THREAD_ID": "",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "ROUNDTABLE_PROJECT_DIR": "",
+            "RT_FALLBACK_PROJECT": "",
+            "RT_FROM": "",
+            "RT_PROJECTS_FILE": "/dev/null",
+        }
+    )
+    env.update(updates)
+    return env
+
+
+def fake_cmux(tmp_path, body, exit_code=0):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cmux = fake_bin / "cmux"
+    cmux.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' '{body}'\n"
+        f"exit {exit_code}\n"
+    )
+    cmux.chmod(0o755)
+    return f"{fake_bin}:{Path(sys.executable).resolve().parent}"
+
+
+def run_tool(name, *args, cwd, env=None):
+    return subprocess.run(
+        [sys.executable, str(BIN / name), *args],
+        cwd=cwd,
+        env=env or no_cmux_env(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def write_project(path):
+    state = path / ".roundtable"
+    state.mkdir(parents=True)
+    (state / "agents.yaml").write_text(
+        f"""schema: roundtable.agents.v1
+project: {path}
+agents:
+  codex:
+    harness: codex
+    instances:
+      - id: codex
+  claude:
+    harness: claude-code
+    instances:
+      - id: claude
+  hermes:
+    harness: hermes-agent
+    instances:
+      - id: hermes
+"""
+    )
+    return state
+
+
+def write_mail(state, msg_id, sender, target, body="test"):
+    directory = state / "inbox" / target / "new"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{msg_id}.md"
+    path.write_text(
+        f"[{sender.upper()}→{target.upper()} directive id={msg_id}] {body}"
+    )
+    return path
+
+
+def test_inbox_lists_and_hides_drained_mail_without_cmux(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    msg_id = "20260718T120000Z-codex-to-claude-100"
+    mail = write_mail(state, msg_id, "codex", "claude", "review this")
+
+    listed = run_tool(
+        "rt-inbox", "claude", "--format", "json", cwd=project
+    )
+
+    assert listed.returncode == 0, listed.stderr
+    records = json.loads(listed.stdout)
+    assert [(record["msg_id"], record["body"]) for record in records] == [
+        (msg_id, "review this")
+    ]
+    assert "Traceback" not in listed.stderr
+
+    current = mail.parents[1] / "cur"
+    current.mkdir()
+    mail.rename(current / mail.name)
+    drained = run_tool("rt-inbox", "claude", cwd=project)
+
+    assert drained.returncode == 0, drained.stderr
+    assert drained.stdout == ""
+    assert drained.stderr == ""
+
+
+def test_inbox_without_identity_fails_cleanly_without_cmux(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+
+    result = run_tool("rt-inbox", cwd=project)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "rt-inbox: could not infer agent; pass agent or set RT_FROM\n"
+    )
+    assert "Traceback" not in result.stderr
+    assert not (state / "runtime.json").exists()
+
+
+def test_inbox_ignores_non_object_runtime_and_cmux_response(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    (state / "runtime.json").write_text("[]\n")
+    path = fake_cmux(tmp_path, "[]")
+
+    result = run_tool(
+        "rt-inbox",
+        cwd=project,
+        env=no_cmux_env(PATH=path),
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "rt-inbox: could not infer agent; pass agent or set RT_FROM\n"
+    )
+    assert "Traceback" not in result.stderr
+
+
+def test_cmux_diagnostics_fail_cleanly_when_adapter_is_unavailable(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+
+    refresh = run_tool("rt-refresh", cwd=project)
+    resolve = run_tool("rt-resolve", "codex", cwd=project)
+
+    assert refresh.returncode == 1
+    assert refresh.stdout == ""
+    assert refresh.stderr == (
+        "rt-refresh: cmux adapter unavailable (No such file or directory); "
+        "maildir delivery is unaffected\n"
+    )
+    assert resolve.returncode == 1
+    assert resolve.stdout == ""
+    assert resolve.stderr == (
+        "rt-resolve: cmux adapter unavailable (No such file or directory); "
+        "maildir delivery is unaffected\n"
+    )
+    assert "Traceback" not in refresh.stderr + resolve.stderr
+    assert not (state / "runtime.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "exit_code"),
+    [("not-json", 0), ("connection failed", 69)],
+)
+def test_cmux_diagnostics_fail_cleanly_when_adapter_is_unhealthy(
+    tmp_path, body, exit_code
+):
+    project = tmp_path / "project"
+    state = write_project(project)
+    path = fake_cmux(tmp_path, body, exit_code)
+    env = no_cmux_env(PATH=path)
+
+    refresh = run_tool("rt-refresh", cwd=project, env=env)
+    resolve = run_tool("rt-resolve", "codex", cwd=project, env=env)
+
+    assert refresh.returncode == 1
+    assert refresh.stderr == (
+        "rt-refresh: cmux adapter unavailable or unhealthy; "
+        "maildir delivery is unaffected\n"
+    )
+    assert resolve.returncode == 1
+    assert resolve.stderr == (
+        "rt-resolve: cmux adapter unavailable or unhealthy; "
+        "maildir delivery is unaffected\n"
+    )
+    assert "Traceback" not in refresh.stderr + resolve.stderr
+    assert not (state / "runtime.json").exists()
+
+
+def test_ack_infers_sender_from_message_recipient_without_cmux(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120000Z-codex-to-claude-101"
+    write_mail(state, original, "codex", "claude")
+
+    result = run_tool("rt-ack", original, "received", cwd=project)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("sent maildir-only ")
+    ack_files = list((state / "inbox" / "codex" / "new").glob("ack-*.md"))
+    assert len(ack_files) == 1
+    ack = ack_files[0].read_text()
+    assert ack.startswith("[CLAUDE→CODEX sync-ack id=")
+    assert f"refs={original} received" in ack
+    assert "Traceback" not in result.stderr
+
+
+def test_ack_validated_sender_is_not_overridden_by_ambient_cmux(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120000Z-codex-to-claude-105"
+    write_mail(state, original, "codex", "claude")
+    runtime = {
+        "schema": "roundtable.runtime.v1",
+        "project": str(project),
+        "agents": {
+            "hermes": {
+                "workspace_ref": "workspace:1",
+                "surface_ref": "surface:3",
+                "pane_ref": "pane:3",
+            }
+        },
+        "surfaces": [],
+    }
+    (state / "runtime.json").write_text(json.dumps(runtime))
+    path = fake_cmux(
+        tmp_path,
+        '{"caller":{"workspace_ref":"workspace:1","surface_ref":"surface:3"}}',
+    )
+
+    result = run_tool(
+        "rt-ack",
+        original,
+        cwd=project,
+        env=no_cmux_env(
+            PATH=path,
+            CMUX_SURFACE_ID="surface-uuid",
+            RT_FROM="claude",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    ack_file = next((state / "inbox" / "codex" / "new").glob("ack-*.md"))
+    assert ack_file.read_text().startswith("[CLAUDE→CODEX sync-ack id=")
+
+
+def test_ack_rejects_explicit_sender_mismatch_before_delivery(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120000Z-codex-to-claude-102"
+    write_mail(state, original, "codex", "claude")
+
+    result = run_tool(
+        "rt-ack",
+        original,
+        cwd=project,
+        env=no_cmux_env(RT_FROM="codex"),
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "rt-ack: RT_FROM=codex does not match message recipient claude\n"
+    )
+    assert not (state / "inbox" / "codex").exists()
+
+
+def test_ack_rejects_mixed_recipients_before_delivery(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    claude_ref = "20260718T120000Z-codex-to-claude-103"
+    hermes_ref = "20260718T120001Z-codex-to-hermes-104"
+    write_mail(state, claude_ref, "codex", "claude")
+    write_mail(state, hermes_ref, "codex", "hermes")
+
+    result = run_tool(
+        "rt-ack", f"{claude_ref},{hermes_ref}", cwd=project
+    )
+
+    assert result.returncode == 1
+    assert result.stderr == (
+        "rt-ack: refs target multiple recipients: claude, hermes; "
+        "acknowledge one recipient at a time\n"
+    )
+    assert not (state / "inbox" / "codex").exists()

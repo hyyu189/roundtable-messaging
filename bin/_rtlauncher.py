@@ -7,7 +7,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from _rtlib import emit_registry_warnings, is_project_root, load_project_registry
+from _rtlib import (
+    emit_registry_warnings,
+    is_project_root,
+    load_agents_doc,
+    load_project_registry,
+)
 
 
 COMMANDS = {
@@ -15,10 +20,139 @@ COMMANDS = {
     "codex": ["codex", "--remote", "unix://"],
     "hermes": ["hermes"],
 }
+EXECUTABLE_OVERRIDES = {
+    "claude": "RT_CLAUDE_BIN",
+    "hermes": "RT_HERMES_BIN",
+}
+CONFIG_HARNESSES = {
+    "claude": frozenset({"claude", "claude-code"}),
+    "codex": frozenset({"codex"}),
+    "hermes": frozenset({"hermes", "hermes-agent"}),
+}
+CMUX_SHIM_PARTS = frozenset({"cmux-cli-shims"})
+CMUX_WRAPPER_NAMES = frozenset({"cmux-claude-wrapper", "cmux-codex-wrapper"})
 
 
 class SelectionError(RuntimeError):
     pass
+
+
+def _executable(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _is_cmux_shim(path: Path) -> bool:
+    candidates = [path.absolute()]
+    try:
+        candidates.append(path.resolve())
+    except OSError:
+        pass
+    for candidate in candidates:
+        parts = {part.lower() for part in candidate.parts}
+        if parts & CMUX_SHIM_PARTS:
+            return True
+        if candidate.name.lower() in CMUX_WRAPPER_NAMES:
+            return True
+    return False
+
+
+def harness_bin(harness: str) -> Path:
+    """Resolve a real harness executable without depending on cmux PATH shims."""
+    if harness == "codex":
+        try:
+            from _rtcodex import CodexRuntimeError, codex_bin
+
+            return codex_bin()
+        except CodexRuntimeError as error:
+            raise SelectionError(f"rt-codex: {error}") from error
+
+    override_name = EXECUTABLE_OVERRIDES[harness]
+    override = os.environ.get(override_name)
+    if override:
+        selected = Path(override).expanduser().absolute()
+        if _executable(selected) and not _is_cmux_shim(selected):
+            return selected
+        if _executable(selected):
+            raise SelectionError(
+                f"rt-{harness}: {override_name} points to a cmux wrapper: {selected}"
+            )
+        raise SelectionError(
+            f"rt-{harness}: {override_name} is not executable: {selected}"
+        )
+
+    executable_name = COMMANDS[harness][0]
+    home = Path.home()
+    candidates = [
+        home / ".local" / "bin" / executable_name,
+        home / ".npm-global" / "bin" / executable_name,
+    ]
+    if harness == "hermes":
+        candidates.append(
+            home / ".hermes" / "hermes-agent" / "venv" / "bin" / executable_name
+        )
+    candidates.extend(
+        Path(directory).expanduser() / executable_name
+        for directory in os.environ.get("PATH", "").split(os.pathsep)
+        if directory
+    )
+    seen = set()
+    for candidate in candidates:
+        selected = candidate.absolute()
+        key = str(selected)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _executable(selected) and not _is_cmux_shim(selected):
+            return selected
+    raise SelectionError(
+        f"rt-{harness}: could not find a non-cmux {executable_name} executable; "
+        f"set {override_name}"
+    )
+
+
+def configured_sender_ids(root: Path, harness: str) -> list[str]:
+    document = load_agents_doc(root, f"rt-{harness}")
+    if not isinstance(document, dict):
+        raise SelectionError(
+            f"rt-{harness}: {root / '.roundtable' / 'agents.yaml'} is not a mapping"
+        )
+    agents = document.get("agents") or {}
+    if not isinstance(agents, dict):
+        raise SelectionError(
+            f"rt-{harness}: agents in {root / '.roundtable' / 'agents.yaml'} "
+            "is not a mapping"
+        )
+    ids = []
+    for agent_name, config in agents.items():
+        if not isinstance(config, dict):
+            continue
+        if config.get("harness") not in CONFIG_HARNESSES[harness]:
+            continue
+        instances = config.get("instances")
+        if not isinstance(instances, list) or not instances:
+            instances = [{"id": agent_name}]
+        for instance in instances:
+            instance_id = (
+                instance.get("id") if isinstance(instance, dict) else instance
+            )
+            if isinstance(instance_id, str) and instance_id and instance_id not in ids:
+                ids.append(instance_id)
+    return ids
+
+
+def set_launch_identity(root: Path | None, harness: str) -> None:
+    if root is None or os.environ.get("RT_FROM"):
+        return
+    candidates = configured_sender_ids(root, harness)
+    if len(candidates) == 1:
+        os.environ["RT_FROM"] = candidates[0]
+        return
+    if len(candidates) > 1:
+        rendered = ", ".join(candidates)
+        raise SelectionError(
+            f"rt-{harness}: multiple configured instances ({rendered}); "
+            "set RT_FROM to the instance to launch"
+        )
 
 
 def project_at_or_above(start: Path) -> Path | None:
@@ -105,18 +239,11 @@ def launch(harness: str, argv: list[str]) -> int:
     selected = choose_launch_cwd(harness)
     if selected is not None:
         os.chdir(selected)
+    root = selected or project_at_or_above(Path.cwd())
+    set_launch_identity(root, harness)
     command = [*COMMANDS[harness], *argv]
-    if harness == "codex":
-        try:
-            from _rtcodex import CodexRuntimeError, codex_bin
-
-            executable = codex_bin()
-        except CodexRuntimeError as error:
-            raise SelectionError(f"rt-codex: {error}") from error
-        command[0] = str(executable)
-        os.execv(command[0], command)
-    else:
-        os.execvp(command[0], command)
+    command[0] = str(harness_bin(harness))
+    os.execv(command[0], command)
     return 127
 
 

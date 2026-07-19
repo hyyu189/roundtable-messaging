@@ -48,7 +48,7 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | Core maildir delivery on macOS without cmux | Covered by the imported regression suite; judge-path packaging is in progress |
 | npm Codex CLI `0.144.6` | Exact-release protocol smoke passed; clean daemon reload and full wake E2E remain a release gate |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
-| cmux | Supported as an optional integration; remaining launcher coupling is being removed |
+| cmux | Optional topology integration; core delivery, inbox, ack, and launcher identity do not require it |
 | tmux and cross-host SSH | Not yet supported |
 
 ## Release target

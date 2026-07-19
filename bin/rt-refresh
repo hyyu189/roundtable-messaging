@@ -529,9 +529,28 @@ def atomic_write_json(path, data):
 
 def main():
     args = parse_args()
+    if shutil.which("cmux") is None:
+        raise SystemExit(
+            "rt-refresh: cmux adapter unavailable (No such file or directory); "
+            "maildir delivery is unaffected"
+        )
 
-    tree = run_json("cmux", "tree", "--all", "--json", "--id-format", "both")
-    identify = run_json("cmux", "identify", "--json", "--id-format", "both")
+    try:
+        tree = run_json("cmux", "tree", "--all", "--json", "--id-format", "both")
+        identify = run_json("cmux", "identify", "--json", "--id-format", "both")
+        if not isinstance(tree, dict) or not isinstance(identify, dict):
+            raise ValueError("cmux response is not an object")
+    except (
+        OSError,
+        UnicodeError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
+        raise SystemExit(
+            "rt-refresh: cmux adapter unavailable or unhealthy; "
+            "maildir delivery is unaffected"
+        ) from None
     existing = read_existing_runtime()
     caller = caller_cmux_context(identify, tree)
     window, workspace, workspace_binding = bound_workspace(tree, identify, existing, args)

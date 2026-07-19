@@ -32,12 +32,18 @@ def parse_args():
 
 
 def load_runtime(refresh=False):
-    if refresh or not RUNTIME.exists() or RUNTIME.stat().st_size == 0:
-        subprocess.run([str(TOOL_DIR / "rt-refresh")], check=True, stdout=subprocess.DEVNULL)
+    if refresh:
+        subprocess.run(
+            [str(TOOL_DIR / "rt-refresh")],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     try:
-        return json.loads(RUNTIME.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        runtime = json.loads(RUNTIME.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+    return runtime if isinstance(runtime, dict) else {}
 
 
 def infer_agent():
@@ -45,10 +51,14 @@ def infer_agent():
     if env_from:
         return env_from.lower()
 
-    runtime = load_runtime(refresh=False)
+    runtime = load_runtime()
     caller_surface = ""
     try:
-        caller_surface = (run_json("cmux", "identify", "--json").get("caller") or {}).get("surface_ref") or ""
+        identify = run_json("cmux", "identify", "--json")
+        if isinstance(identify, dict):
+            caller_surface = (
+                (identify.get("caller") or {}).get("surface_ref") or ""
+            )
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
         pass
     for name, agent in (runtime.get("agents") or {}).items():
@@ -59,7 +69,7 @@ def infer_agent():
         for name, agent in (runtime.get("agents") or {}).items():
             if agent.get("surface_ref") == caller_surface:
                 return name
-    raise SystemExit("rt-inbox: could not infer agent from current cmux surface; pass agent or set RT_FROM")
+    raise SystemExit("rt-inbox: could not infer agent; pass agent or set RT_FROM")
 
 
 def one_line(value):

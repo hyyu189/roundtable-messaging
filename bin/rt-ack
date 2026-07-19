@@ -27,8 +27,7 @@ def parse_ref(ref):
     match = MSG_ID_RE.match(ref)
     if not match:
         raise SystemExit(f"rt-ack: cannot parse msg_id: {ref}")
-    original_from, _original_to = match.groups()
-    return original_from
+    return match.groups()
 
 
 def main():
@@ -39,9 +38,29 @@ def main():
         usage()
     body = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
 
-    groups = defaultdict(list)
+    parsed_refs = []
     for ref in refs:
-        groups[parse_ref(ref)].append(ref)
+        original_from, original_to = parse_ref(ref)
+        parsed_refs.append((ref, original_from, original_to))
+
+    recipients = {original_to for _ref, _original_from, original_to in parsed_refs}
+    if len(recipients) != 1:
+        raise SystemExit(
+            "rt-ack: refs target multiple recipients: "
+            + ", ".join(sorted(recipients))
+            + "; acknowledge one recipient at a time"
+        )
+    inferred_sender = next(iter(recipients))
+    explicit_sender = os.environ.get("RT_FROM", "").lower()
+    if explicit_sender and explicit_sender != inferred_sender:
+        raise SystemExit(
+            f"rt-ack: RT_FROM={explicit_sender} does not match message recipient "
+            f"{inferred_sender}"
+        )
+
+    groups = defaultdict(list)
+    for ref, original_from, _original_to in parsed_refs:
+        groups[original_from].append(ref)
 
     outputs = []
     for target, group_refs in groups.items():
@@ -53,9 +72,20 @@ def main():
         env["RT_ACK_MODE"] = "1"
         env["RT_ACK_REFS"] = csv
         env["RT_ACK_BODY"] = body
+        env["RT_FROM"] = explicit_sender or inferred_sender
+        # Every ref has already agreed on the message recipient and any
+        # explicit RT_FROM has been checked against it. Keep an ambient cmux
+        # caller from overriding that validated acknowledger identity.
+        command = [
+            str(TOOL_DIR / "rt-say"),
+            "--no-nudge",
+            target,
+            "sync-ack",
+            visible_body,
+        ]
         try:
             proc = subprocess.run(
-                [str(TOOL_DIR / "rt-say"), target, "sync-ack", visible_body],
+                command,
                 text=True,
                 check=False,
                 stdout=subprocess.PIPE,

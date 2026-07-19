@@ -20,6 +20,23 @@ the standalone `current` link and npm's visible CLI shim. The launcher,
 app-server LaunchAgent, wake LaunchAgent, daemon checks, and doctor all use that
 same path.
 
+## Terminal launcher portability
+
+`rt-claude`, `rt-hermes`, and `rt-codex` execute absolute harness paths. The
+Claude and Hermes resolvers prefer their normal user-level installations, then
+search PATH while rejecting cmux's generated `cmux-cli-shims` and wrapper
+targets. `RT_CLAUDE_BIN`, `RT_HERMES_BIN`, and `RT_CODEX_BIN` provide explicit
+selection; an explicit Claude or Hermes path is still rejected if it resolves
+to a cmux wrapper.
+
+Inside a Roundtable project, each launcher exports `RT_FROM` automatically when
+exactly one configured instance uses that harness. A multi-instance
+configuration must select its identity explicitly, for example
+`RT_FROM=claude-review rt-claude`. This identity path is configuration-based
+and does not require a cmux surface, so it works in ordinary terminal apps.
+The cmux topology commands remain optional integration tools; full tmux support
+is not claimed until its end-to-end gate passes.
+
 ## Readiness contract
 
 Codex wake is ready only when all of the following are true:

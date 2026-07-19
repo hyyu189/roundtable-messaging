@@ -339,29 +339,108 @@ def test_launcher_exec_preserves_harness_contract(
     monkeypatch.setattr(
         _rtlauncher, "choose_launch_cwd", lambda _harness: project
     )
+    monkeypatch.setenv("RT_FROM", harness)
     monkeypatch.setattr(
         _rtlauncher.os, "chdir", lambda path: observed.setdefault("cwd", path)
     )
-
-    def fake_execvp(program, command):
-        observed.update(program=program, command=command)
-        raise ExecCalled
 
     def fake_execv(program, command):
         observed.update(program=program, command=command)
         raise ExecCalled
 
-    monkeypatch.setattr(_rtlauncher.os, "execvp", fake_execvp)
     monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
-    fake_codex = tmp_path / "codex"
-    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: fake_codex)
+    fake_binary = tmp_path / harness
+    monkeypatch.setattr(_rtlauncher, "harness_bin", lambda _harness: fake_binary)
 
     with pytest.raises(ExecCalled):
         _rtlauncher.launch(harness, argv)
 
-    if harness == "codex":
-        expected = [str(fake_codex), *expected[1:]]
+    expected = [str(fake_binary), *expected[1:]]
     assert observed == {"cwd": project, "program": expected[0], "command": expected}
+
+
+def test_harness_bin_skips_cmux_path_shim(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    shim_dir = tmp_path / "cmux-cli-shims"
+    real_dir = tmp_path / "real-bin"
+    shim_dir.mkdir()
+    real_dir.mkdir()
+    shim = shim_dir / "claude"
+    real = real_dir / "claude"
+    for executable in (shim, real):
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+    monkeypatch.setattr(_rtlauncher.Path, "home", classmethod(lambda _cls: home))
+    monkeypatch.setenv("PATH", f"{shim_dir}:{real_dir}")
+    monkeypatch.delenv("RT_CLAUDE_BIN", raising=False)
+
+    assert _rtlauncher.harness_bin("claude") == real.absolute()
+
+
+def test_harness_bin_explicit_override_rejects_cmux_wrapper(tmp_path, monkeypatch):
+    wrapper = tmp_path / "cmux-cli-shims" / "claude"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("RT_CLAUDE_BIN", str(wrapper))
+
+    with pytest.raises(_rtlauncher.SelectionError, match="cmux wrapper"):
+        _rtlauncher.harness_bin("claude")
+
+
+def test_launcher_sets_unique_instance_identity(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project", codex=False)
+    config = project / ".roundtable" / "agents.yaml"
+    config.write_text(
+        "schema: roundtable.agents.v1\n"
+        "agents:\n"
+        "  reviewer:\n"
+        "    harness: claude-code\n"
+        "    instances:\n"
+        "      - id: claude-review\n"
+    )
+    observed = {}
+
+    class ExecCalled(Exception):
+        pass
+
+    monkeypatch.delenv("RT_FROM", raising=False)
+    monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
+    monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(_rtlauncher, "harness_bin", lambda _harness: tmp_path / "claude")
+
+    def capture_identity(_program, _command):
+        observed["sender"] = os.environ.get("RT_FROM")
+        raise ExecCalled
+
+    monkeypatch.setattr(_rtlauncher.os, "execv", capture_identity)
+
+    with pytest.raises(ExecCalled):
+        _rtlauncher.launch("claude", [])
+
+    assert observed["sender"] == "claude-review"
+
+
+def test_launcher_requires_explicit_identity_for_multiple_instances(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project", codex=False)
+    config = project / ".roundtable" / "agents.yaml"
+    config.write_text(
+        "schema: roundtable.agents.v1\n"
+        "agents:\n"
+        "  claude:\n"
+        "    harness: claude-code\n"
+        "    instances:\n"
+        "      - id: claude#1\n"
+        "      - id: claude#2\n"
+    )
+    monkeypatch.delenv("RT_FROM", raising=False)
+    monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
+    monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
+
+    with pytest.raises(_rtlauncher.SelectionError, match="set RT_FROM"):
+        _rtlauncher.launch("claude", [])
 
 
 def test_bridge_default_unbound_keeps_mail_without_rpc_or_turn(tmp_path):
