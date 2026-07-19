@@ -75,11 +75,11 @@ The P0 implementation order is therefore:
 
 1. add a dry-run-first, ownership-marked harness setup command with backups,
    idempotent merges, diagnostics, and a symmetric uninstall path;
-2. wire and test Claude's stop gate, skill discovery, and tracked inbox
+2. install, validate, and safely reload the Codex app-server/wake bridge, then
+   bind and exercise real npm and standalone threads;
+3. wire and test Claude's stop gate, skill discovery, and tracked inbox
    tripwire;
-3. wire and test the equivalent Hermes lifecycle;
-4. install, validate, and safely reload the Codex app-server/wake bridge, then
-   bind and exercise a real thread;
+4. wire and test the equivalent Hermes lifecycle;
 5. run the same send-to-wake-to-ack acceptance in Terminal.app, iTerm2,
    Ghostty, and cmux;
 6. test cmux topology, navigation, and notifications separately as optional
