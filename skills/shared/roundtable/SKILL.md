@@ -44,9 +44,12 @@ one, set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT`.
 Launch dedicated sessions with `rt-codex`, `rt-claude`, or `rt-hermes`. When
 called outside a project on a TTY they offer registered projects, project
 creation, or an explicit unanchored launch; non-TTY unanchored calls exit 2.
-Only `rt-codex` is load-bearing (it injects the `--remote` flag the wake
-bridge depends on); for Claude/Hermes the launchers are pure ergonomics —
-a plain `claude`/`hermes` started in the project root anchors identically.
+All three launchers select a real harness executable instead of a generated
+cmux PATH shim and export the unique configured `RT_FROM` identity. A
+multi-instance project must set `RT_FROM` explicitly. `rt-codex` additionally
+injects the `--remote` flag that its native wake bridge requires. Direct
+`claude`/`hermes` launches still anchor by cwd, but non-cmux tool calls then
+need an explicit `RT_FROM`.
 
 ## Delivery: maildir + native wake (v2, sole path since 2026-07-17)
 
