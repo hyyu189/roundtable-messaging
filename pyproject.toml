@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roundtable-messaging"
+version = "0.1.0"
+description = "Durable local maildir coordination for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Roundtable contributors" },
+]
+dependencies = [
+  "PyYAML>=6.0,<7",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<10",
+]
+
+[project.scripts]
+roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
+
+[tool.setuptools]
+include-package-data = false
+packages = ["roundtable_packaging"]
+py-modules = ["_rtcodex", "_rtlauncher", "_rtlib"]
+script-files = [
+  "bin/_rtcodex.py",
+  "bin/_rtlauncher.py",
+  "bin/_rtlib.py",
+  "bin/roundtable-init",
+  "bin/rt-ack",
+  "bin/rt-claude",
+  "bin/rt-codex",
+  "bin/rt-codex-daemon",
+  "bin/rt-codex-wake",
+  "bin/rt-doctor",
+  "bin/rt-hermes",
+  "bin/rt-inbox",
+  "bin/rt-projects",
+  "bin/rt-refresh",
+  "bin/rt-resolve",
+  "bin/rt-say",
+  "bin/rt-startup-advisory",
+  "bin/rt-stop-gate",
+  "bin/rt-wait-inbox",
+]
+package-dir = { "" = "bin", "roundtable_packaging" = "roundtable_packaging" }
+
+[tool.setuptools.data-files]
+"share/roundtable" = ["LICENSE", "NOTICE"]
+"share/roundtable/docs" = [
+  "docs/compatibility.md",
+  "docs/install.md",
+  "docs/legacy-v1-keyboard.md",
+  "docs/rt-codex-phase3.md",
+  "docs/wp21-quiet-ack-nudge-retirement.md",
+]
+"share/roundtable/skills/shared/roundtable" = [
+  "skills/shared/roundtable/SKILL.md",
+]
+"share/roundtable/templates" = [
+  "templates/AGENTS.md.tmpl",
+  "templates/BRIEF.md.tmpl",
+  "templates/CLAUDE.md.tmpl",
+  "templates/HERMES.md.tmpl",
+  "templates/README.md.tmpl",
+  "templates/ROUTING.md.tmpl",
+  "templates/agents.yaml.tmpl",
+  "templates/decision.md.tmpl",
+  "templates/root-gitignore.tmpl",
+  "templates/roundtable-gitignore.tmpl",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

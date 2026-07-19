@@ -4,9 +4,10 @@ Roundtable is a local coordination layer for coding agents. Messaging v2 uses
 durable per-project mailboxes as the delivery fact source and wakes supported
 harnesses through native mechanisms instead of injecting keystrokes.
 
-> Build status: the public Build Week repository is being assembled from an
-> audited implementation history. Installation instructions will replace this
-> notice after the first clean-release smoke test.
+> Build status: the source installer has passed isolated clean-home tests. The
+> checksummed release archive and offline dependency wheelhouse are still
+> release gates; do not replace an active legacy installation without a planned
+> migration.
 
 ## Why it exists
 
@@ -64,6 +65,25 @@ The Build Week P0 release is complete only when it provides:
 
 Same-host tmux support is P1. Cross-host transport, Linux service management,
 and multi-auth switching are roadmap items.
+
+## Development install
+
+The current source tree can be installed into a versioned private environment:
+
+```bash
+mamba run -n general ./scripts/install.sh
+```
+
+Stable commands are linked under `~/.local/bin`. Installation is fail-closed
+when an existing path is not owned by its managed manifest. Uninstallation
+preserves the project registry, runtime state, and every project-local mailbox:
+
+```bash
+roundtable-uninstall
+```
+
+See [Installation and ownership](docs/install.md) for isolated preview paths,
+offline release mode, upgrade gates, and precise removal behavior.
 
 ## License
 

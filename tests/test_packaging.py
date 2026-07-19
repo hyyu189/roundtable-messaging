@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import plistlib
+import shutil
+import stat
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+INSTALL = ROOT / "scripts" / "install.sh"
+UNINSTALL = ROOT / "scripts" / "uninstall.sh"
+
+
+def packaging_env(home: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "ROUNDTABLE_BOOTSTRAP_PYTHON": sys.executable,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    return env
+
+
+def run_script(
+    script: Path,
+    *args: str,
+    home: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged = packaging_env(home)
+    if env:
+        merged.update(env)
+    return subprocess.run(
+        [str(script), *args],
+        cwd=ROOT,
+        env=merged,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory):
+    root = tmp_path_factory.mktemp("roundtable-wheel")
+    wheel_dir = root / "wheels"
+    source = root / "source"
+    wheel_dir.mkdir()
+    shutil.copytree(
+        ROOT,
+        source,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".pytest_cache",
+            "__pycache__",
+            "*.egg-info",
+            "*.pyc",
+            "build",
+            "dist",
+        ),
+    )
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(wheel_dir),
+            str(source),
+        ],
+        cwd=source,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    matches = list(wheel_dir.glob("roundtable_messaging-0.1.0-*.whl"))
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
+    with zipfile.ZipFile(built_wheel) as archive:
+        names = set(archive.namelist())
+
+    assert "roundtable_packaging/cli.py" in names
+    assert any(name.endswith(".data/scripts/rt-say") for name in names)
+    assert any(name.endswith(".data/scripts/_rtlib.py") for name in names)
+    assert any(
+        name.endswith(".data/data/share/roundtable/templates/agents.yaml.tmpl")
+        for name in names
+    )
+    assert any(
+        name.endswith(".dist-info/entry_points.txt")
+        for name in names
+    )
+
+
+def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+
+    first = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert first.returncode == 0, first.stderr
+
+    manifest_path = prefix / "install-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema"] == "roundtable.install.v1"
+    assert (prefix / "current").is_symlink()
+    assert (link_dir / "rt-say").is_symlink()
+    assert (prefix / "bin" / "rt-say").stat().st_mode & stat.S_IXUSR
+
+    root_probe = subprocess.run(
+        [
+            str(prefix / "current" / "bin" / "python"),
+            "-c",
+            "import _rtcodex; print(_rtcodex.ROUND_ROOT)",
+        ],
+        env={
+            **packaging_env(home),
+            "ROUNDTABLE_INSTALL_PREFIX": str(prefix),
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert root_probe.returncode == 0, root_probe.stderr
+    assert root_probe.stdout.strip() == str(prefix / "current")
+
+    wrapper_hashes = {
+        path: digest(Path(path))
+        for path in manifest["files"]
+    }
+    second = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert second.returncode == 0, second.stderr
+    assert wrapper_hashes == {
+        path: digest(Path(path))
+        for path in manifest["files"]
+    }
+
+    project_parent = tmp_path / "projects"
+    project_parent.mkdir()
+    initialized = subprocess.run(
+        [
+            str(link_dir / "roundtable-init"),
+            "--no-git",
+            "--parent",
+            str(project_parent),
+            "demo",
+        ],
+        cwd=tmp_path,
+        env=packaging_env(home),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+
+    project = project_parent / "demo"
+    inbox = project / ".roundtable" / "inbox" / "claude" / "new"
+    inbox.mkdir(parents=True)
+    mail = inbox / "keep.md"
+    mail.write_text("[codex→claude fyi id=keep] preserve me\n")
+    runtime = prefix / ".runtime"
+    runtime.mkdir()
+    runtime_file = runtime / "keep.json"
+    runtime_file.write_text("{}\n")
+    registry = prefix / "projects.yaml"
+    registry_before = registry.read_bytes()
+
+    removed = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert registry.read_bytes() == registry_before
+    assert runtime_file.read_text() == "{}\n"
+    assert mail.read_text().endswith("preserve me\n")
+    assert not (link_dir / "rt-say").exists()
+    assert not manifest_path.exists()
+
+    again = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+    assert again.returncode == 0, again.stderr
+    assert "already uninstalled" in again.stdout
+
+
+def test_install_conflict_fails_before_creating_version(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    conflict = link_dir / "rt-say"
+    conflict.write_text("owned by user\n")
+
+    process = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+
+    assert process.returncode == 1
+    assert "install preflight found conflicts" in process.stderr
+    assert conflict.read_text() == "owned by user\n"
+    assert not (prefix / "versions").exists()
+    assert not (prefix / "install-manifest.json").exists()
+
+
+def test_modified_wrapper_makes_uninstall_fail_closed(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    installed = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    wrapper = prefix / "bin" / "rt-say"
+    wrapper.write_text("#!/bin/sh\nexit 99\n")
+    removed = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+
+    assert removed.returncode == 1
+    assert "managed wrapper was modified" in removed.stderr
+    assert wrapper.exists()
+    assert (prefix / "current").is_symlink()
+    assert (prefix / "install-manifest.json").exists()
+
+
+def test_tampered_manifest_cannot_delete_outside_prefix(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    installed = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("owned by user\n")
+    manifest_path = prefix / "install-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["versions"] = [str(outside)]
+    manifest_path.write_text(json.dumps(manifest))
+
+    removed = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+
+    assert removed.returncode == 1
+    assert "version escapes owned paths" in removed.stderr
+    assert sentinel.read_text() == "owned by user\n"
+    assert (prefix / "current").is_symlink()
+
+
+def test_owned_launch_agents_are_booted_out_but_foreign_plist_is_preserved(
+    tmp_path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    trace = tmp_path / "launchctl.jsonl"
+    fake_launchctl = tmp_path / "launchctl"
+    fake_launchctl.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {str(trace)!r}\n"
+        "exit 0\n"
+    )
+    fake_launchctl.chmod(0o755)
+
+    installed = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    owned = launch_agents / "com.roundtable.codex-wake.plist"
+    owned.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.roundtable.codex-wake",
+                "ProgramArguments": [str(prefix / "bin" / "rt-codex-wake"), "run"],
+            }
+        )
+    )
+    foreign = launch_agents / "com.roundtable.codex-app-server.plist"
+    foreign_payload = plistlib.dumps(
+        {
+            "Label": "com.roundtable.codex-app-server",
+            "ProgramArguments": ["/usr/local/bin/codex", "app-server"],
+            "StandardErrorPath": str(tmp_path / "foreign.log"),
+        }
+    )
+    foreign.write_bytes(foreign_payload)
+
+    removed = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+        env={
+            "RT_LAUNCH_AGENTS_DIR": str(launch_agents),
+            "RT_LAUNCHCTL": str(fake_launchctl),
+        },
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not owned.exists()
+    assert foreign.read_bytes() == foreign_payload
+    commands = trace.read_text().splitlines()
+    assert any(line.startswith("print ") for line in commands)
+    assert any("bootout" in line and "com.roundtable.codex-wake" in line for line in commands)
+    assert "preserved non-owned LaunchAgent" in removed.stderr

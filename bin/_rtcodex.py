@@ -23,7 +23,13 @@ import time
 from pathlib import Path
 
 
-ROUND_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+INSTALL_PREFIX = os.environ.get("ROUNDTABLE_INSTALL_PREFIX")
+ROUND_ROOT = (
+    Path(INSTALL_PREFIX).expanduser().absolute() / "current"
+    if INSTALL_PREFIX
+    else SOURCE_ROOT
+)
 RUNTIME_DIR = Path(
     os.environ.get("RT_CODEX_RUNTIME_DIR", ROUND_ROOT / ".runtime")
 ).expanduser()
@@ -98,6 +104,16 @@ def launch_agent_path(label: str) -> Path:
 def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     selected_codex = codex_bin()
+    environment = {
+        "HOME": str(Path.home()),
+        "PATH": _env_path(),
+        "CODEX_HOME": str(CODEX_HOME),
+        "RT_CODEX_BIN": str(selected_codex),
+    }
+    if INSTALL_PREFIX:
+        environment["ROUNDTABLE_INSTALL_PREFIX"] = str(
+            Path(INSTALL_PREFIX).expanduser().absolute()
+        )
     return {
         "Label": APP_SERVER_LABEL,
         "ProgramArguments": [
@@ -111,12 +127,7 @@ def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
         "ThrottleInterval": 5,
         "ProcessType": "Background",
         "WorkingDirectory": str(Path.home()),
-        "EnvironmentVariables": {
-            "HOME": str(Path.home()),
-            "PATH": _env_path(),
-            "CODEX_HOME": str(CODEX_HOME),
-            "RT_CODEX_BIN": str(selected_codex),
-        },
+        "EnvironmentVariables": environment,
         "StandardOutPath": str(RUNTIME_DIR / "codex-app-server.stdout.log"),
         "StandardErrorPath": str(RUNTIME_DIR / "codex-app-server.stderr.log"),
     }
@@ -144,6 +155,10 @@ def wake_plist(
         "RT_CODEX_RUNTIME_DIR": str(RUNTIME_DIR),
         "RT_CODEX_BIN": str(selected_codex),
     }
+    if INSTALL_PREFIX:
+        environment["ROUNDTABLE_INSTALL_PREFIX"] = str(
+            Path(INSTALL_PREFIX).expanduser().absolute()
+        )
     if os.environ.get("RT_PROJECTS_FILE"):
         environment["RT_PROJECTS_FILE"] = str(
             Path(os.environ["RT_PROJECTS_FILE"]).expanduser().resolve()

@@ -1767,6 +1767,21 @@ def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):
     assert bridge["EnvironmentVariables"]["RT_CODEX_BIN"] == str(fake_codex)
 
 
+def test_launchd_payloads_preserve_stable_install_prefix(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/bin/sh\n")
+    fake_codex.chmod(0o755)
+    prefix = tmp_path / "roundtable"
+    monkeypatch.setenv("RT_CODEX_BIN", str(fake_codex))
+    monkeypatch.setattr(_rtcodex, "INSTALL_PREFIX", str(prefix))
+
+    app = _rtcodex.app_server_plist(tmp_path / "app.sock")
+    bridge = _rtcodex.wake_plist(tmp_path / "app.sock")
+
+    assert app["EnvironmentVariables"]["ROUNDTABLE_INSTALL_PREFIX"] == str(prefix)
+    assert bridge["EnvironmentVariables"]["ROUNDTABLE_INSTALL_PREFIX"] == str(prefix)
+
+
 def test_launchd_payload_uses_registry_and_persists_only_auto_discover(tmp_path, monkeypatch):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text("#!/bin/sh\n")

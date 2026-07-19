@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8,<10
+setuptools>=77
+wheel>=0.45,<1
