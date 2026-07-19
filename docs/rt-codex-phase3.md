@@ -1,4 +1,8 @@
-# Codex app-server wake bridge (Phase 3)
+# Codex app-server wake bridge (historical Phase 3)
+
+> This file records the original `0.144.3` implementation milestone. It is not
+> the current support matrix. See `docs/compatibility.md` for release claims and
+> validation gates.
 
 Implementation target: Codex CLI `0.144.3`. The wire schema and wake path are
 version-gated to that exact release.

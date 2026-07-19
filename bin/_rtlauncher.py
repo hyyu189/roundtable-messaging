@@ -106,7 +106,17 @@ def launch(harness: str, argv: list[str]) -> int:
     if selected is not None:
         os.chdir(selected)
     command = [*COMMANDS[harness], *argv]
-    os.execvp(command[0], command)
+    if harness == "codex":
+        try:
+            from _rtcodex import CodexRuntimeError, codex_bin
+
+            executable = codex_bin()
+        except CodexRuntimeError as error:
+            raise SelectionError(f"rt-codex: {error}") from error
+        command[0] = str(executable)
+        os.execv(command[0], command)
+    else:
+        os.execvp(command[0], command)
     return 127
 
 
@@ -116,4 +126,3 @@ def main(harness: str) -> int:
     except SelectionError as error:
         print(error, file=sys.stderr)
         return 2
-

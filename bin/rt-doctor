@@ -16,14 +16,13 @@ from _rtcodex import (
     AppServerClient,
     DEFAULT_SOCKET,
     RUNTIME_DIR,
-    VALIDATED_CODEX_MAX,
-    VALIDATED_CODEX_MIN,
     WAKE_LABEL,
     codex_version,
     daemon_version,
     launchd_loaded,
     pid_is_running,
     probe_handshake,
+    validated_releases_text,
     version_is_validated,
 )
 from _rtlib import load_project_registry, projects_registry_path
@@ -476,15 +475,24 @@ def main() -> int:
             "FAIL",
             "version",
             f"could not parse CLI version: {cli_output}",
-            "reinstall Codex CLI 0.144.3",
+            f"install a validated Codex release ({validated_releases_text()})",
         )
     else:
+        daemon_cli_version = (daemon or {}).get("cliVersion")
         app_server_version = (daemon or {}).get("appServerVersion")
-        if app_server_version and app_server_version != render_version(cli_version):
+        rendered_cli = render_version(cli_version)
+        if daemon and daemon_cli_version != rendered_cli:
             report.item(
                 "FAIL",
                 "version",
-                f"CLI {render_version(cli_version)} != app-server {app_server_version}",
+                f"selected CLI {rendered_cli} != daemon CLI {daemon_cli_version}",
+                "~/.roundtable/bin/rt-codex-daemon install --reload",
+            )
+        elif daemon and app_server_version != rendered_cli:
+            report.item(
+                "FAIL",
+                "version",
+                f"CLI {rendered_cli} != app-server {app_server_version}",
                 "~/.roundtable/bin/rt-codex-daemon install --reload",
             )
         elif version_is_validated(cli_version):
@@ -492,16 +500,16 @@ def main() -> int:
             report.item(
                 "OK",
                 "version",
-                f"{render_version(cli_version)} in validated range "
-                f"[{render_version(VALIDATED_CODEX_MIN)}, {render_version(VALIDATED_CODEX_MAX)}]",
+                f"{rendered_cli} is an explicitly validated release "
+                f"({validated_releases_text()})",
             )
         else:
             report.item(
-                "WARN",
+                "FAIL",
                 "version",
-                f"{render_version(cli_version)} is outside validated range; "
-                "bridge wake disabled, use legacy nudge",
-                "revalidate this Codex version or install 0.144.3",
+                f"{rendered_cli} is not an explicitly validated release; "
+                "bridge wake disabled",
+                f"install or validate one of: {validated_releases_text()}",
             )
 
     bridge_ok, bridge_detail = bridge_check(args.runtime_dir, args.bridge_max_age)
@@ -509,8 +517,8 @@ def main() -> int:
         bridge_level = "OK"
         bridge_fix = "none"
     elif not version_supported:
-        bridge_level = "WARN"
-        bridge_fix = "use legacy keyboard nudge until this Codex version is revalidated"
+        bridge_level = "FAIL"
+        bridge_fix = f"install or validate one of: {validated_releases_text()}"
     elif launchd_loaded(WAKE_LABEL):
         bridge_level = "FAIL"
         bridge_fix = "launchctl kickstart -k gui/$(id -u)/com.roundtable.codex-wake"

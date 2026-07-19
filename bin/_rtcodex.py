@@ -31,8 +31,7 @@ CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expandus
 DEFAULT_SOCKET = (CODEX_HOME / "app-server-control" / "app-server-control.sock").expanduser()
 APP_SERVER_LABEL = "com.roundtable.codex-app-server"
 WAKE_LABEL = "com.roundtable.codex-wake"
-VALIDATED_CODEX_MIN = (0, 144, 3)
-VALIDATED_CODEX_MAX = (0, 144, 3)
+VALIDATED_CODEX_RELEASES = frozenset({(0, 144, 6)})
 
 
 class CodexRuntimeError(RuntimeError):
@@ -63,9 +62,9 @@ def _env_path() -> str:
 def codex_bin() -> Path:
     override = os.environ.get("RT_CODEX_BIN")
     if override:
-        path = Path(override).expanduser()
+        path = Path(override).expanduser().absolute()
         if path.is_file() and os.access(path, os.X_OK):
-            return path.resolve()
+            return path
         raise CodexRuntimeError(f"RT_CODEX_BIN is not executable: {path}")
 
     candidates = [
@@ -75,11 +74,11 @@ def codex_bin() -> Path:
     ]
     for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
-            return path.resolve()
+            return path.absolute()
 
     found = shutil.which("codex", path=_env_path())
     if found:
-        return Path(found).resolve()
+        return Path(found).absolute()
     raise CodexRuntimeError("could not find an executable Codex CLI")
 
 
@@ -98,10 +97,11 @@ def launch_agent_path(label: str) -> Path:
 
 def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    selected_codex = codex_bin()
     return {
         "Label": APP_SERVER_LABEL,
         "ProgramArguments": [
-            str(codex_bin()),
+            str(selected_codex),
             "app-server",
             "--listen",
             f"unix://{socket_path}",
@@ -115,6 +115,7 @@ def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
             "HOME": str(Path.home()),
             "PATH": _env_path(),
             "CODEX_HOME": str(CODEX_HOME),
+            "RT_CODEX_BIN": str(selected_codex),
         },
         "StandardOutPath": str(RUNTIME_DIR / "codex-app-server.stdout.log"),
         "StandardErrorPath": str(RUNTIME_DIR / "codex-app-server.stderr.log"),
@@ -127,6 +128,7 @@ def wake_plist(
     auto_discover: bool = False,
 ) -> dict:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    selected_codex = codex_bin()
     arguments = [
         str(ROUND_ROOT / "bin" / "rt-codex-wake"),
         "--socket",
@@ -140,6 +142,7 @@ def wake_plist(
         "PATH": _env_path(),
         "CODEX_HOME": str(CODEX_HOME),
         "RT_CODEX_RUNTIME_DIR": str(RUNTIME_DIR),
+        "RT_CODEX_BIN": str(selected_codex),
     }
     if os.environ.get("RT_PROJECTS_FILE"):
         environment["RT_PROJECTS_FILE"] = str(
@@ -419,8 +422,9 @@ class AppServerClient:
                     "title": "Roundtable Codex wake bridge",
                     "version": "1.0.0",
                 },
-                # excludeTurns and bounded turn-history paging are
-                # experimental in app-server 0.144.3.
+                # excludeTurns and bounded turn-history paging use the
+                # experimental API; supported releases are validated
+                # explicitly above rather than accepted by an open range.
                 "capabilities": {"experimentalApi": True},
             },
         )
@@ -642,7 +646,14 @@ def daemon_version(socket_path: Path = DEFAULT_SOCKET) -> tuple[dict | None, str
 
 
 def version_is_validated(version: tuple[int, int, int]) -> bool:
-    return VALIDATED_CODEX_MIN <= version <= VALIDATED_CODEX_MAX
+    return version in VALIDATED_CODEX_RELEASES
+
+
+def validated_releases_text() -> str:
+    return ", ".join(
+        ".".join(str(part) for part in version)
+        for version in sorted(VALIDATED_CODEX_RELEASES)
+    )
 
 
 def require_validated_version() -> tuple[int, int, int]:
@@ -652,8 +663,8 @@ def require_validated_version() -> tuple[int, int, int]:
     if not version_is_validated(version):
         rendered = ".".join(str(part) for part in version)
         raise UnsupportedVersion(
-            f"Codex {rendered} is outside the validated app-server wake range "
-            "0.144.3; use legacy keyboard nudge until revalidated"
+            f"Codex {rendered} is not a validated app-server wake release "
+            f"(validated: {validated_releases_text()})"
         )
     return version
 
@@ -670,8 +681,14 @@ def require_validated_daemon(socket_path: Path = DEFAULT_SOCKET) -> dict:
         raise CodexRuntimeError(
             f"daemon socket mismatch: {reported_socket!r} != {str(socket_path)!r}"
         )
+    daemon_cli_version = daemon.get("cliVersion")
     app_version = daemon.get("appServerVersion")
     cli_rendered = ".".join(str(part) for part in cli)
+    if daemon_cli_version != cli_rendered:
+        raise CodexRuntimeError(
+            f"selected CLI/daemon CLI version mismatch: "
+            f"{cli_rendered} != {daemon_cli_version}"
+        )
     if app_version != cli_rendered:
         raise CodexRuntimeError(
             f"CLI/app-server version mismatch: {cli_rendered} != {app_version}"

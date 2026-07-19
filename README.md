@@ -32,6 +32,7 @@ to make the rewrite reviewable.
 - [Development and attribution boundary](PROVENANCE.md)
 - [Contributor roles](CREDITS.md)
 - [Source commit ledger](docs/provenance/source-commits.tsv)
+- [Runtime compatibility and validation](docs/compatibility.md)
 
 Ocean directed the product. GPT-5.6 through Codex was the primary implementation
 environment. Fable 5 contributed specified early code, documentation,
@@ -39,6 +40,16 @@ configuration, design, and review; those contributions are recorded
 commit-by-commit rather than described as GPT-5.6-only work.
 
 All productization work begun in this public repository is GPT-5.6/Codex-led.
+
+## Current compatibility status
+
+| Surface | Status |
+| --- | --- |
+| Core maildir delivery on macOS without cmux | Covered by the imported regression suite; judge-path packaging is in progress |
+| npm Codex CLI `0.144.6` | Exact-release protocol smoke passed; clean daemon reload and full wake E2E remain a release gate |
+| Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
+| cmux | Supported as an optional integration; remaining launcher coupling is being removed |
+| tmux and cross-host SSH | Not yet supported |
 
 ## Release target
 

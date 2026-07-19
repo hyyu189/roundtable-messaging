@@ -15,6 +15,7 @@ from _rtcodex import (
     launchd_running,
     probe_handshake,
     require_default_socket,
+    require_validated_daemon,
 )
 
 
@@ -30,13 +31,18 @@ def main() -> int:
             path = install_launch_agent(
                 APP_SERVER_LABEL, app_server_plist(args.socket), reload=args.reload
             )
+            ensure_daemon(args.socket)
+            require_validated_daemon(args.socket)
             print(f"installed {path}")
             return 0
         if args.command == "ensure":
             ensure_daemon(args.socket)
+            require_validated_daemon(args.socket)
             print(f"ready {args.socket}")
             return 0
         ok, detail = probe_handshake(args.socket)
+        if ok:
+            require_validated_daemon(args.socket)
         print(
             f"launchd={'running' if launchd_running(APP_SERVER_LABEL) else 'not-running'} "
             f"handshake={'ok' if ok else 'failed'} socket={args.socket} detail={detail}"

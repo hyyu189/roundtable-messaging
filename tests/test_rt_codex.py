@@ -1636,9 +1636,45 @@ def test_rebind_during_start_waits_then_resets_wake_state(tmp_path):
 
 
 def test_version_allowlist_is_exact():
-    assert _rtcodex.version_is_validated((0, 144, 3))
-    assert not _rtcodex.version_is_validated((0, 144, 2))
-    assert not _rtcodex.version_is_validated((0, 144, 4))
+    assert _rtcodex.version_is_validated((0, 144, 6))
+    assert not _rtcodex.version_is_validated((0, 144, 5))
+    assert not _rtcodex.version_is_validated((0, 144, 7))
+
+
+def test_codex_bin_preserves_explicit_symlink_path(tmp_path, monkeypatch):
+    target = tmp_path / "versions" / "0.144.6" / "codex"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\n")
+    target.chmod(0o755)
+    selected = tmp_path / "current" / "codex"
+    selected.parent.mkdir()
+    selected.symlink_to(target)
+    monkeypatch.setenv("RT_CODEX_BIN", str(selected))
+
+    assert _rtcodex.codex_bin() == selected.absolute()
+    assert _rtcodex.codex_bin() != target
+
+
+def test_codex_bin_prefers_standalone_cache_over_npm(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    standalone_target = home / "standalone-versions" / "0.144.6" / "codex"
+    standalone_target.parent.mkdir(parents=True)
+    standalone_target.write_text("#!/bin/sh\n")
+    standalone_target.chmod(0o755)
+    standalone = home / ".codex" / "packages" / "standalone" / "current" / "codex"
+    standalone.parent.mkdir(parents=True)
+    standalone.symlink_to(standalone_target)
+    npm = home / ".npm-global" / "bin" / "codex"
+    npm.parent.mkdir(parents=True)
+    npm.write_text("#!/bin/sh\n")
+    npm.chmod(0o755)
+    monkeypatch.delenv("RT_CODEX_BIN", raising=False)
+    monkeypatch.setattr(_rtcodex, "CODEX_HOME", home / ".codex")
+    monkeypatch.setattr(
+        _rtcodex.Path, "home", classmethod(lambda _cls: home)
+    )
+
+    assert _rtcodex.codex_bin() == standalone.absolute()
 
 
 def test_rt_codex_socket_environment_cannot_redefine_validated_default(tmp_path):
@@ -1670,7 +1706,7 @@ def test_rt_codex_socket_environment_cannot_redefine_validated_default(tmp_path)
 
 def test_daemon_version_mismatch_fails_closed(monkeypatch):
     monkeypatch.setattr(
-        _rtcodex, "codex_version", lambda: ((0, 144, 3), "codex-cli 0.144.3")
+        _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
     )
     monkeypatch.setattr(
         _rtcodex,
@@ -1679,13 +1715,36 @@ def test_daemon_version_mismatch_fails_closed(monkeypatch):
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
-                "appServerVersion": "0.144.4",
+                "cliVersion": "0.144.6",
+                "appServerVersion": "0.144.5",
             },
             "",
         ),
     )
 
     with pytest.raises(_rtcodex.CodexRuntimeError, match="version mismatch"):
+        _rtcodex.require_validated_daemon()
+
+
+def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "daemon_version",
+        lambda _path: (
+            {
+                "status": "running",
+                "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+                "cliVersion": "0.144.5",
+                "appServerVersion": "0.144.6",
+            },
+            "",
+        ),
+    )
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="daemon CLI"):
         _rtcodex.require_validated_daemon()
 
 
@@ -1701,8 +1760,11 @@ def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):
 
     assert app["RunAtLoad"] and app["KeepAlive"]
     assert app["ProgramArguments"][-2:] == ["--listen", f"unix://{tmp_path / 'app.sock'}"]
+    assert app["ProgramArguments"][0] == str(fake_codex)
+    assert app["EnvironmentVariables"]["RT_CODEX_BIN"] == str(fake_codex)
     assert bridge["RunAtLoad"] and bridge["KeepAlive"] == {"SuccessfulExit": False}
     assert bridge["ProgramArguments"][-1] == "run"
+    assert bridge["EnvironmentVariables"]["RT_CODEX_BIN"] == str(fake_codex)
 
 
 def test_launchd_payload_uses_registry_and_persists_only_auto_discover(tmp_path, monkeypatch):
@@ -1744,7 +1806,7 @@ def test_explicit_launch_agent_reload_applies_unchanged_plist(tmp_path, monkeypa
 
 
 def test_doctor_failure_matrix_and_install_fix(monkeypatch, capsys):
-    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 3), "codex-cli 0.144.3"))
+    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6"))
     monkeypatch.setattr(doctor, "daemon_version", lambda _path: (None, "down"))
     monkeypatch.setattr(doctor, "socket_check", lambda _path: (False, "missing"))
     monkeypatch.setattr(doctor, "probe_handshake", lambda _path: (False, "refused"))
@@ -1800,9 +1862,9 @@ def test_doctor_reports_persisted_needs_human_as_warn(tmp_path, monkeypatch, cap
     assert not report.failed
 
 
-def test_doctor_unsupported_version_warns_and_exits_zero(monkeypatch, capsys):
+def test_doctor_unsupported_version_fails_closed(monkeypatch, capsys):
     socket_path = doctor.DEFAULT_SOCKET
-    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 4), "codex-cli 0.144.4"))
+    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 7), "codex-cli 0.144.7"))
     monkeypatch.setattr(
         doctor,
         "daemon_version",
@@ -1810,7 +1872,8 @@ def test_doctor_unsupported_version_warns_and_exits_zero(monkeypatch, capsys):
             {
                 "status": "running",
                 "socketPath": str(socket_path),
-                "appServerVersion": "0.144.4",
+                "cliVersion": "0.144.7",
+                "appServerVersion": "0.144.7",
             },
             "",
         ),
@@ -1821,15 +1884,16 @@ def test_doctor_unsupported_version_warns_and_exits_zero(monkeypatch, capsys):
     monkeypatch.setattr(doctor, "launchd_loaded", lambda _label: False)
     monkeypatch.setattr(sys, "argv", ["rt-doctor"])
 
-    assert doctor.main() == 0
+    assert doctor.main() == 1
     output = capsys.readouterr().out
-    assert "WARN version:" in output
-    assert "WARN bridge:" in output
+    assert "FAIL version:" in output
+    assert "FAIL bridge:" in output
+    assert "legacy" not in output
 
 
 def test_doctor_rejects_daemon_on_different_socket(monkeypatch, capsys, tmp_path):
     requested = tmp_path / "requested.sock"
-    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 3), "codex-cli 0.144.3"))
+    monkeypatch.setattr(doctor, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6"))
     monkeypatch.setattr(
         doctor,
         "daemon_version",
@@ -1837,7 +1901,8 @@ def test_doctor_rejects_daemon_on_different_socket(monkeypatch, capsys, tmp_path
             {
                 "status": "running",
                 "socketPath": "/tmp/other.sock",
-                "appServerVersion": "0.144.3",
+                "cliVersion": "0.144.6",
+                "appServerVersion": "0.144.6",
             },
             "",
         ),
@@ -1855,7 +1920,7 @@ def test_doctor_rejects_daemon_on_different_socket(monkeypatch, capsys, tmp_path
 def test_doctor_version_mismatch_reinstalls_loaded_plist(monkeypatch, capsys):
     socket_path = doctor.DEFAULT_SOCKET
     monkeypatch.setattr(
-        doctor, "codex_version", lambda: ((0, 144, 3), "codex-cli 0.144.3")
+        doctor, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
     )
     monkeypatch.setattr(
         doctor,
@@ -1864,7 +1929,8 @@ def test_doctor_version_mismatch_reinstalls_loaded_plist(monkeypatch, capsys):
             {
                 "status": "running",
                 "socketPath": str(socket_path),
-                "appServerVersion": "0.144.2",
+                "cliVersion": "0.144.6",
+                "appServerVersion": "0.144.5",
             },
             "",
         ),
@@ -1878,6 +1944,24 @@ def test_doctor_version_mismatch_reinstalls_loaded_plist(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "FAIL version:" in output
     assert "rt-codex-daemon install --reload" in output
+
+
+def test_daemon_status_rejects_handshake_only_readiness(monkeypatch, capsys):
+    monkeypatch.setattr(
+        daemon, "probe_handshake", lambda _path: (True, "initialize succeeded")
+    )
+    monkeypatch.setattr(daemon, "launchd_running", lambda _label: True)
+    monkeypatch.setattr(
+        daemon,
+        "require_validated_daemon",
+        lambda _path: (_ for _ in ()).throw(
+            _rtcodex.CodexRuntimeError("CLI/app-server version mismatch")
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["rt-codex-daemon", "status"])
+
+    assert daemon.main() == 1
+    assert "version mismatch" in capsys.readouterr().err
 
 
 def test_bridge_check_reports_non_object_heartbeat_as_failure(tmp_path, monkeypatch):

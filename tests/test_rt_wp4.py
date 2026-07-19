@@ -17,6 +17,7 @@ ISOLATED_BIN = ROOT / "tests" / "fixtures" / "bin"
 sys.path.insert(0, str(BIN))
 
 import _rtlauncher
+import _rtcodex
 import _rtlib
 
 
@@ -346,11 +347,20 @@ def test_launcher_exec_preserves_harness_contract(
         observed.update(program=program, command=command)
         raise ExecCalled
 
+    def fake_execv(program, command):
+        observed.update(program=program, command=command)
+        raise ExecCalled
+
     monkeypatch.setattr(_rtlauncher.os, "execvp", fake_execvp)
+    monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
+    fake_codex = tmp_path / "codex"
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: fake_codex)
 
     with pytest.raises(ExecCalled):
         _rtlauncher.launch(harness, argv)
 
+    if harness == "codex":
+        expected = [str(fake_codex), *expected[1:]]
     assert observed == {"cwd": project, "program": expected[0], "command": expected}
 
 
