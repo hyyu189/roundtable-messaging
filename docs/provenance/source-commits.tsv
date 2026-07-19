@@ -1,20 +1,20 @@
 source_commit	source_date	phase	fable_role	public_commit	status	notes
-dc6f1e61d3fdf8c6b88c34b8af62bebd58be077f	2026-06-29T16:56:21-07:00	pre_period_baseline	none		pending	Import only the minimum v1 context required to review the rewrite.
-0d49729dd2f56037158a57f6abe11224773e28ae	2026-07-15T19:25:06-07:00	build_week_v2	design_review		pending	Fable specification and approval found in design repo; implementation attributed to GPT-5.6 Codex.
-4651bc9cb9c4b391aebdd45d0e804b7bcec2a913	2026-07-15T20:17:49-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-30c704e8eda23861eea4c562ca85c0825f7ad84d	2026-07-15T20:25:24-07:00	build_week_v2	direct_code		pending	Exclude bin.bak-20260623T183827 completely.
-7b1752f2a4d784d4e6c7044f0ecb34200ef9a6a5	2026-07-16T18:19:46-07:00	build_week_v2	direct_code		pending	-
-706cb68e38fd5e1104a010616b78a4da74f38341	2026-07-16T19:01:17-07:00	build_week_v2	direct_docs_config		pending	-
-028008a248a23f16adf72ab2dcb15a674b2aa73b	2026-07-16T19:15:08-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-c691a0c91cc83bc5fd69e6c85ff119c14d043f10	2026-07-16T19:18:11-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-286db883ad6be415fd27570a60a9d2721e08ae75	2026-07-16T21:06:12-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-b545b29ca7249225f7c44aa78262613033306782	2026-07-16T21:20:25-07:00	build_week_v2	direct_docs_config		pending	-
-1fecae8342258f8a61109bc7673eecfa1ed09e0a	2026-07-16T21:39:31-07:00	build_week_v2	direct_code		pending	-
-05247b825c670c6a14eaaee6c1b29d86c5910f31	2026-07-16T22:13:20-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-b70a575cff856f1110668c5828f27429f4d23917	2026-07-16T22:26:24-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-fc26072e61bd807c19b83a9d1c552532c28e658d	2026-07-16T22:37:05-07:00	build_week_v2	direct_docs_config		pending	-
-b716987ebfc717e580f15e233596e54e09f25a5f	2026-07-16T22:43:51-07:00	build_week_v2	direct_docs_config		pending	Legacy v1 keyboard table is pre-period migration context.
-ec6f1f5401d1c566783ffa7ce542e0d19a4d29cb	2026-07-16T23:14:30-07:00	build_week_v2	design_review		pending	Implementation attributed to GPT-5.6 Codex.
-0d7f78e9c45594559a981f7c5b8ee50808b15f5d	2026-07-16T23:37:30-07:00	build_week_v2	direct_docs_config		pending	-
-0686cdef50c6db146d71efbe3d27690757354a0c	2026-07-17T00:15:58-07:00	build_week_v2	direct_docs_config		pending	-
-bbc67d8f42a238e4887d389cb6766dc57ae76e47	2026-07-17T00:35:01-07:00	build_week_v2	spec_only_no_review		pending	Implementation attributed to GPT-5.6 Codex.
+dc6f1e61d3fdf8c6b88c34b8af62bebd58be077f	2026-06-29T16:56:21-07:00	pre_period_baseline	none	26bae5a8015df9305aacc21d2d4a1595766e1f18	imported_sanitized	Minimum v1 context only; personal-name test fixture generalized.
+0d49729dd2f56037158a57f6abe11224773e28ae	2026-07-15T19:25:06-07:00	build_week_v2	design_review	27eb50fa5c2a990b643ff085c437ccc2d006f114	replayed_sanitized	Fable specification and approval found in design repo; implementation attributed to GPT-5.6 Codex.
+4651bc9cb9c4b391aebdd45d0e804b7bcec2a913	2026-07-15T20:17:49-07:00	build_week_v2	design_review	4b78cffe87707a369551ebc59f28c8e17417ebf5	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
+30c704e8eda23861eea4c562ca85c0825f7ad84d	2026-07-15T20:25:24-07:00	build_week_v2	direct_code	7a2bfd644bd9bd68a717525d80b9a458adffdeb8	replayed_sanitized	Excluded bin.bak-20260623T183827 completely.
+7b1752f2a4d784d4e6c7044f0ecb34200ef9a6a5	2026-07-16T18:19:46-07:00	build_week_v2	direct_code	5bd97b4d7fc41c690cd77a972cf9fc75b0807012	replayed_sanitized	-
+706cb68e38fd5e1104a010616b78a4da74f38341	2026-07-16T19:01:17-07:00	build_week_v2	direct_docs_config	cadd7005ac938405c540a5b8d72128b4982c7b27	replayed_sanitized	-
+028008a248a23f16adf72ab2dcb15a674b2aa73b	2026-07-16T19:15:08-07:00	build_week_v2	design_review	42f4685721185854d59b7cc75b4570c0824ca8c3	replayed_sanitized	Implementation attributed to GPT-5.6 Codex; source .gitignore excluded.
+c691a0c91cc83bc5fd69e6c85ff119c14d043f10	2026-07-16T19:18:11-07:00	build_week_v2	design_review	be7b4f354f541eb720601305fc4d71d37287b8ce	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
+286db883ad6be415fd27570a60a9d2721e08ae75	2026-07-16T21:06:12-07:00	build_week_v2	design_review	b69cd4c370735a83888ad899a69060d14d3572ca	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
+b545b29ca7249225f7c44aa78262613033306782	2026-07-16T21:20:25-07:00	build_week_v2	direct_docs_config	3fe7a288a8db5963cd37f935497da60b4df8c805	replayed_sanitized	-
+1fecae8342258f8a61109bc7673eecfa1ed09e0a	2026-07-16T21:39:31-07:00	build_week_v2	direct_code	af2da81bf2c6f340e865a3ea0063515f176c08b2	replayed_sanitized	-
+05247b825c670c6a14eaaee6c1b29d86c5910f31	2026-07-16T22:13:20-07:00	build_week_v2	design_review	209d01195b64723c36d0e3fe6728f19439b9233f	replayed_sanitized	Implementation attributed to GPT-5.6 Codex; source .gitignore excluded.
+b70a575cff856f1110668c5828f27429f4d23917	2026-07-16T22:26:24-07:00	build_week_v2	design_review	e3ffc983fae9e432b56ed151c0d0ab435ada1638	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
+fc26072e61bd807c19b83a9d1c552532c28e658d	2026-07-16T22:37:05-07:00	build_week_v2	direct_docs_config	e87573babbe50c06ca72791a789fc4696cf20f85	replayed_sanitized	-
+b716987ebfc717e580f15e233596e54e09f25a5f	2026-07-16T22:43:51-07:00	build_week_v2	direct_docs_config	637450fe44ebea75be3a99a79a9d44c3603d770c	replayed_sanitized	Legacy v1 keyboard table is pre-period migration context.
+ec6f1f5401d1c566783ffa7ce542e0d19a4d29cb	2026-07-16T23:14:30-07:00	build_week_v2	design_review	07c42948b7a945a3754d0226f3280937349e46b7	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
+0d7f78e9c45594559a981f7c5b8ee50808b15f5d	2026-07-16T23:37:30-07:00	build_week_v2	direct_docs_config	1f0ab6a45a238b155b34b4a2d7963fb097260237	replayed_sanitized	-
+0686cdef50c6db146d71efbe3d27690757354a0c	2026-07-17T00:15:58-07:00	build_week_v2	direct_docs_config	3fb28b4f97f2327e196c1877eaf1f981a96ed537	replayed_sanitized	-
+bbc67d8f42a238e4887d389cb6766dc57ae76e47	2026-07-17T00:35:01-07:00	build_week_v2	spec_only_no_review	5d74a74534667dd7a46360b6272321bea8287f51	replayed_sanitized	Implementation attributed to GPT-5.6 Codex.
