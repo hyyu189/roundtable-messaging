@@ -227,7 +227,11 @@ def project_config_path(root):
 
 
 def is_project_root(root):
-    return project_config_path(root).is_file()
+    candidate = Path(root).expanduser().resolve()
+    home = Path.home().expanduser().resolve()
+    if candidate == home or candidate == Path(candidate.anchor):
+        return False
+    return project_config_path(candidate).is_file()
 
 
 def fallback_project_root():

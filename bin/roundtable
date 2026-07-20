@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Unified project-first entry point for Roundtable."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from _rtlauncher import SelectionError, configured_sender_ids, project_at_or_above
+from _rtlib import emit_registry_warnings, is_project_root, load_project_registry
+
+
+ALIASES = {
+    "init": "roundtable-init",
+    "setup": "roundtable-setup",
+    "doctor": "rt-doctor",
+    "projects": "rt-projects",
+    "smoke": "roundtable-smoke",
+    "uninstall": "roundtable-uninstall",
+    "claude": "rt-claude",
+    "hermes": "rt-hermes",
+    "codex": "rt-codex",
+    "send": "rt-say",
+    "inbox": "rt-inbox",
+    "ack": "rt-ack",
+}
+HARNESS_ORDER = ("claude", "codex", "hermes")
+
+HELP = """usage: roundtable [command] [args...]
+
+Run without a command in a terminal for project-first onboarding.
+
+commands:
+  init       Create or safely set up a Roundtable project
+  setup      Plan, apply, inspect, or remove harness integration
+  doctor     Diagnose the current Roundtable project
+  projects   List or manage registered projects
+  smoke      Test the installed package
+  uninstall  Remove the managed Roundtable package
+  claude     Launch a Claude seat
+  hermes     Launch a Hermes seat
+  codex      Launch a Codex seat
+  send       Send a durable message
+  inbox      Read a durable inbox
+  ack        Acknowledge a durable message
+"""
+
+
+class OnboardingError(RuntimeError):
+    pass
+
+
+def sibling(name: str) -> Path:
+    target = Path(__file__).resolve().parent / name
+    if target.is_file() and os.access(target, os.X_OK):
+        return target
+    fallback = shutil.which(name)
+    if fallback:
+        return Path(fallback).resolve()
+    raise OnboardingError(f"roundtable: installed command is unavailable: {target}")
+
+
+def execute(name: str, args: list[str], exec_runner=os.execv) -> int:
+    target = sibling(name)
+    result = exec_runner(str(target), [str(target), *args])
+    return 127 if result is None else int(result)
+
+
+def read_choice(stdin, stderr, prompt: str) -> str:
+    print(prompt, end="", file=stderr, flush=True)
+    value = stdin.readline()
+    if value == "":
+        raise OnboardingError("roundtable: input closed during onboarding")
+    return value.strip()
+
+
+def read_yes_no(stdin, stderr, prompt: str) -> bool:
+    value = read_choice(stdin, stderr, prompt).lower()
+    if value in {"", "n", "no"}:
+        return False
+    if value in {"y", "yes"}:
+        return True
+    raise OnboardingError(
+        f"roundtable: expected yes or no, got {value!r}"
+    )
+
+
+def canonical_existing_folder(raw: str, cwd: Path) -> Path:
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    if candidate.is_symlink():
+        raise OnboardingError(
+            f"roundtable: refusing symbolic-link project folder: {candidate}"
+        )
+    try:
+        resolved = candidate.resolve()
+    except OSError as error:
+        raise OnboardingError(
+            f"roundtable: cannot resolve project folder {candidate}: {error}"
+        ) from error
+    if not resolved.is_dir():
+        raise OnboardingError(
+            f"roundtable: project folder does not exist: {resolved}"
+        )
+    return resolved
+
+
+def forbidden_project_root(root: Path, home: Path) -> bool:
+    resolved = root.expanduser().resolve()
+    filesystem_root = Path(resolved.anchor)
+    return resolved in {home.expanduser().resolve(), filesystem_root}
+
+
+def run_init_here(
+    root: Path,
+    *,
+    initialize_git: bool,
+    init_runner=subprocess.run,
+) -> Path:
+    command = [str(sibling("roundtable-init")), "--here"]
+    if initialize_git:
+        command.append("--git")
+    result = init_runner(command, cwd=root, check=False)
+    if result.returncode != 0:
+        raise OnboardingError(
+            f"roundtable: project setup failed with exit {result.returncode}"
+        )
+    if not is_project_root(root):
+        raise OnboardingError(
+            f"roundtable: setup completed without creating a project at {root}"
+        )
+    return root
+
+
+def create_project(
+    cwd: Path,
+    *,
+    stdin,
+    stderr,
+    home: Path,
+    init_runner=subprocess.run,
+) -> Path:
+    raw_parent = read_choice(stdin, stderr, f"Parent folder [{cwd}]: ")
+    parent = canonical_existing_folder(raw_parent or str(cwd), cwd)
+    name = read_choice(stdin, stderr, "New folder name: ")
+    if not name:
+        raise OnboardingError("roundtable: new folder name cannot be empty")
+    initialize_git = read_yes_no(
+        stdin, stderr, "Initialize Git too? [y/N]: "
+    )
+    target = (parent / name).resolve()
+    if forbidden_project_root(target, home):
+        raise OnboardingError(
+            "roundtable: refusing to use the home or filesystem root as a project"
+        )
+    command = [
+        str(sibling("roundtable-init")),
+        name,
+        "--parent",
+        str(parent),
+    ]
+    if initialize_git:
+        command.append("--git")
+    result = init_runner(command, cwd=cwd, check=False)
+    if result.returncode != 0:
+        raise OnboardingError(
+            f"roundtable: project creation failed with exit {result.returncode}"
+        )
+    if not is_project_root(target):
+        raise OnboardingError(
+            f"roundtable: creation completed without a project at {target}"
+        )
+    return target
+
+
+def choose_project(
+    *,
+    cwd: Path,
+    home: Path,
+    stdin,
+    stderr,
+    init_runner=subprocess.run,
+) -> Path:
+    anchored = project_at_or_above(cwd)
+    if anchored is not None and not forbidden_project_root(anchored, home):
+        print(f"Roundtable project: {anchored}", file=stderr)
+        return anchored
+
+    entries, warnings = load_project_registry()
+    emit_registry_warnings(warnings, stream=stderr, tool="roundtable")
+    options = []
+    for entry in entries:
+        root = entry["root"]
+        if not forbidden_project_root(root, home):
+            options.append(("project", root))
+    if not forbidden_project_root(cwd, home):
+        options.append(("here", cwd))
+    options.extend((("another", None), ("create", None)))
+
+    print("Choose a Roundtable project:", file=stderr)
+    for index, (kind, value) in enumerate(options, 1):
+        if kind == "project":
+            label = str(value)
+        elif kind == "here":
+            label = f"Set up this folder safely: {cwd}"
+        elif kind == "another":
+            label = "Set up another existing folder"
+        else:
+            label = "Create a new folder"
+        print(f"  {index}) {label}", file=stderr)
+
+    raw = read_choice(stdin, stderr, "Select project: ")
+    try:
+        selected = int(raw)
+        if not 1 <= selected <= len(options):
+            raise IndexError(selected)
+        kind, value = options[selected - 1]
+    except (ValueError, IndexError) as error:
+        raise OnboardingError(
+            f"roundtable: invalid project selection: {raw!r}"
+        ) from error
+
+    if kind == "project":
+        return value
+    if kind == "create":
+        return create_project(
+            cwd,
+            stdin=stdin,
+            stderr=stderr,
+            home=home,
+            init_runner=init_runner,
+        )
+    if kind == "another":
+        raw_path = read_choice(stdin, stderr, "Existing folder path: ")
+        root = canonical_existing_folder(raw_path, cwd)
+    else:
+        root = cwd
+    if forbidden_project_root(root, home):
+        raise OnboardingError(
+            "roundtable: refusing to use the home or filesystem root as a project"
+        )
+    initialize_git = read_yes_no(
+        stdin, stderr, "Initialize Git too? [y/N]: "
+    )
+    return run_init_here(
+        root,
+        initialize_git=initialize_git,
+        init_runner=init_runner,
+    )
+
+
+def choose_seat(root: Path, *, stdin, stderr) -> tuple[str, str]:
+    seats = []
+    for harness in HARNESS_ORDER:
+        try:
+            ids = configured_sender_ids(root, harness)
+        except SelectionError as error:
+            raise OnboardingError(f"roundtable: {error}") from error
+        seats.extend((harness, agent_id) for agent_id in ids)
+    if not seats:
+        raise OnboardingError(
+            f"roundtable: no Claude, Codex, or Hermes seats configured in {root}"
+        )
+
+    print("Choose a harness seat:", file=stderr)
+    for index, (harness, agent_id) in enumerate(seats, 1):
+        print(f"  {index}) {harness} — {agent_id}", file=stderr)
+    raw = read_choice(stdin, stderr, "Select harness: ")
+    try:
+        selected = int(raw)
+        if not 1 <= selected <= len(seats):
+            raise IndexError(selected)
+        return seats[selected - 1]
+    except (ValueError, IndexError) as error:
+        raise OnboardingError(
+            f"roundtable: invalid harness selection: {raw!r}"
+        ) from error
+
+
+def onboard(
+    *,
+    cwd: Path,
+    home: Path,
+    stdin,
+    stderr,
+    environ,
+    init_runner=subprocess.run,
+    exec_runner=os.execv,
+    chdir_runner=os.chdir,
+) -> int:
+    root = choose_project(
+        cwd=cwd,
+        home=home,
+        stdin=stdin,
+        stderr=stderr,
+        init_runner=init_runner,
+    )
+    harness, agent_id = choose_seat(root, stdin=stdin, stderr=stderr)
+    environ["RT_FROM"] = agent_id
+    chdir_runner(root)
+    return execute(f"rt-{harness}", [], exec_runner=exec_runner)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+    environ=None,
+    init_runner=subprocess.run,
+    exec_runner=os.execv,
+    chdir_runner=os.chdir,
+) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cwd = (cwd or Path.cwd()).expanduser().resolve()
+    home = (home or Path.home()).expanduser().resolve()
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
+    environ = os.environ if environ is None else environ
+
+    try:
+        if argv:
+            command = argv[0]
+            if command in {"help", "-h", "--help"}:
+                print(HELP, end="", file=stdout)
+                return 0
+            target = ALIASES.get(command)
+            if target is None:
+                print(f"roundtable: unknown command: {command}", file=stderr)
+                print(HELP, end="", file=stderr)
+                return 2
+            return execute(target, argv[1:], exec_runner=exec_runner)
+
+        if not stdin.isatty():
+            print(
+                "roundtable: no command given and stdin is not a TTY",
+                file=stderr,
+            )
+            print(HELP, end="", file=stderr)
+            return 2
+        return onboard(
+            cwd=cwd,
+            home=home,
+            stdin=stdin,
+            stderr=stderr,
+            environ=environ,
+            init_runner=init_runner,
+            exec_runner=exec_runner,
+            chdir_runner=chdir_runner,
+        )
+    except OnboardingError as error:
+        print(error, file=stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

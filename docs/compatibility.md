@@ -4,6 +4,24 @@ Roundtable's durable maildir core and its harness wake adapters have different
 compatibility boundaries. Delivery can succeed while an offline or unsupported
 harness remains unwoken.
 
+## Harness onboarding matrix
+
+`roundtable-setup` configures harnesses already installed by the user. It does
+not install a harness, create an account, copy credentials, or certify that a
+real vendor session can wake.
+
+| Harness | Packaged and automated | Still required before support promotion |
+| --- | --- | --- |
+| Claude Code | Global skill link; owned SessionStart inbox hook; owned Stop drain gate; plan/apply/status/remove tests | Clean-account skill discovery and real send-to-wake-to-drain/ack |
+| Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests | Clean-account plugin load/injection and real send-to-wake-to-drain/ack |
+| Codex | Shared executable resolver; global skill link; owned app-server and wake plist generation | Safe service load/reload, cwd-verified thread bind, and real send-to-wake-to-drain/ack |
+
+The Codex plist files are written but not loaded by setup. This is an
+intentional safety boundary, not evidence that the daemon is running.
+Conversely, removing Codex onboarding requires
+`roundtable-setup remove --unload-codex` from outside a Codex session, so a
+loaded job cannot be orphaned after its plist and executable are removed.
+
 ## Codex executable selection
 
 Every Codex-facing component uses the same resolver:
@@ -67,6 +85,33 @@ Before the Build Week release, npm `0.144.6` still needs the clean default
 daemon and real send-to-wake-to-drain/ack gate. Standalone support requires an
 official standalone installation followed by the same gate; an app-bundled
 internal Codex binary does not qualify as the standalone distribution.
+
+## Terminal acceptance matrix
+
+The core smoke runs without a terminal adapter and proves durable send, inbox,
+acknowledgement, and drain. It does not prove interactive wake UX.
+
+| Host | Core transport | Real Claude/Hermes/Codex wake |
+| --- | --- | --- |
+| Terminal.app | Same maildir core | Pending promotion gate |
+| iTerm2 | Same maildir core | Pending promotion gate |
+| Ghostty | Same maildir core | Pending promotion gate |
+| cmux | Same maildir core; optional topology features | Pending baseline and separate optional-adapter gate |
+| tmux | Core design is reusable | Unsupported until lifecycle and wake E2E pass |
+| Cross-host SSH | No P0 transport | Unsupported |
+
+## Legacy and migration boundary
+
+The current source tree replaces the earlier cmux keyboard-nudge delivery path.
+cmux surface IDs and project-local `.armed-*` markers are not delivery or
+liveness facts in Messaging v2. Existing maildir state remains durable, while
+session leases and heartbeats live under the host-local
+`~/.roundtable/.runtime/` tree.
+
+An active installation created before the managed package and harness manifests
+needs an explicit migration plan. The installer will not treat an unexplained
+legacy path as owned, and setup will not overwrite a foreign config fragment,
+plugin path, skill path, or plist.
 
 ## Official surface notes
 

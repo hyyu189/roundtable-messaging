@@ -6,7 +6,7 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 6.0.0
+version: 6.1.0
 author: Roundtable contributors
 license: MIT
 platforms: [linux, macos]
@@ -18,19 +18,66 @@ Collocated agents (Hermes, Claude, Codex) collaborate per project and talk
 through the `rt-*` CLI tools. Messages are **files in the project's mailbox**;
 wakes are harness-native. Nothing touches a keyboard.
 
-**Rule #0 — launch every agent in its project root.** One project × one
-harness = one dedicated session = one mailbox. Every identity mechanism
-(orientation autoload, rt-tool project discovery, tripwire/inbox anchoring,
-codex thread binding) keys off the directory the agent was started in; an
-agent launched elsewhere (e.g. `~`) is anchor-less — gates no-op, binds fail,
-workarounds pile up. `rt-startup-advisory` warns about this at session start.
-A project with no open session for an agent = that agent is **offline** there;
-mail waits in `new/` (the mailbox is the fact source).
+**Rule #0 — every collaborating session needs one project anchor.** One project
+× one logical harness seat = one dedicated session = one mailbox. Every
+identity mechanism keys off that canonical project path. For a human, prefer
+the unified `roundtable` entry: it chooses or safely creates the project first,
+then selects a configured harness seat. The scriptable `rt-claude`,
+`rt-hermes`, and `rt-codex` launchers remain available. A project with no open
+session for an agent means that agent is **offline** there; mail waits durably
+in `new/`.
+
+## One-time host setup
+
+Package installation provides one canonical Roundtable skill. Onboarding links
+that installed copy into each selected harness's global skill directory; do not
+ask a vibe-coding user to clone, pull, or copy this skill per project.
+
+```bash
+roundtable-setup          # read-only plan
+roundtable-setup apply    # owned hooks, plugin/skill links, Codex plists
+roundtable-setup status
+```
+
+Setup configures detected harnesses. Repeat `--harness` to make the selection
+explicit. It never installs a harness or moves credentials. Codex plist files
+are written but not loaded; service reload is a separate, human-coordinated
+operation outside any Codex session whose app-server may restart:
+
+```bash
+rt-codex-daemon install --reload
+rt-codex-wake install --reload
+rt-doctor
+```
+
+For removal, never orphan a loaded Codex job. Ask the human to run this from a
+normal terminal outside Codex:
+
+```bash
+roundtable-setup remove --unload-codex
+roundtable-uninstall
+```
+
+The command refuses when called inside Codex and touches only Roundtable's two
+owned labels. Claude/Hermes-only onboarding uses plain
+`roundtable-setup remove`.
+
+Any directory can become a project and Git is optional:
+
+```bash
+roundtable                         # recommended interactive entry
+roundtable-init --here
+roundtable-init new-project          # no Git by default
+roundtable-init new-git-project --git
+```
 
 ## Tools (on PATH via ~/.roundtable/bin/)
 
 | Tool | Purpose |
 |------|---------|
+| `roundtable-setup [plan\|apply\|status\|remove]` | Own host-level harness onboarding; the default is a no-write plan. |
+| `roundtable-init --here` / `roundtable-init NAME` | Adopt the current directory or create and register a project; add `--git` only when wanted. |
+| `rt-claude` / `rt-hermes` / `rt-codex` | Claim a fenced project seat and launch the real harness executable. |
 | `rt-say <agent> <kind> "body"` | Write the message into the target's project mailbox (atomic maildir). |
 | `rt-ack <id>[,<id>...] ["note"]` | Acknowledge received message(s). Comma-batches. Lands as a quiet `ack-*` file. |
 | `rt-inbox` | List un-ack'd inbound messages. |
@@ -47,9 +94,10 @@ creation, or an explicit unanchored launch; non-TTY unanchored calls exit 2.
 All three launchers select a real harness executable instead of a generated
 cmux PATH shim and export the unique configured `RT_FROM` identity. A
 multi-instance project must set `RT_FROM` explicitly. `rt-codex` additionally
-injects the `--remote` flag that its native wake bridge requires. Direct
-`claude`/`hermes` launches still anchor by cwd, but non-cmux tool calls then
-need an explicit `RT_FROM`.
+injects the `--remote` flag and fenced session environment that its native wake
+bridge requires. Direct vendor launch commands do not establish the complete
+lease context required for automatic wake; use the `rt-*` launchers for the
+supported path.
 
 ## Delivery: maildir + native wake (v2, sole path since 2026-07-17)
 
@@ -64,34 +112,27 @@ inbox has mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack`
 the ids (comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm**
 before going idle.
 
-**Arming (Claude)** — run as a harness-tracked background process at the end
-of any turn in a roundtable project:
+**Arming (Claude)** — the setup-owned SessionStart hook launches the fenced
+inbox watcher for a Roundtable-launched session. Its Stop hook prevents Claude
+from going idle with undrained mail or a missing watcher. Follow the hook's
+diagnostic instruction; ordinary users should not start or kill watcher
+processes themselves.
 
-```bash
-rt-wait-inbox claude    # via run_in_background; exits when mail lands (or heartbeat)
-```
+**Arming (Hermes)** — the setup-owned plugin starts the fenced watcher at
+Hermes session start and injects a user-visible Roundtable notice when mail
+lands. It is inert outside a complete Roundtable launcher lease and shuts down
+its watcher with the Hermes session.
 
-No interval argument = adaptive heartbeat: 45m countdown that resets while the
-session is active (rt-stop-gate stamps `.last-active` at every turn end), and
-backs off to 240m after 6 consecutive empty beats (~4.5h true idle). Sub-hour
-beats keep the prompt cache warm. Its exit re-invokes you automatically. A
-Stop hook (`rt-stop-gate`) blocks going idle with undrained mail or no live
-tripwire; follow its stderr instruction.
+**Arming (Codex)** — launch with `rt-codex`, then self-register in the first
+turn with `rt-codex-wake bind <project-root>`. The wake bridge then delivers
+maildir wakes with zero keyboard. A Codex session that was never bound has no
+waker; its mail still waits like any offline agent's.
 
-**Arming (Hermes)** — same script via
-`terminal(background=true, notify_on_complete=true)`.
-
-**Arming (Codex)** — launch from the project root with `rt-codex` (daemon
-liveness and remote attach handled automatically), then self-register in the
-first turn: `rt-codex-wake bind <project-root>`. The wake bridge then delivers
-maildir wakes with zero keyboard. A codex session that never self-registered
-has no waker — its mail waits like any offline agent's.
-
-**Replacing a tripwire: kill by marker, NEVER by name.** Other projects run
-tripwires under the same process name; `pkill -f rt-wait-inbox` deafens a
-sibling project's agent (real incident, 2026-07-17). Read the pid from YOUR
-inbox's `.armed-<pid>` marker and `kill` exactly that pid — or just arm a new
-one; duplicates are harmless.
+`rt-wait-inbox` remains an implementation and diagnostic tool. Never kill it
+by process name: another project can have the same executable name. P0 watcher
+ownership is fenced by the host-local session lease; old project-local
+`.armed-*`, `.last-active`, and `.empty-beats` files are diagnostic-only legacy
+state and must not be used as routing or liveness truth.
 
 ## Sending
 
@@ -117,10 +158,11 @@ in `~/.roundtable/docs/legacy-v1-keyboard.md`; human-coordinated use only.
 ## When mail sits unanswered
 
 Mail waiting in `new/` means the receiver is offline or unarmed — not lost.
-Diagnose in order: ① is a session open in that project (Rule #0)? ② Claude/
-Hermes: is a tripwire armed (`.armed-*` marker with a live pid)? ③ Codex: is
-the thread bound (`rt-doctor` anchor audit / bridge heartbeat)? ④ `rt-doctor`
-for daemon/bridge health. Fix the waker; never re-send by keyboard reflex.
+Diagnose in order: ① is a Roundtable-launched session open in that project
+(Rule #0)? ② does `roundtable-setup status` report the harness configured?
+③ does `rt-doctor` report a current fenced lease and healthy adapter?
+④ for Codex, is the thread bound and are both services healthy? Fix the native
+waker; never re-send by keyboard reflex.
 
 ## Multi-instance
 

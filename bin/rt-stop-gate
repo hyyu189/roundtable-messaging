@@ -165,7 +165,20 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) > 1:
         print("usage: rt-stop-gate [agent]", file=sys.stderr)
         return 2
-    agent = argv[0] if argv else "claude"
+    # This hook is installed globally. A direct vendor launch carries no
+    # Roundtable lease and must remain usable (and simply offline to peers).
+    # Any partial lease context still enters run() and fails closed.
+    if not any(
+        os.environ.get(name)
+        for name in (
+            "RT_PROJECT_ROOT",
+            "RT_FROM",
+            "RT_SESSION_ID",
+            "RT_LEASE_REVISION",
+        )
+    ):
+        return 0
+    agent = argv[0] if argv else os.environ.get("RT_FROM", "claude")
     hook_input = sys.stdin.read()
     try:
         return run(agent, hook_input)

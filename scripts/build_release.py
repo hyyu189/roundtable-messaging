@@ -160,6 +160,7 @@ OUTER_STATIC_FILES = {
     "install",
     "roundtable_packaging/__init__.py",
     "roundtable_packaging/cli.py",
+    "roundtable_packaging/setup.py",
     "scripts/install.sh",
     "scripts/uninstall.sh",
     "uninstall",
@@ -188,7 +189,15 @@ REQUIRED_PROJECT_PACKAGE_FILES = frozenset(
     {
         "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py",
+        "roundtable_packaging/setup.py",
         "roundtable_packaging/smoke.py",
+    }
+)
+REQUIRED_PROJECT_DATA_FILES = frozenset(
+    {
+        "share/roundtable/integrations/hermes/roundtable/__init__.py",
+        "share/roundtable/integrations/hermes/roundtable/plugin.yaml",
+        "share/roundtable/skills/shared/roundtable/SKILL.md",
     }
 )
 REQUIRED_PROJECT_SCRIPTS = frozenset(
@@ -197,6 +206,7 @@ REQUIRED_PROJECT_SCRIPTS = frozenset(
         "_rtlauncher.py",
         "_rtlib.py",
         "_rtruntime.py",
+        "roundtable",
         "roundtable-init",
         "rt-ack",
         "rt-claude",
@@ -483,6 +493,10 @@ def _validate_project_wheel(wheel: Path, version: str) -> None:
         *REQUIRED_PROJECT_ROOT_FILES,
         *REQUIRED_PROJECT_PACKAGE_FILES,
         *(
+            f"{data_prefix}data/{path}"
+            for path in REQUIRED_PROJECT_DATA_FILES
+        ),
+        *(
             f"{data_prefix}scripts/{script}"
             for script in REQUIRED_PROJECT_SCRIPTS
         ),
@@ -616,6 +630,7 @@ def _copy_release_bootstrap(source: Path, staging: Path) -> None:
         "docs/release.md": "docs/release.md",
         "roundtable_packaging/__init__.py": "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py": "roundtable_packaging/cli.py",
+        "roundtable_packaging/setup.py": "roundtable_packaging/setup.py",
         "scripts/install.sh": "scripts/install.sh",
         "scripts/uninstall.sh": "scripts/uninstall.sh",
     }

@@ -4,10 +4,12 @@ Roundtable is a local coordination layer for coding agents. Messaging v2 uses
 durable per-project mailboxes as the delivery fact source and wakes supported
 harnesses through native mechanisms instead of injecting keystrokes.
 
-> Build status: the source installer has passed isolated clean-home tests. The
-> checksummed release archive and offline dependency wheelhouse are still
-> release gates; do not replace an active legacy installation without a planned
-> migration.
+> Build status: the source installer and deterministic offline release archive
+> pass automated clean-home install, setup, core smoke, and uninstall tests.
+> The result is a release candidate, not yet a public support claim: real
+> credentialed harness wake tests and the mainstream terminal matrix remain
+> promotion gates. Do not replace an active pre-manifest installation without a
+> planned migration.
 
 ## Why it exists
 
@@ -51,6 +53,8 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | Surface | Status |
 | --- | --- |
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
+| Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
+| Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | npm Codex CLI `0.144.6` | Exact-release protocol smoke passed; clean daemon reload and full wake E2E remain a release gate |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
@@ -73,20 +77,72 @@ and multi-auth switching are roadmap items.
 
 ## Development install
 
-The current source tree can be installed into a versioned private environment:
+The current source tree can be installed into a versioned private environment.
+Package installation and harness onboarding are intentionally separate:
 
 ```bash
 mamba run -n general ./scripts/install.sh
+roundtable-setup
+roundtable-setup apply
 ```
 
-Stable commands are linked under `~/.local/bin`. Installation is fail-closed
-when an existing path is not owned by its managed manifest. Uninstallation
-preserves the project registry, runtime state, and every project-local mailbox:
+The first `roundtable-setup` is a read-only preview. `apply` configures only
+detected harnesses, or an explicit selection such as
+`--harness claude --harness hermes --harness codex`. It merges owned hook or
+plugin fragments, records backups and ownership, and links the installed
+Roundtable skill into each selected harness's global skill directory. A normal
+user does not copy or pull the skill into every project.
+
+Codex setup writes two LaunchAgent plist files but deliberately does not load
+them. Coordinate a safe restart outside the Codex session whose app-server may
+be restarted:
+
+```bash
+rt-codex-daemon install --reload
+rt-codex-wake install --reload
+rt-doctor
+```
+
+Then use the unified entry point. It first finds or safely creates the project
+anchor, then asks which configured harness seat to launch:
+
+```bash
+roundtable
+```
+
+The menu can adopt the current non-Git directory without replacing user files,
+select a registered project, choose another existing folder, or create a new
+one. Git is always opt-in. Scriptable users can use `roundtable init`,
+`roundtable claude`, `roundtable hermes`, or `roundtable codex`; the underlying
+`roundtable-init` and `rt-*` commands remain available.
+
+The most common day-to-day commands are:
+
+```text
+roundtable                         project-first interactive entry
+rt-claude / rt-hermes / rt-codex  launch a project-anchored harness
+rt-say AGENT KIND "MESSAGE"       deliver durable mail
+rt-inbox                          inspect waiting mail
+rt-ack ID                         acknowledge a message
+rt-doctor                         diagnose setup, leases, and wake services
+```
+
+Stable commands are linked under `~/.local/bin`. Installation fails closed
+when an existing path is not owned by its managed manifest. Remove harness
+configuration before removing the package. If Codex was configured, run the
+teardown from a normal terminal outside Codex so Roundtable can inspect and
+unload only its two owned jobs:
 
 ```bash
 roundtable-smoke
+roundtable-setup status
+roundtable-setup remove --unload-codex
 roundtable-uninstall
 ```
+
+Claude/Hermes-only onboarding uses plain `roundtable-setup remove`.
+Uninstallation preserves the project registry, host runtime state, and every
+project-local mailbox unless an explicit runtime purge is requested.
 
 See [Installation and ownership](docs/install.md) for isolated preview paths,
 offline release mode, upgrade gates, and precise removal behavior.

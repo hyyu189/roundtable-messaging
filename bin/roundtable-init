@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import date
@@ -13,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "templates"
 
 PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TEMPLATE_VARIABLE_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
 FILES = {
     # Per-harness entrypoints — thin (role + always-load). Each harness only auto-reads its OWN
@@ -31,31 +34,293 @@ FILES = {
     ".roundtable/.gitignore": "roundtable-gitignore.tmpl",
 }
 
+MARKER_BLOCKS = {
+    "AGENTS.md": (
+        "<!-- BEGIN Roundtable -->\n"
+        "For Roundtable work, always read `ROUTING.md` and `README.md`. "
+        "Use the `roundtable` skill for peer-agent messaging.\n"
+        "<!-- END Roundtable -->\n"
+    ),
+    "CLAUDE.md": (
+        "<!-- BEGIN Roundtable -->\n"
+        "@ROUTING.md\n"
+        "@README.md\n"
+        "<!-- END Roundtable -->\n"
+    ),
+    "HERMES.md": (
+        "<!-- BEGIN Roundtable -->\n"
+        "For Roundtable work, always read `ROUTING.md` and `README.md`. "
+        "Use the `roundtable` skill for peer-agent messaging.\n"
+        "<!-- END Roundtable -->\n"
+    ),
+    "ROUTING.md": (
+        "<!-- BEGIN Roundtable -->\n"
+        "## Roundtable routing\n\n"
+        "For peer-agent coordination or `rt-*` messaging, load the "
+        "`roundtable` skill and `.roundtable/agents.yaml`. Project scope is "
+        "in `BRIEF.md`, shared status is in `README.md`, and durable decisions "
+        "are in `decision.md`.\n"
+        "<!-- END Roundtable -->\n"
+    ),
+    "README.md": (
+        "<!-- BEGIN Roundtable -->\n"
+        "## Roundtable status\n\n"
+        "Agent routing is in [`ROUTING.md`](ROUTING.md). Keep the current "
+        "shared status in this README so every harness sees the same state.\n"
+        "<!-- END Roundtable -->\n"
+    ),
+    ".gitignore": (
+        "# BEGIN Roundtable\n"
+        ".gstack/\n"
+        "PAUSE\n"
+        ".cmux/cache/\n"
+        "*.log\n"
+        ".DS_Store\n"
+        "# END Roundtable\n"
+    ),
+    ".roundtable/.gitignore": (
+        "# BEGIN Roundtable\n"
+        "runtime.json\n"
+        "runtime.json.tmp.*\n"
+        "messages/\n"
+        "locks/\n"
+        "inbox/\n"
+        "topology.tmp.json\n"
+        "# END Roundtable\n"
+    ),
+}
+
+MARKERS = {
+    rel: (
+        (
+            "# BEGIN Roundtable"
+            if rel.endswith(".gitignore")
+            else "<!-- BEGIN Roundtable -->"
+        ),
+        (
+            "# END Roundtable"
+            if rel.endswith(".gitignore")
+            else "<!-- END Roundtable -->"
+        ),
+    )
+    for rel in MARKER_BLOCKS
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="roundtable-init",
         description="Bootstrap a roundtable project that uses global rt-* tools.",
     )
-    parser.add_argument("project_name")
-    parser.add_argument("-p", "--parent", default=".")
-    parser.add_argument("--no-git", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("project_name", nargs="?")
+    location = parser.add_mutually_exclusive_group()
+    location.add_argument("-p", "--parent", default=".")
+    location.add_argument(
+        "--here",
+        action="store_true",
+        help="configure the current directory without replacing existing files",
+    )
+    git = parser.add_mutually_exclusive_group()
+    git.add_argument(
+        "--git",
+        action="store_true",
+        help="initialize Git and create an initial commit when not already in a repository",
+    )
+    git.add_argument(
+        "--no-git",
+        action="store_true",
+        help="do not initialize Git (the default; retained for compatibility)",
+    )
+    args = parser.parse_args()
+    if not args.here and args.project_name is None:
+        parser.error("project_name is required unless --here is used")
+    return args
 
 
 def render(template, values):
-    text = template
-    for key, value in values.items():
-        text = text.replace("${" + key + "}", value)
-    return text
+    # Substitute against the template exactly once. A user-controlled project
+    # name or path can itself contain text such as ``${date}``; replacement
+    # values must never be interpreted as a second template pass.
+    return TEMPLATE_VARIABLE_RE.sub(
+        lambda match: values.get(match.group(1), match.group(0)),
+        template,
+    )
 
 
-def write_from_template(target, template_name, values):
-    template_path = TEMPLATES / template_name
-    if not template_path.is_file():
-        raise SystemExit(f"roundtable-init: missing template: {template_path}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render(template_path.read_text(), values))
+def matches_rendered_template(content, template, values):
+    """Recognize our dated templates without requiring today's date."""
+    pieces = []
+    position = 0
+    for match in re.finditer(r"\$\{([A-Za-z0-9_]+)\}", template):
+        pieces.append(re.escape(template[position:match.start()]))
+        key = match.group(1)
+        if key == "date":
+            pieces.append(r"\d{4}-\d{2}-\d{2}")
+        else:
+            pieces.append(re.escape(values.get(key, match.group(0))))
+        position = match.end()
+    pieces.append(re.escape(template[position:]))
+    return re.fullmatch("".join(pieces), content) is not None
+
+
+def fail(message):
+    raise SystemExit(f"roundtable-init: {message}")
+
+
+def ensure_plain_directory(path, *, writable=False):
+    if path.is_symlink():
+        fail(f"refusing symbolic-link directory: {path}")
+    if not path.is_dir():
+        fail(f"expected a directory: {path}")
+    if writable and not os.access(path, os.W_OK | os.X_OK):
+        fail(f"directory is not writable: {path}")
+
+
+def read_templates():
+    if not TEMPLATES.is_dir():
+        fail(f"templates directory missing: {TEMPLATES}")
+    rendered = {}
+    for template_name in set(FILES.values()):
+        path = TEMPLATES / template_name
+        if path.is_symlink() or not path.is_file():
+            fail(f"missing template: {path}")
+        try:
+            rendered[template_name] = path.read_text()
+        except OSError as error:
+            fail(f"cannot read template {path}: {error}")
+    return rendered
+
+
+def marked_append(target, rel):
+    try:
+        current = target.read_text()
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read existing file {target}: {error}")
+    begin, end = MARKERS[rel]
+    has_begin = begin in current
+    has_end = end in current
+    if has_begin != has_end:
+        fail(f"refusing incomplete Roundtable marker in {target}")
+    if has_begin:
+        return None
+    if not os.access(target, os.W_OK):
+        fail(f"file is not writable: {target}")
+    separator = "" if not current or current.endswith("\n\n") else (
+        "\n" if current.endswith("\n") else "\n\n"
+    )
+    return separator + MARKER_BLOCKS[rel]
+
+
+def preflight(project_dir, *, create_root, values, templates):
+    """Return a complete mutation plan without changing the target."""
+    if create_root:
+        if project_dir.exists() or project_dir.is_symlink():
+            fail(f"target already exists: {project_dir}")
+        ensure_plain_directory(project_dir.parent, writable=True)
+    else:
+        ensure_plain_directory(project_dir, writable=True)
+
+    use_claude_skills = (Path.home() / ".claude").is_dir()
+    directory_rels = {
+        "handoff",
+        "log",
+        "skills",
+        ".roundtable",
+        *(
+            str(Path(rel).parent)
+            for rel in FILES
+            if str(Path(rel).parent) != "."
+        ),
+    }
+    if use_claude_skills:
+        directory_rels.add(".claude")
+
+    directories = []
+    missing_directories = set()
+    for rel in sorted(directory_rels, key=lambda value: (len(Path(value).parts), value)):
+        target = project_dir / rel
+        if target.exists() or target.is_symlink():
+            ensure_plain_directory(target, writable=True)
+        else:
+            missing_directories.add(rel)
+            directories.append(target)
+
+    creates = []
+    appends = []
+    for rel, template_name in FILES.items():
+        target = project_dir / rel
+        if target.is_symlink():
+            fail(f"refusing symbolic-link file: {target}")
+        if target.exists():
+            if not target.is_file():
+                fail(f"expected a regular file: {target}")
+            if rel == ".roundtable/agents.yaml":
+                try:
+                    content = target.read_text()
+                except (OSError, UnicodeError) as error:
+                    fail(f"cannot read existing file {target}: {error}")
+                if not re.search(
+                    r"(?m)^schema:\s*roundtable\.agents\.v1\s*$", content
+                ):
+                    fail(f"existing agents file is not Roundtable v1: {target}")
+            elif rel in MARKER_BLOCKS:
+                try:
+                    current = target.read_text()
+                except (OSError, UnicodeError) as error:
+                    fail(f"cannot read existing file {target}: {error}")
+                if not matches_rendered_template(
+                    current, templates[template_name], values
+                ):
+                    addition = marked_append(target, rel)
+                    if addition is not None:
+                        appends.append((target, addition))
+            # BRIEF.md and decision.md are user-owned when already present.
+            continue
+        creates.append((target, render(templates[template_name], values)))
+
+    gitkeeps = []
+    for rel in ("handoff", "log", "skills"):
+        if rel in missing_directories:
+            gitkeeps.append(project_dir / rel / ".gitkeep")
+
+    claude_skills = None
+    if use_claude_skills:
+        target = project_dir / ".claude" / "skills"
+        if target.is_symlink():
+            if os.readlink(target) != "../skills":
+                fail(f"refusing foreign symbolic link: {target}")
+        elif target.exists():
+            # A user-managed directory is valid and remains untouched, but a
+            # regular file cannot serve as Claude's project skill directory.
+            ensure_plain_directory(target)
+        else:
+            claude_skills = target
+
+    return {
+        "create_root": create_root,
+        "directories": directories,
+        "creates": creates,
+        "appends": appends,
+        "gitkeeps": gitkeeps,
+        "claude_skills": claude_skills,
+    }
+
+
+def apply_plan(project_dir, plan):
+    if plan["create_root"]:
+        project_dir.mkdir()
+    for path in plan["directories"]:
+        path.mkdir()
+    for path in plan["gitkeeps"]:
+        path.write_text("")
+    for path, content in plan["creates"]:
+        with path.open("x") as handle:
+            handle.write(content)
+    for path, addition in plan["appends"]:
+        with path.open("a") as handle:
+            handle.write(addition)
+    if plan["claude_skills"] is not None:
+        plan["claude_skills"].symlink_to(Path("..") / "skills")
 
 
 def run_git(project_dir, args):
@@ -74,42 +339,70 @@ def git_init(project_dir, project_name):
     subprocess.run(cmd, cwd=project_dir, text=True, check=True)
 
 
+def in_git_worktree(project_dir):
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=project_dir,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
 def main():
     args = parse_args()
-    project_name = args.project_name
-    if not PROJECT_RE.match(project_name):
-        raise SystemExit("roundtable-init: project name must match ^[A-Za-z0-9][A-Za-z0-9._-]*$; no slashes or whitespace")
-    parent = Path(args.parent).expanduser().resolve()
-    project_dir = parent / project_name
-    if project_dir.exists():
-        raise SystemExit(f"roundtable-init: target already exists: {project_dir}")
-    if not TEMPLATES.is_dir():
-        raise SystemExit(f"roundtable-init: templates directory missing: {TEMPLATES}")
+    if args.here:
+        project_dir = Path.cwd().resolve()
+        if project_dir in {Path.home().resolve(), Path(project_dir.anchor)}:
+            fail(
+                "refusing to use the home or filesystem root as a project; "
+                "choose a real project folder"
+            )
+        project_name = args.project_name or project_dir.name
+        if not project_name or "\n" in project_name or "\r" in project_name:
+            fail("project name must be a non-empty single line")
+        create_root = False
+    else:
+        project_name = args.project_name
+        if not PROJECT_RE.fullmatch(project_name):
+            fail(
+                "project name must match ^[A-Za-z0-9][A-Za-z0-9._-]*$; "
+                "no slashes or whitespace"
+            )
+        parent = Path(args.parent).expanduser().resolve()
+        project_dir = parent / project_name
+        create_root = True
+
+    templates = read_templates()
     validate_project_registry()
 
     values = {
         "project_name": project_name,
         "project_dir": str(project_dir),
+        # JSON strings are valid YAML scalars. Keep the human-facing path
+        # unquoted for Markdown templates while making agents.yaml safe for
+        # spaces, comment characters, quotes, and other YAML punctuation.
+        "project_dir_yaml": json.dumps(str(project_dir), ensure_ascii=False),
         "date": date.today().isoformat(),
     }
 
-    project_dir.mkdir(parents=True)
-    for dirname in ("handoff", "log", "skills"):
-        path = project_dir / dirname
-        path.mkdir()
-        (path / ".gitkeep").write_text("")
+    plan = preflight(
+        project_dir,
+        create_root=create_root,
+        values=values,
+        templates=templates,
+    )
+    already_git = False
+    if args.git:
+        if shutil.which("git") is None:
+            fail("--git requested but git is not installed")
+        already_git = in_git_worktree(project_dir if not create_root else project_dir.parent)
 
-    # project-level skills: ./skills/ is the single source.
-    # Wire harness-specific skill discovery if that harness is installed.
-    if (Path.home() / ".claude").is_dir():
-        claude_dir = project_dir / ".claude"
-        claude_dir.mkdir()
-        (claude_dir / "skills").symlink_to(Path("..") / "skills")
+    apply_plan(project_dir, plan)
 
-    for rel, template in FILES.items():
-        write_from_template(project_dir / rel, template, values)
-
-    if not args.no_git:
+    if args.git and not already_git:
         git_init(project_dir, project_name)
 
     try:
@@ -120,7 +413,27 @@ def main():
             f"{error}; recover with: rt-projects add {project_dir}"
         ) from error
 
-    print(f"created {project_dir}")
+    changed = bool(
+        plan["create_root"]
+        or plan["directories"]
+        or plan["creates"]
+        or plan["appends"]
+        or plan["gitkeeps"]
+        or plan["claude_skills"]
+    )
+    if create_root:
+        print(f"created {project_dir}")
+    elif changed:
+        print(f"configured {project_dir}")
+    else:
+        print(f"already configured {project_dir}")
+    if args.git:
+        if already_git:
+            print("git: existing repository preserved (no init or commit)")
+        else:
+            print("git: initialized with an initial commit")
+    else:
+        print("git: not initialized (use --git to opt in)")
     print(f"registered {project_dir}")
     print("next:")
     print(f"  cd {project_dir}")

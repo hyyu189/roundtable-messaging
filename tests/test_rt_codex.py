@@ -89,6 +89,21 @@ agents:
     return path.resolve()
 
 
+def test_project_config_parser_preserves_yaml_comment_characters(tmp_path):
+    project = tmp_path / "project # notes"
+    state = project / ".roundtable"
+    state.mkdir(parents=True)
+    (state / "agents.yaml").write_text(
+        "schema: roundtable.agents.v1\n"
+        f"project: {json.dumps(str(project.resolve()))}\n"
+        "agents:\n"
+        "  codex:\n"
+        "    harness: codex\n"
+    )
+
+    assert wake.project_config_has_codex(project.resolve()) is True
+
+
 def add_mail(project: Path, msg_id: str) -> Path:
     inbox = project / ".roundtable" / "inbox" / "codex" / "new"
     inbox.mkdir(parents=True, exist_ok=True)
@@ -1477,6 +1492,66 @@ def test_wake_install_rejects_custom_socket_before_plist_or_launchctl(
     assert "non-default app-server socket" in capsys.readouterr().err
 
 
+def test_daemon_install_rejects_unsupported_cli_before_plist_or_launchctl(
+    monkeypatch, capsys
+):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "require_validated_version",
+        lambda: (_ for _ in ()).throw(
+            _rtcodex.UnsupportedVersion("unsupported test CLI")
+        ),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "app_server_plist",
+        lambda *_args: calls.append("plist"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "install_launch_agent",
+        lambda *_args, **_kwargs: calls.append("install"),
+    )
+    monkeypatch.setattr(sys, "argv", ["rt-codex-daemon", "install", "--reload"])
+
+    assert daemon.main() == 1
+    assert calls == []
+    assert "unsupported test CLI" in capsys.readouterr().err
+
+
+def test_wake_install_rejects_unsupported_cli_before_plist_or_launchctl(
+    monkeypatch, capsys
+):
+    calls = []
+    monkeypatch.setattr(
+        wake,
+        "require_validated_version",
+        lambda: (_ for _ in ()).throw(
+            _rtcodex.UnsupportedVersion("unsupported test CLI")
+        ),
+    )
+    monkeypatch.setattr(
+        wake,
+        "wake_plist",
+        lambda *_args, **_kwargs: calls.append("plist"),
+    )
+    monkeypatch.setattr(
+        wake,
+        "install_launch_agent",
+        lambda *_args, **_kwargs: calls.append("install"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["rt-codex-wake", "install", "--reload"],
+    )
+
+    assert wake.main() == 1
+    assert calls == []
+    assert "unsupported test CLI" in capsys.readouterr().err
+
+
 def test_singleton_kernel_lock_releases_without_unlink(tmp_path):
     path = tmp_path / "bridge.lock"
     first = wake.acquire_singleton(path)
@@ -1841,6 +1916,28 @@ def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):
     assert bridge["EnvironmentVariables"]["RT_RUNTIME_DIR"] == str(
         tmp_path / "runtime"
     )
+
+
+def test_launchd_payload_preview_does_not_create_runtime(tmp_path, monkeypatch):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/bin/sh\n")
+    fake_codex.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("RT_CODEX_BIN", str(fake_codex))
+    monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", runtime)
+
+    app = _rtcodex.app_server_plist(
+        tmp_path / "app.sock",
+        ensure_runtime=False,
+    )
+    bridge = _rtcodex.wake_plist(
+        tmp_path / "app.sock",
+        ensure_runtime=False,
+    )
+
+    assert not runtime.exists()
+    assert app["EnvironmentVariables"]["RT_RUNTIME_DIR"] == str(runtime)
+    assert bridge["EnvironmentVariables"]["RT_RUNTIME_DIR"] == str(runtime)
 
 
 def test_codex_runtime_root_rejects_symlink(tmp_path, monkeypatch):

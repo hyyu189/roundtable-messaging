@@ -300,6 +300,17 @@ def _read_choice(stdin, stderr, prompt: str) -> str:
     return value.strip()
 
 
+def _choose_git(stdin, stderr, harness: str) -> bool:
+    answer = _read_choice(
+        stdin, stderr, "Initialize Git too? [y/N]: "
+    ).lower()
+    if answer not in {"", "n", "no", "y", "yes"}:
+        raise SelectionError(
+            f"rt-{harness}: expected yes or no for Git, got {answer!r}"
+        )
+    return answer in {"y", "yes"}
+
+
 def choose_launch_cwd(
     harness: str,
     *,
@@ -326,8 +337,15 @@ def choose_launch_cwd(
     print("Roundtable projects:", file=stderr)
     for index, root in enumerate(roots, 1):
         print(f"  {index}) {root}", file=stderr)
-    create_index = len(roots) + 1
+    can_setup_here = cwd not in {Path.home().resolve(), Path(cwd.anchor)}
+    setup_here_index = len(roots) + 1 if can_setup_here else None
+    create_index = len(roots) + 1 + int(can_setup_here)
     unanchored_index = create_index + 1
+    if setup_here_index is not None:
+        print(
+            f"  {setup_here_index}) Set up this folder safely: {cwd}",
+            file=stderr,
+        )
     print(f"  {create_index}) Create a new project in {cwd}", file=stderr)
     print(f"  {unanchored_index}) Start without a project anchor", file=stderr)
 
@@ -338,12 +356,30 @@ def choose_launch_cwd(
         raise SelectionError(f"rt-{harness}: invalid selection: {raw!r}") from error
     if 1 <= selected <= len(roots):
         return roots[selected - 1]
+    if setup_here_index is not None and selected == setup_here_index:
+        init = Path(__file__).resolve().parent / "roundtable-init"
+        command = [str(init), "--here"]
+        if _choose_git(stdin, stderr, harness):
+            command.append("--git")
+        result = init_runner(command, cwd=cwd, check=False)
+        if result.returncode != 0:
+            raise SelectionError(
+                f"rt-{harness}: roundtable-init failed with exit {result.returncode}"
+            )
+        if not is_project_root(cwd):
+            raise SelectionError(
+                f"rt-{harness}: roundtable-init did not configure {cwd}"
+            )
+        return cwd
     if selected == create_index:
         name = _read_choice(stdin, stderr, "New project name: ")
         if not name:
             raise SelectionError(f"rt-{harness}: project name cannot be empty")
         init = Path(__file__).resolve().parent / "roundtable-init"
-        result = init_runner([str(init), name, "--parent", str(cwd)], check=False)
+        command = [str(init), name, "--parent", str(cwd)]
+        if _choose_git(stdin, stderr, harness):
+            command.append("--git")
+        result = init_runner(command, check=False)
         if result.returncode != 0:
             raise SelectionError(
                 f"rt-{harness}: roundtable-init failed with exit {result.returncode}"

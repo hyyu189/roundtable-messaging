@@ -10,7 +10,7 @@ core.
 | Layer | Responsibility | Required for delivery |
 | --- | --- | --- |
 | Product core | Project config and identity, atomic maildir delivery, ledger, inbox, acknowledgement, and drain state | Yes |
-| Harness adapters | Codex app-server wake; Claude and Hermes tripwire/hook integration | Only for automatic wake; offline delivery still succeeds |
+| Harness adapters | Codex app-server wake; Claude hooks; Hermes lifecycle plugin | Only for automatic wake; offline delivery still succeeds |
 | Terminal integrations | Optional workspace topology, surface diagnostics, project navigation, and notifications | No |
 
 The data path is:
@@ -44,6 +44,51 @@ optional cmux adapter
 - Terminal-emulator support and harness support are separate axes. A Codex
   app-server compatibility gate is not a Ghostty, iTerm2, or Terminal.app
   compatibility gate.
+
+## Host and project onboarding
+
+Program installation, host onboarding, and project creation are separate
+ownership boundaries:
+
+```text
+release installer
+  -> versioned program + canonical global skill
+  -> install-manifest.json
+
+roundtable-setup
+  -> selected harness config fragments, plugin/skill links, Codex plists
+  -> harness-setup.json + private config backups
+
+roundtable-init
+  -> one project anchor, identities, mailboxes, and orientation files
+  -> optional Git initialization only when requested
+
+roundtable
+  -> project-first selector over registered/current/new folders
+  -> configured harness-seat selector, then the fenced rt-* launcher
+```
+
+`roundtable-setup` defaults to a read-only plan. `apply` links the one installed
+skill into the selected harnesses' user-global skill roots, so agents discover
+the same version without copying it into every project. Claude receives owned
+SessionStart and Stop hook groups. Hermes receives one marked plugin enablement
+plus an owned plugin link. Codex receives owned app-server and wake plist files.
+Setup does not install a harness or copy credentials. Plan, apply, and status
+never invoke `launchctl`; only an explicit Codex teardown may do so.
+
+The package and harness manifests are deliberately separate. Harness
+configuration must be removed while its Roundtable commands and canonical
+skill still exist; only then can the package be uninstalled. Both removal paths
+verify ownership and fail closed on drift. A Codex-selected removal also fails
+closed until an operator outside Codex explicitly supplies `--unload-codex`;
+that path inspects and bootouts only the two owned labels before deleting their
+plist files.
+
+`roundtable-init --here` configures an existing directory without replacing
+user documents. `roundtable-init NAME` creates a new directory. Git is not a
+project-identity requirement and is initialized only with `--git`. The
+unified `roundtable` command exposes this as the default interactive journey;
+the individual harness launchers retain their scriptable entry points.
 
 ## P0 state placement and session ownership
 
@@ -178,28 +223,30 @@ is claimed; neither should fork the core transport.
 
 ## Current implementation boundary
 
-The release installer currently installs versioned commands, templates, and
-the Roundtable skill. It does not yet merge Claude or Hermes hook
-configuration, install Codex wake services, bind a Codex thread, or prove that
-each harness can discover the installed skill from a clean account. Those are
-harness-onboarding gaps, not terminal-emulator dependencies.
+The release candidate now implements the host-local fenced lease, unified
+launcher selector, no-Git project initialization, dry-run-first harness setup,
+owned global skill links, Claude lifecycle hooks, the Hermes lifecycle plugin,
+and Codex plist generation. Automated tests exercise those config changes and
+their symmetric removal from an installed release artifact.
 
-The P0 implementation order is therefore:
+Codex setup stops at writing plist definitions. Loading or reloading them is an
+explicit, coordinated operation because it may restart the app-server serving
+the current Codex session. A fresh Codex thread also must prove its project
+identity with `rt-codex-wake bind <project-root>`.
 
-1. add the host-local runtime helper and fenced seat lease, migrate
-   Claude/Hermes liveness markers, and make the unified launcher selector
-   enforce the state machine above;
-2. add a dry-run-first, ownership-marked harness setup command with backups,
-   idempotent merges, diagnostics, and a symmetric uninstall path;
-3. install, validate, and safely reload the Codex app-server/wake bridge, then
-   bind and exercise real npm and standalone threads;
-4. wire and test Claude's stop gate, skill discovery, and tracked inbox
-   tripwire;
-5. wire and test the equivalent Hermes lifecycle;
-6. run the same send-to-wake-to-ack acceptance in Terminal.app, iTerm2,
-   Ghostty, and cmux;
-7. test cmux topology, navigation, and notifications separately as optional
+The remaining P0 promotion work is:
+
+1. load a clean npm Codex `0.144.6` daemon safely, then pass the real
+   send-to-wake-to-drain/ack acceptance;
+2. install an official standalone Codex and pass the same protocol and
+   end-to-end gates before claiming support;
+3. pass real clean-account Claude and Hermes skill discovery, lifecycle, and
+   wake acceptance;
+4. repeat the same harness acceptance in Terminal.app, iTerm2, Ghostty, and
+   cmux;
+5. test cmux topology, navigation, and notifications separately as optional
    adapter behavior.
 
-Until steps 1–6 pass, the core is portable but the mainstream-terminal
-experience is not yet claimed as complete.
+Until the real gates pass, the core and onboarding mechanics are distributable
+as a release candidate, but mainstream-terminal support is not yet promoted as
+complete.

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from _rtlib import (
     emit_registry_warnings,
+    load_agents_doc,
     load_project_registry,
     projects_registry_path,
 )
@@ -582,38 +583,21 @@ def canonical_project(path: Path) -> Path:
 
 def project_config_has_codex(project: Path) -> bool:
     """Strictly recognize a top-level agents.codex.harness=codex block."""
-    text = (project / ".roundtable" / "agents.yaml").read_text()
-    lines = text.splitlines()
-    in_agents = False
-    in_codex = False
-    saw_harness = False
-    configured_project = None
-    for raw in lines:
-        line = raw.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        stripped = line.strip()
-        if indent == 0:
-            if stripped.startswith("project:"):
-                configured_project = stripped.split(":", 1)[1].strip().strip("'\"")
-            in_agents = stripped == "agents:"
-            in_codex = False
-            continue
-        if not in_agents:
-            continue
-        if indent == 2 and stripped.endswith(":"):
-            in_codex = stripped[:-1].strip().lower() == "codex"
-            continue
-        if in_codex and indent == 4 and stripped.startswith("harness:"):
-            saw_harness = stripped.split(":", 1)[1].strip().strip("'\"").lower() == "codex"
-    if not configured_project:
+    document = load_agents_doc(project, "rt-codex-wake")
+    if not isinstance(document, dict):
+        return False
+    configured_project = document.get("project")
+    agents = document.get("agents")
+    if not isinstance(configured_project, str) or not isinstance(agents, dict):
+        return False
+    codex = agents.get("codex")
+    if not isinstance(codex, dict) or codex.get("harness") != "codex":
         return False
     try:
         project_matches = Path(configured_project).expanduser().resolve() == project
-    except OSError:
+    except (OSError, RuntimeError):
         project_matches = False
-    return saw_harness and project_matches
+    return project_matches
 
 
 def validate_thread(project: Path, thread: dict, expected_id: str | None = None) -> dict:
@@ -1974,6 +1958,7 @@ def main() -> int:
             return unbind_command(args)
         if args.command == "install":
             require_default_socket(args.socket)
+            require_validated_version()
             path = install_launch_agent(
                 WAKE_LABEL,
                 wake_plist(

@@ -49,7 +49,7 @@ jobs:
       - name: Verify source and tests
         run: |
           python scripts/check_public_safety.py
-          python -m compileall -q bin roundtable_packaging scripts tests
+          python -m compileall -q bin roundtable_packaging scripts tests integrations
           python -m pytest -p no:cacheprovider -p no:rerunfailures -q tests
 
       - name: Build locked offline artifact
@@ -65,7 +65,33 @@ jobs:
           extract_root="$RUNNER_TEMP/roundtable-release-extract"
           prefix="$RUNNER_TEMP/roundtable-release-prefix"
           link_dir="$RUNNER_TEMP/roundtable-release-bin"
-          mkdir -p "$extract_root"
+          setup_home="$RUNNER_TEMP/roundtable-release-home"
+          fake_launchctl="$RUNNER_TEMP/roundtable-fake-launchctl"
+          launchctl_sentinel="$RUNNER_TEMP/roundtable-launchctl-invoked"
+          mkdir -p \
+            "$extract_root" \
+            "$setup_home/.local/bin" \
+            "$setup_home/.npm-global/bin"
+          for harness in claude hermes; do
+            printf '%s\n' '#!/bin/sh' 'exit 0' \
+              > "$setup_home/.local/bin/$harness"
+            chmod +x "$setup_home/.local/bin/$harness"
+          done
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'if [ "${1:-}" = "--version" ]; then' \
+            '  echo "codex-cli 0.144.6"' \
+            'fi' \
+            'exit 0' \
+            > "$setup_home/.npm-global/bin/codex"
+          chmod +x "$setup_home/.npm-global/bin/codex"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'if [ "${1:-}" = print ]; then exit 113; fi' \
+            'touch "$RT_LAUNCHCTL_SENTINEL"' \
+            'exit 99' \
+            > "$fake_launchctl"
+          chmod +x "$fake_launchctl"
           shopt -s nullglob
           artifacts=(artifacts/*.tar.gz)
           test "${#artifacts[@]}" -eq 1
@@ -78,10 +104,65 @@ jobs:
           (
             cd "$payload"
             shasum -a 256 --check SHA256SUMS
-            ROUNDTABLE_BOOTSTRAP_PYTHON="$(command -v python)" \
+            HOME="$setup_home" \
+              ROUNDTABLE_BOOTSTRAP_PYTHON="$(command -v python)" \
               ./install --prefix "$prefix" --link-dir "$link_dir"
-            "$link_dir/roundtable-smoke"
-            ./uninstall --prefix "$prefix"
+            HOME="$setup_home" "$link_dir/roundtable" --help
+            setup=(
+              "$link_dir/roundtable-setup"
+              --home "$setup_home"
+              --prefix "$prefix"
+              --harness claude
+              --harness hermes
+              --harness codex
+            )
+            HOME="$setup_home" \
+              RT_LAUNCHCTL="$fake_launchctl" \
+              RT_LAUNCHCTL_SENTINEL="$launchctl_sentinel" \
+              "${setup[@]}"
+            test ! -e "$prefix/harness-setup.json"
+            test ! -e "$prefix/.runtime"
+            test ! -e "$setup_home/.claude/settings.json"
+            test ! -e "$setup_home/.hermes/config.yaml"
+            test ! -e "$setup_home/Library/LaunchAgents/com.roundtable.codex-app-server.plist"
+            test ! -e "$setup_home/Library/LaunchAgents/com.roundtable.codex-wake.plist"
+            test ! -e "$launchctl_sentinel"
+            HOME="$setup_home" \
+              RT_LAUNCHCTL="$fake_launchctl" \
+              RT_LAUNCHCTL_SENTINEL="$launchctl_sentinel" \
+              "${setup[@]}" apply
+            test -f "$prefix/harness-setup.json"
+            test -d "$prefix/.runtime"
+            test -f "$setup_home/.claude/settings.json"
+            test -f "$setup_home/.hermes/config.yaml"
+            test -L "$setup_home/.claude/skills/roundtable"
+            test -L "$setup_home/.hermes/plugins/roundtable"
+            test -L "$setup_home/.hermes/skills/roundtable"
+            test -L "$setup_home/.codex/skills/roundtable"
+            test -f "$setup_home/Library/LaunchAgents/com.roundtable.codex-app-server.plist"
+            test -f "$setup_home/Library/LaunchAgents/com.roundtable.codex-wake.plist"
+            test ! -e "$launchctl_sentinel"
+            HOME="$setup_home" \
+              RT_LAUNCHCTL="$fake_launchctl" \
+              RT_LAUNCHCTL_SENTINEL="$launchctl_sentinel" \
+              "${setup[@]}" status
+            HOME="$setup_home" \
+              CODEX_THREAD_ID= \
+              RT_LAUNCHCTL="$fake_launchctl" \
+              RT_LAUNCHCTL_SENTINEL="$launchctl_sentinel" \
+              "${setup[@]}" remove --unload-codex
+            test ! -e "$prefix/harness-setup.json"
+            test ! -e "$setup_home/.claude/settings.json"
+            test ! -e "$setup_home/.hermes/config.yaml"
+            test ! -L "$setup_home/.claude/skills/roundtable"
+            test ! -L "$setup_home/.hermes/plugins/roundtable"
+            test ! -L "$setup_home/.hermes/skills/roundtable"
+            test ! -L "$setup_home/.codex/skills/roundtable"
+            test ! -e "$setup_home/Library/LaunchAgents/com.roundtable.codex-app-server.plist"
+            test ! -e "$setup_home/Library/LaunchAgents/com.roundtable.codex-wake.plist"
+            test ! -e "$launchctl_sentinel"
+            HOME="$setup_home" "$link_dir/roundtable-smoke"
+            HOME="$setup_home" ./uninstall --prefix "$prefix"
           )
           test ! -e "$prefix/install-manifest.json"
           test ! -e "$link_dir/rt-say"

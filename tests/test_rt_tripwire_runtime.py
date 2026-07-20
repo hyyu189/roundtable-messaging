@@ -20,7 +20,7 @@ def write_project(path: Path, agent: str = "claude") -> Path:
     project = path.resolve()
     state = project / ".roundtable"
     state.mkdir(parents=True)
-    harness = "claude-code" if agent == "claude" else "hermes-agent"
+    harness = "claude-code" if agent.startswith("claude") else "hermes-agent"
     (state / "agents.yaml").write_text(
         "schema: roundtable.agents.v1\n"
         f"project: {project}\n"
@@ -43,7 +43,7 @@ def claim_environment(
 ) -> dict[str, str]:
     monkeypatch.setenv("RT_RUNTIME_DIR", str(runtime))
     monkeypatch.setenv("RT_CODEX_RUNTIME_DIR", str(runtime))
-    harness = "claude" if agent == "claude" else "hermes"
+    harness = "claude" if agent.startswith("claude") else "hermes"
     token = _rtruntime.claim(
         project,
         agent,
@@ -123,6 +123,57 @@ def test_wait_requires_fenced_session_and_never_creates_project_markers(tmp_path
     assert not runtime.exists()
 
 
+def test_global_claude_hook_is_noop_outside_managed_sessions(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    environment = os.environ.copy()
+    for name in (
+        "RT_PROJECT_ROOT",
+        "RT_FROM",
+        "RT_SESSION_ID",
+        "RT_LEASE_REVISION",
+    ):
+        environment.pop(name, None)
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "0",
+        cwd=outside,
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_claude_hook_fails_closed_on_partial_managed_context(tmp_path):
+    project = write_project(tmp_path / "project")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "RT_PROJECT_ROOT": str(project),
+            "RT_FROM": "claude",
+        }
+    )
+    environment.pop("RT_SESSION_ID", None)
+    environment.pop("RT_LEASE_REVISION", None)
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode == 2
+    assert "missing claimed-seat environment" in result.stderr
+
+
 @pytest.mark.parametrize("agent", ["claude", "hermes"])
 def test_wait_keeps_maildir_project_local_and_wake_state_host_local(
     tmp_path, monkeypatch, agent
@@ -147,6 +198,110 @@ def test_wait_keeps_maildir_project_local_and_wake_state_host_local(
     assert (new_dir.parent / "tmp").is_dir()
     assert_no_project_liveness(project, agent)
     assert any(path.is_file() for path in runtime.rglob("*"))
+
+
+def test_claude_hook_uses_async_rewake_exit_for_mail(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    new_dir = project / ".roundtable" / "inbox" / "claude" / "new"
+    new_dir.mkdir(parents=True)
+    (new_dir / "message-claude.md").write_text(
+        "[CODEX→CLAUDE question id=message-claude] test\n"
+    )
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "1",
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode == 2
+    assert "message-claude.md" in result.stdout
+    assert "Roundtable mail arrived" in result.stderr
+
+
+def test_global_claude_hooks_use_the_claimed_instance_identity(
+    tmp_path, monkeypatch
+):
+    agent = "claude-research"
+    project = write_project(tmp_path / "project", agent)
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project, agent)
+    new_dir = project / ".roundtable" / "inbox" / agent / "new"
+    new_dir.mkdir(parents=True)
+    (new_dir / "message-custom.md").write_text(
+        "[CODEX→CLAUDE question id=message-custom] test\n"
+    )
+
+    rewake = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        cwd=project,
+        env=environment,
+    )
+
+    assert rewake.returncode == 2
+    assert "message-custom.md" in rewake.stdout
+
+    stop = run_tool(
+        "rt-stop-gate",
+        cwd=project,
+        env=environment,
+        input_text="{}",
+    )
+    assert stop.returncode == 2
+    assert agent in stop.stderr
+
+
+def test_duplicate_claude_session_start_hook_quietly_uses_live_watcher(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    _rtruntime.update_wake(
+        project,
+        "claude",
+        environment["RT_SESSION_ID"],
+        environment["RT_LEASE_REVISION"],
+        watcher_pid=os.getpid(),
+    )
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_claude_hook_uses_async_rewake_exit_for_heartbeat(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode == 2
+    assert "heartbeat timeout after 0m" in result.stdout
+    assert "heartbeat completed" in result.stderr
 
 
 def test_quiet_ack_does_not_wake_and_empty_heartbeat_backoff_persists(
@@ -177,7 +332,7 @@ def test_quiet_ack_does_not_wake_and_empty_heartbeat_backoff_persists(
     assert_no_project_liveness(project)
 
 
-def test_stop_gate_is_noop_outside_projects_but_fails_closed_without_lease(
+def test_global_stop_gate_is_noop_for_direct_launch_but_partial_lease_fails(
     tmp_path,
 ):
     outside = tmp_path / "outside"
@@ -201,15 +356,29 @@ def test_stop_gate_is_noop_outside_projects_but_fails_closed_without_lease(
     assert noop.returncode == 0
 
     project = write_project(tmp_path / "project")
-    missing = run_tool(
+    direct = run_tool(
         "rt-stop-gate",
         "claude",
         cwd=project,
         env=environment,
         input_text="{}",
     )
-    assert missing.returncode == 2
-    assert "missing claimed-seat environment" in missing.stderr
+    assert direct.returncode == 0
+
+    partial_environment = {
+        **environment,
+        "RT_PROJECT_ROOT": str(project),
+        "RT_FROM": "claude",
+    }
+    partial = run_tool(
+        "rt-stop-gate",
+        "claude",
+        cwd=project,
+        env=partial_environment,
+        input_text="{}",
+    )
+    assert partial.returncode == 2
+    assert "missing claimed-seat environment" in partial.stderr
     assert_no_project_liveness(project)
 
 

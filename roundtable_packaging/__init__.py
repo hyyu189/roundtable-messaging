@@ -14,8 +14,16 @@ MANAGED_HELPERS = (
     "_rtruntime.py",
 )
 
+MANAGED_ASSETS = (
+    "share/roundtable/integrations/hermes/roundtable/__init__.py",
+    "share/roundtable/integrations/hermes/roundtable/plugin.yaml",
+    "share/roundtable/skills/shared/roundtable/SKILL.md",
+)
+
 TOOLS = (
+    "roundtable",
     "roundtable-init",
+    "roundtable-setup",
     "roundtable-smoke",
     "roundtable-uninstall",
     "rt-ack",

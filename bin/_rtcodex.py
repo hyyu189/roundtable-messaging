@@ -148,8 +148,23 @@ def launch_agent_path(label: str) -> Path:
     return root.expanduser() / f"{label}.plist"
 
 
-def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
-    runtime_dir = ensure_private_runtime_dir()
+def _plist_runtime_dir(*, ensure_runtime: bool) -> Path:
+    if ensure_runtime:
+        return ensure_private_runtime_dir()
+    runtime_dir = Path(RUNTIME_DIR).expanduser()
+    if not runtime_dir.is_absolute():
+        raise CodexRuntimeError(
+            f"runtime directory must be absolute: {runtime_dir}"
+        )
+    return runtime_dir
+
+
+def app_server_plist(
+    socket_path: Path = DEFAULT_SOCKET,
+    *,
+    ensure_runtime: bool = True,
+) -> dict:
+    runtime_dir = _plist_runtime_dir(ensure_runtime=ensure_runtime)
     selected_codex = codex_bin()
     environment = {
         "HOME": str(Path.home()),
@@ -186,8 +201,9 @@ def wake_plist(
     socket_path: Path = DEFAULT_SOCKET,
     *,
     auto_discover: bool = False,
+    ensure_runtime: bool = True,
 ) -> dict:
-    runtime_dir = ensure_private_runtime_dir()
+    runtime_dir = _plist_runtime_dir(ensure_runtime=ensure_runtime)
     selected_codex = codex_bin()
     arguments = [
         str(ROUND_ROOT / "bin" / "rt-codex-wake"),

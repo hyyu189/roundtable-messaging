@@ -286,12 +286,13 @@ def test_launcher_menu_creates_then_selects_project(tmp_path, monkeypatch):
     selected = _rtlauncher.choose_launch_cwd(
         "claude",
         cwd=tmp_path,
-        stdin=TTYInput("1\nnew-project\n"),
-        stderr=io.StringIO(),
+        stdin=TTYInput("2\nnew-project\n\n"),
+        stderr=(stderr := io.StringIO()),
         init_runner=fake_init,
     )
 
     assert selected == (tmp_path / "new-project").resolve()
+    assert "Initialize Git too? [y/N]" in stderr.getvalue()
     assert calls == [
         (
             [
@@ -305,17 +306,78 @@ def test_launcher_menu_creates_then_selects_project(tmp_path, monkeypatch):
     ]
 
 
+def test_launcher_menu_only_opts_into_git_after_yes(tmp_path, monkeypatch):
+    registry = write_registry(tmp_path / "projects.yaml", [])
+    monkeypatch.setenv("RT_PROJECTS_FILE", str(registry))
+    calls = []
+
+    def fake_init(command, check):
+        calls.append((command, check))
+        write_project(tmp_path / "new-project")
+        return SimpleNamespace(returncode=0)
+
+    selected = _rtlauncher.choose_launch_cwd(
+        "hermes",
+        cwd=tmp_path,
+        stdin=TTYInput("2\nnew-project\nyes\n"),
+        stderr=io.StringIO(),
+        init_runner=fake_init,
+    )
+
+    assert selected == (tmp_path / "new-project").resolve()
+    assert calls[0][0][-1] == "--git"
+
+
 def test_launcher_menu_allows_explicit_unanchored_start(tmp_path, monkeypatch):
     registry = write_registry(tmp_path / "projects.yaml", [])
     monkeypatch.setenv("RT_PROJECTS_FILE", str(registry))
     stderr = io.StringIO()
 
     selected = _rtlauncher.choose_launch_cwd(
-        "codex", cwd=tmp_path, stdin=TTYInput("2\n"), stderr=stderr
+        "codex", cwd=tmp_path, stdin=TTYInput("3\n"), stderr=stderr
     )
 
     assert selected is None
     assert "advisory: starting without a Roundtable project anchor" in stderr.getvalue()
+
+
+def test_launcher_menu_can_safely_set_up_the_current_folder(
+    tmp_path, monkeypatch
+):
+    registry = write_registry(tmp_path / "projects.yaml", [])
+    monkeypatch.setenv("RT_PROJECTS_FILE", str(registry))
+    calls = []
+
+    def fake_init(command, cwd, check):
+        calls.append((command, cwd, check))
+        write_project(cwd)
+        return SimpleNamespace(returncode=0)
+
+    selected = _rtlauncher.choose_launch_cwd(
+        "claude",
+        cwd=tmp_path,
+        stdin=TTYInput("1\n\n"),
+        stderr=io.StringIO(),
+        init_runner=fake_init,
+    )
+
+    assert selected == tmp_path.resolve()
+    assert calls == [
+        (
+            [str(BIN / "roundtable-init"), "--here"],
+            tmp_path.resolve(),
+            False,
+        )
+    ]
+
+
+def test_home_is_never_discovered_as_a_project_root(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    write_project(home)
+    monkeypatch.setenv("HOME", str(home))
+
+    assert _rtlib.is_project_root(home) is False
+    assert _rtlauncher.project_at_or_above(home) is None
 
 
 @pytest.mark.parametrize(

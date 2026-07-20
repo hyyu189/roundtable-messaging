@@ -153,7 +153,16 @@ def test_locked_matrix_and_hash_fail_closed(tmp_path):
     "missing",
     [
         "_rtruntime.py",
+        "roundtable_messaging-0.1.0.data/scripts/roundtable",
         "roundtable_messaging-0.1.0.data/scripts/_rtruntime.py",
+        (
+            "roundtable_messaging-0.1.0.data/data/share/roundtable/"
+            "integrations/hermes/roundtable/plugin.yaml"
+        ),
+        (
+            "roundtable_messaging-0.1.0.data/data/share/roundtable/"
+            "skills/shared/roundtable/SKILL.md"
+        ),
     ],
 )
 def test_project_wheel_validator_requires_runtime_helper_copies(tmp_path, missing):
@@ -162,6 +171,10 @@ def test_project_wheel_validator_requires_runtime_helper_copies(tmp_path, missin
     required = {
         *build_release.REQUIRED_PROJECT_ROOT_FILES,
         *build_release.REQUIRED_PROJECT_PACKAGE_FILES,
+        *(
+            f"{data_prefix}data/{path}"
+            for path in build_release.REQUIRED_PROJECT_DATA_FILES
+        ),
         *(
             f"{data_prefix}scripts/{script}"
             for script in build_release.REQUIRED_PROJECT_SCRIPTS
@@ -244,6 +257,7 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
         "install",
         "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py",
+        "roundtable_packaging/setup.py",
         "scripts/install.sh",
         "scripts/uninstall.sh",
         "uninstall",

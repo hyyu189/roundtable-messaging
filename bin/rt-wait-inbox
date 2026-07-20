@@ -22,6 +22,7 @@ from _rtruntime import (
     clear_wake,
     load_validated_lease,
     update_wake,
+    watcher_is_live,
 )
 
 
@@ -159,11 +160,21 @@ def _pick_max(explicit: int | None, empty_beats: int) -> int:
     return FLOOR_MINUTES if empty_beats >= BACKOFF_AFTER else DEFAULT_MINUTES
 
 
-def run(agent: str, explicit_minutes: int | None) -> int:
+def run(
+    agent: str,
+    explicit_minutes: int | None,
+    *,
+    claude_hook: bool = False,
+) -> int:
     project = _project_root()
     session_id, revision = _lease_environment(agent)
     # Validate before touching either the durable inbox or host-local runtime.
-    load_validated_lease(project, agent, session_id, revision)
+    lease = load_validated_lease(project, agent, session_id, revision)
+    # SessionStart also fires after compaction. If the original async Claude
+    # hook is still healthy, the duplicate hook must quietly stand down rather
+    # than replacing it or spuriously waking Claude with a fence error.
+    if claude_hook and watcher_is_live(lease):
+        return 0
 
     inbox = project / ".roundtable" / "inbox" / agent
     new_dir = inbox / "new"
@@ -172,13 +183,20 @@ def run(agent: str, explicit_minutes: int | None) -> int:
 
     watcher_pid = os.getpid()
     try:
-        token = update_wake(
-            project,
-            agent,
-            session_id,
-            revision,
-            watcher_pid=watcher_pid,
-        )
+        try:
+            token = update_wake(
+                project,
+                agent,
+                session_id,
+                revision,
+                watcher_pid=watcher_pid,
+            )
+        except FenceRejected:
+            if claude_hook and watcher_is_live(
+                load_validated_lease(project, agent, session_id, revision)
+            ):
+                return 0
+            raise
         empty_beats = _integer_field(token, "empty_beats")
         activity = _activity_stamp(token)
         max_minutes = _pick_max(explicit_minutes, empty_beats)
@@ -231,6 +249,13 @@ def run(agent: str, explicit_minutes: int | None) -> int:
             )
             print(f"rt-wait-inbox: mail after {ticks * POLL_SECONDS}s:")
             print("\n".join(mail))
+            if claude_hook:
+                print(
+                    "Roundtable mail arrived. Read and act on every pending "
+                    f"message for {agent!r}, acknowledge and drain it, then "
+                    "re-arm the inbox tripwire before stopping.",
+                    file=sys.stderr,
+                )
         else:
             empty_beats += 1
             update_wake(
@@ -246,13 +271,23 @@ def run(agent: str, explicit_minutes: int | None) -> int:
                 f"{max_minutes}m (inbox empty; consecutive empty beats: "
                 f"{empty_beats})"
             )
+            if claude_hook:
+                print(
+                    "Roundtable inbox heartbeat completed. Re-arm the inbox "
+                    "tripwire before stopping so this session remains reachable.",
+                    file=sys.stderr,
+                )
         acks = _ack_count(new_dir)
         if acks:
             print(
                 f"rt-wait-inbox: {acks} quiet ack file(s) pending in new/ "
                 "— drain to cur/ while you're awake"
             )
-        return 0
+        # Claude Code's asyncRewake contract wakes an idle session only when
+        # the background hook exits 2. Ordinary terminal/Hermes watchers keep
+        # their historical success exit so their native background-process
+        # notification path remains unchanged.
+        return 2 if claude_hook else 0
     except StopRequested:
         return 0
     finally:
@@ -269,17 +304,46 @@ def run(agent: str, explicit_minutes: int | None) -> int:
             pass
 
 
+def _claude_hook_is_managed() -> bool:
+    """Return whether a global Claude hook belongs to a claimed RT session.
+
+    The hook is installed in user-level settings and therefore fires for every
+    Claude project. A normal direct Claude launch must remain a silent no-op.
+    Partial lease context is deliberately treated as managed so ``run`` can
+    fail closed and surface the broken launch environment.
+    """
+
+    return any(
+        os.environ.get(name)
+        for name in (
+            "RT_PROJECT_ROOT",
+            "RT_FROM",
+            "RT_SESSION_ID",
+            "RT_LEASE_REVISION",
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    claude_hook = bool(argv and argv[0] == "--claude-hook")
+    if claude_hook:
+        argv.pop(0)
+        if not _claude_hook_is_managed():
+            return 0
+        if not argv:
+            launched_as = os.environ.get("RT_FROM", "").strip()
+            if launched_as:
+                argv.append(launched_as)
     if not 1 <= len(argv) <= 2:
         print(
-            "usage: rt-wait-inbox <agent> [max-minutes]",
+            "usage: rt-wait-inbox [--claude-hook] <agent> [max-minutes]",
             file=sys.stderr,
         )
         return 2
     try:
         explicit = _parse_minutes(argv[1] if len(argv) == 2 else None)
-        return run(argv[0], explicit)
+        return run(argv[0], explicit, claude_hook=claude_hook)
     except (FenceRejected, RuntimeStateError, OSError) as error:
         print(f"rt-wait-inbox: {error}", file=sys.stderr)
         return 2

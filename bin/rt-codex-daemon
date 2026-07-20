@@ -16,6 +16,7 @@ from _rtcodex import (
     probe_handshake,
     require_default_socket,
     require_validated_daemon,
+    require_validated_version,
 )
 
 
@@ -28,6 +29,7 @@ def main() -> int:
     try:
         if args.command == "install":
             require_default_socket(args.socket)
+            require_validated_version()
             path = install_launch_agent(
                 APP_SERVER_LABEL, app_server_plist(args.socket), reload=args.reload
             )
@@ -36,6 +38,7 @@ def main() -> int:
             print(f"installed {path}")
             return 0
         if args.command == "ensure":
+            require_validated_version()
             ensure_daemon(args.socket)
             require_validated_daemon(args.socket)
             print(f"ready {args.socket}")

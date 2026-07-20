@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from roundtable_packaging import MANAGED_HELPERS
+from roundtable_packaging import MANAGED_ASSETS, MANAGED_HELPERS
 from roundtable_packaging import cli as packaging_cli
 
 
@@ -185,12 +185,28 @@ def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
         names = set(archive.namelist())
 
     assert "roundtable_packaging/cli.py" in names
+    assert "roundtable_packaging/setup.py" in names
     assert "_rtruntime.py" in names
+    assert any(name.endswith(".data/scripts/roundtable") for name in names)
     assert any(name.endswith(".data/scripts/rt-say") for name in names)
     assert any(name.endswith(".data/scripts/_rtlib.py") for name in names)
     assert any(name.endswith(".data/scripts/_rtruntime.py") for name in names)
     assert any(
         name.endswith(".data/data/share/roundtable/templates/agents.yaml.tmpl")
+        for name in names
+    )
+    assert any(
+        name.endswith(
+            ".data/data/share/roundtable/integrations/hermes/"
+            "roundtable/plugin.yaml"
+        )
+        for name in names
+    )
+    assert any(
+        name.endswith(
+            ".data/data/share/roundtable/integrations/hermes/"
+            "roundtable/__init__.py"
+        )
         for name in names
     )
     assert any(
@@ -223,6 +239,7 @@ def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path
         (prefix / "current" / ".roundtable-managed.json").read_text()
     )
     assert set(marker["helpers"]) == set(MANAGED_HELPERS)
+    assert set(marker["assets"]) == set(MANAGED_ASSETS)
     assert (link_dir / "rt-say").is_symlink()
     assert (prefix / "bin" / "rt-say").stat().st_mode & stat.S_IXUSR
     wrapper = (prefix / "bin" / "rt-say").read_text()
@@ -389,11 +406,61 @@ def test_modified_wrapper_makes_uninstall_fail_closed(tmp_path):
     assert (prefix / "install-manifest.json").exists()
 
 
+@pytest.mark.parametrize("setup_marker", ["file", "dangling-symlink"])
+def test_uninstall_refuses_to_leave_managed_harness_config_broken(
+    tmp_path,
+    setup_marker,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    prefix = home / ".roundtable"
+    link_dir = home / ".local" / "bin"
+    installed = run_script(
+        INSTALL,
+        "--prefix",
+        str(prefix),
+        "--link-dir",
+        str(link_dir),
+        home=home,
+    )
+    assert installed.returncode == 0, installed.stderr
+    setup_manifest = prefix / "harness-setup.json"
+    if setup_marker == "file":
+        setup_manifest.write_text("{}\n")
+    else:
+        setup_manifest.symlink_to(prefix / "missing-setup-manifest.json")
+
+    refused = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+
+    assert refused.returncode == 1
+    assert "roundtable-setup remove" in refused.stderr
+    assert (prefix / "install-manifest.json").is_file()
+    assert (link_dir / "rt-say").is_symlink()
+
+    setup_manifest.unlink()
+    removed = run_script(
+        UNINSTALL,
+        "--prefix",
+        str(prefix),
+        home=home,
+    )
+    assert removed.returncode == 0, removed.stderr
+
+
 @pytest.mark.parametrize(
     ("relative", "expected"),
     [
         ("rt-say", "managed tool is missing or modified: rt-say"),
         ("_rtruntime.py", "managed helper is missing or modified: _rtruntime.py"),
+        (
+            "../share/roundtable/integrations/hermes/roundtable/plugin.yaml",
+            "managed onboarding asset is missing or modified",
+        ),
     ],
 )
 def test_same_version_reinstall_rejects_modified_installed_runtime(

@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import (
     LAUNCH_AGENT_LABELS,
+    MANAGED_ASSETS,
     MANAGED_HELPERS,
     MANAGED_MARKER,
     MANIFEST_SCHEMA,
@@ -55,6 +56,10 @@ def _link_dir_default() -> Path:
 
 def _manifest_path(prefix: Path) -> Path:
     return prefix / "install-manifest.json"
+
+
+def _harness_setup_manifest_path(prefix: Path) -> Path:
+    return prefix / "harness-setup.json"
 
 
 def _lexists(path: Path) -> bool:
@@ -542,6 +547,16 @@ def _create_version(
         templates = destination / "share" / "roundtable" / "templates"
         if not templates.is_dir():
             raise InstallError(f"installed wheel is missing templates: {templates}")
+        missing_assets = [
+            str(destination / relative)
+            for relative in MANAGED_ASSETS
+            if not (destination / relative).is_file()
+        ]
+        if missing_assets:
+            raise InstallError(
+                "installed wheel is missing managed onboarding assets:\n"
+                + "\n".join(f"  - {path}" for path in missing_assets)
+            )
         (destination / "templates").symlink_to(templates)
 
         marker = {
@@ -555,6 +570,10 @@ def _create_version(
             "helpers": {
                 helper: _sha256_path(destination / "bin" / helper)
                 for helper in MANAGED_HELPERS
+            },
+            "assets": {
+                relative: _sha256_path(destination / relative)
+                for relative in MANAGED_ASSETS
             },
         }
         _atomic_write(
@@ -627,6 +646,24 @@ def _validate_version_dir(
         ):
             raise InstallError(
                 f"{destination}: managed helper is missing or modified: {helper}"
+            )
+    asset_digests = marker.get("assets")
+    if (
+        not isinstance(asset_digests, dict)
+        or set(asset_digests) != set(MANAGED_ASSETS)
+    ):
+        raise InstallError(f"{destination}: invalid managed asset digest set")
+    for relative, expected in asset_digests.items():
+        path = destination / relative
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or not path.is_file()
+            or _sha256_path(path) != expected
+        ):
+            raise InstallError(
+                f"{destination}: managed onboarding asset is missing or "
+                f"modified: {relative}"
             )
     templates = destination / "templates"
     expected_templates = destination / "share" / "roundtable" / "templates"
@@ -871,6 +908,13 @@ def uninstall_main(argv: list[str] | None = None) -> int:
         if manifest is None:
             print(f"Roundtable is already uninstalled from {prefix}")
             return 0
+        setup_manifest = _harness_setup_manifest_path(prefix)
+        if _lexists(setup_manifest):
+            raise InstallError(
+                "harness onboarding is still installed; run "
+                "`roundtable-setup remove` before removing the commands "
+                f"({setup_manifest})"
+            )
 
         conflicts = _uninstall_preflight(prefix, manifest)
         if conflicts:
