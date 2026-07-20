@@ -44,6 +44,17 @@ from _rtcodex import (
     require_validated_version,
     wake_plist,
 )
+from _rtruntime import (
+    FenceRejected,
+    LeaseToken,
+    RuntimeStateError,
+    harness_lease_records,
+    inspect_seat,
+    legacy_harness_guard,
+    load_validated_lease,
+    seat_shared_guard,
+    update_wake,
+)
 
 
 MAIL_RE = re.compile(
@@ -177,7 +188,12 @@ class StateStore:
         """Persist while transaction() owns the exclusive state lock."""
         atomic_json(self.path, self.data)
 
-    def bind(self, project: Path, thread: dict) -> None:
+    def bind(
+        self,
+        project: Path,
+        thread: dict,
+        lease: LeaseToken | None = None,
+    ) -> None:
         thread_id = thread["id"]
         with self._lock(True):
             loaded = self._read()
@@ -188,21 +204,34 @@ class StateStore:
                     raise IdentityError(
                         f"thread {thread_id} is already bound to {other_project}"
                     )
-            self.bindings[str(project)] = {
-                "agent": "codex",
+            binding = {
+                "agent": lease.agent_id if lease is not None else "codex",
                 "project": str(project),
                 "threadId": thread_id,
                 "sessionId": thread.get("sessionId"),
                 "bindingRevision": uuid.uuid4().hex,
                 "boundAt": utc_now(),
             }
+            if lease is not None:
+                binding.update(
+                    {
+                        "roundtableSessionId": lease.session_id,
+                        "leaseRevision": lease.revision,
+                    }
+                )
+            self.bindings[str(project)] = binding
             self.data.setdefault("projects", {})[str(project)] = {
                 "phase": "EMPTY",
                 "reboundAt": utc_now(),
             }
             atomic_json(self.path, self.data)
 
-    def bind_if_absent(self, project: Path, thread: dict) -> dict:
+    def bind_if_absent(
+        self,
+        project: Path,
+        thread: dict,
+        lease: LeaseToken | None = None,
+    ) -> dict:
         """Auto-bind with CAS semantics; never replace an explicit binding."""
         key = str(project)
         thread_id = thread["id"]
@@ -213,7 +242,8 @@ class StateStore:
             existing = self.bindings.get(key)
             if existing is not None:
                 if (
-                    existing.get("agent") != "codex"
+                    not isinstance(existing.get("agent"), str)
+                    or not existing.get("agent")
                     or existing.get("project") != key
                     or not existing.get("threadId")
                 ):
@@ -226,13 +256,20 @@ class StateStore:
                     )
             now = utc_now()
             binding = {
-                "agent": "codex",
+                "agent": lease.agent_id if lease is not None else "codex",
                 "project": key,
                 "threadId": thread_id,
                 "sessionId": thread.get("sessionId"),
                 "bindingRevision": uuid.uuid4().hex,
                 "boundAt": now,
             }
+            if lease is not None:
+                binding.update(
+                    {
+                        "roundtableSessionId": lease.session_id,
+                        "leaseRevision": lease.revision,
+                    }
+                )
             self.bindings[key] = binding
             self.data.setdefault("projects", {})[key] = {
                 "phase": "EMPTY",
@@ -252,6 +289,186 @@ class StateStore:
             if removed_binding or removed_state:
                 atomic_json(self.path, self.data)
             return removed_binding or removed_state
+
+
+def _lease_environment(project: Path) -> LeaseToken | None:
+    """Resolve and fence the lease carried by a Codex tool subprocess.
+
+    Legacy direct binds remain accepted only before a project has any seat
+    record. Once a unified launcher creates a lease, an old or unlaunched
+    thread cannot replace its binding.
+    """
+    session_id = os.environ.get("RT_SESSION_ID")
+    revision = os.environ.get("RT_LEASE_REVISION")
+    configured_root = os.environ.get("RT_PROJECT_ROOT")
+    configured_agent = os.environ.get("RT_FROM")
+    inspection = inspect_seat(project, configured_agent or "codex")
+
+    if inspection.status == "vacant":
+        if session_id or revision or configured_root:
+            raise IdentityError(
+                f"claimed-seat environment exists but no current Codex lease "
+                f"exists for {project}"
+            )
+        try:
+            records = harness_lease_records(project, "codex")
+        except RuntimeStateError as error:
+            raise IdentityError(
+                f"Codex seat state is ambiguous for {project}: {error}"
+            ) from error
+        if records:
+            agents = ", ".join(
+                sorted({str(record.get("agentId")) for record in records})
+            )
+            raise IdentityError(
+                f"legacy bind is superseded by host-local Codex seat state "
+                f"for {project} (agents: {agents})"
+            )
+        return None
+    if inspection.status == "stale":
+        raise IdentityError(
+            f"Codex seat is inactive for {project}; launch a fresh session with rt-codex"
+        )
+    if inspection.status == "ambiguous":
+        raise IdentityError(
+            f"Codex seat state is ambiguous for {project}: {inspection.detail}"
+        )
+    token = inspection.token
+    if token is None:
+        raise IdentityError(f"Codex seat has no validated lease for {project}")
+    if not session_id or revision is None:
+        raise IdentityError(
+            "RT_SESSION_ID and RT_LEASE_REVISION are required; "
+            "launch this thread with rt-codex"
+        )
+    if configured_root:
+        try:
+            environment_root = Path(configured_root).expanduser().resolve()
+        except OSError as error:
+            raise IdentityError(f"invalid RT_PROJECT_ROOT: {error}") from error
+        if environment_root != project:
+            raise IdentityError(
+                f"RT_PROJECT_ROOT {environment_root} does not match {project}"
+            )
+    if configured_agent and configured_agent != token.agent_id:
+        raise IdentityError(
+            f"RT_FROM={configured_agent!r} does not match current seat "
+            f"{token.agent_id!r}"
+        )
+    try:
+        return load_validated_lease(
+            project,
+            token.agent_id,
+            session_id,
+            revision,
+        )
+    except (FenceRejected, RuntimeStateError) as error:
+        raise IdentityError(f"Codex seat lease validation failed: {error}") from error
+
+
+def _binding_lease(project: Path, binding: dict) -> LeaseToken | None:
+    """Return the active lease for a binding, or validate legacy compatibility."""
+    agent_id = binding.get("agent")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise IdentityError(f"stored binding lacks agent identity for {project}")
+    session_id = binding.get("roundtableSessionId")
+    revision = binding.get("leaseRevision")
+    if bool(session_id) != (revision is not None):
+        raise IdentityError(f"stored binding has partial lease identity for {project}")
+    if not session_id:
+        inspection = inspect_seat(project, agent_id)
+        if inspection.status == "vacant":
+            if agent_id != "codex":
+                raise IdentityError(
+                    f"legacy binding has unsupported agent {agent_id!r} for {project}"
+                )
+            try:
+                records = harness_lease_records(project, "codex")
+            except RuntimeStateError as error:
+                raise IdentityError(
+                    f"Codex seat state is ambiguous for {project}: {error}"
+                ) from error
+            if records:
+                agents = ", ".join(
+                    sorted({str(record.get("agentId")) for record in records})
+                )
+                raise IdentityError(
+                    f"legacy binding is superseded by host-local seat state "
+                    f"for {project} (agents: {agents})"
+                )
+            return None
+        raise IdentityError(
+            f"legacy binding is superseded by host-local seat state "
+            f"({inspection.status}) for {project}; re-bind from rt-codex"
+        )
+    try:
+        return load_validated_lease(project, agent_id, session_id, revision)
+    except (FenceRejected, RuntimeStateError) as error:
+        raise IdentityError(
+            f"stored Codex binding does not match the active seat for {project}: {error}"
+        ) from error
+
+
+def _discover_binding_lease(project: Path) -> LeaseToken | None:
+    """Find the only active configured Codex seat for explicit auto-discovery."""
+    # P0's supported configuration names the Codex mailbox ``codex``.
+    inspection = inspect_seat(project, "codex")
+    if inspection.status == "vacant":
+        try:
+            records = harness_lease_records(project, "codex")
+        except RuntimeStateError as error:
+            raise IdentityError(
+                f"cannot inspect Codex seat records for {project}: {error}"
+            ) from error
+        if records:
+            agents = ", ".join(
+                sorted({str(record.get("agentId")) for record in records})
+            )
+            raise IdentityError(
+                f"cannot auto-bind while another Codex seat record exists "
+                f"for {project} (agents: {agents})"
+            )
+        return None
+    if inspection.status == "stale":
+        raise IdentityError(
+            f"cannot auto-bind an inactive Codex seat for {project}; relaunch rt-codex"
+        )
+    if inspection.status == "ambiguous" or inspection.token is None:
+        raise IdentityError(
+            f"cannot auto-bind ambiguous Codex seat for {project}: {inspection.detail}"
+        )
+    return inspection.token
+
+
+def heartbeat_bound_seats(
+    store: StateStore,
+    projects: list[Path],
+    results: list["ProjectResult"],
+) -> None:
+    """Refresh per-seat wake health after successful bridge iterations."""
+    for project, result in zip(projects, results):
+        if not result.ok:
+            continue
+        binding = store.bindings.get(str(project))
+        if not isinstance(binding, dict):
+            continue
+        try:
+            lease = _binding_lease(project, binding)
+            if lease is None:
+                continue
+            update_wake(
+                project,
+                lease.agent_id,
+                lease.session_id,
+                lease.revision,
+                native_session_id=binding.get("threadId"),
+            )
+        except (IdentityError, FenceRejected, RuntimeStateError) as error:
+            log_event(
+                "seat_heartbeat_rejected",
+                project=str(project),
+                error=str(error),
+            )
 
 
 def log_event(event: str, **fields) -> None:
@@ -507,8 +724,13 @@ def discover_thread(client: AppServerClient, project: Path) -> dict:
     return candidates[0]
 
 
-def pending_generation(project: Path) -> tuple[str | None, list[str]]:
-    inbox = project / ".roundtable" / "inbox" / "codex" / "new"
+def pending_generation(
+    project: Path,
+    agent_id: str = "codex",
+) -> tuple[str | None, list[str]]:
+    if not isinstance(agent_id, str) or not agent_id:
+        raise IdentityError("Codex binding lacks a valid agent identity")
+    inbox = project / ".roundtable" / "inbox" / agent_id / "new"
     inbox.mkdir(parents=True, exist_ok=True)
     ids = []
     for path in sorted(inbox.iterdir()):
@@ -549,7 +771,7 @@ def pending_generation(project: Path) -> tuple[str | None, list[str]]:
         if not match:
             raise IdentityError(f"invalid Roundtable mail header: {path.name}")
         msg_id = match.group("id")
-        if match.group("to").lower() != "codex" or msg_id != path.stem:
+        if match.group("to").lower() != agent_id.lower() or msg_id != path.stem:
             raise IdentityError(f"mail identity mismatch: {path.name}")
         ids.append(msg_id)
     if not ids:
@@ -788,8 +1010,9 @@ class WakeBridge:
         key = str(project)
         binding = self.store.bindings.get(key)
         if binding:
-            if binding.get("project") != key or binding.get("agent") != "codex":
+            if binding.get("project") != key:
                 raise IdentityError(f"invalid stored binding identity for {project}")
+            _binding_lease(project, binding)
             thread_id = binding.get("threadId")
             if not thread_id:
                 raise IdentityError(f"stored binding lacks threadId for {project}")
@@ -811,7 +1034,33 @@ class WakeBridge:
                 "run rt-codex-wake bind from its target Codex turn"
             )
         thread = discover_thread(self.client, project)
-        binding = self.store.bind_if_absent(project, thread)
+        lease = _discover_binding_lease(project)
+        if lease is None:
+            try:
+                with legacy_harness_guard(project, "codex"):
+                    binding = self.store.bind_if_absent(project, thread)
+            except RuntimeStateError as error:
+                raise IdentityError(
+                    f"Codex seat changed before legacy auto-bind: {error}"
+                ) from error
+        else:
+            try:
+                with seat_shared_guard(
+                    project,
+                    lease.agent_id,
+                    lease.session_id,
+                    lease.revision,
+                ) as current:
+                    binding = self.store.bind_if_absent(
+                        project,
+                        thread,
+                        lease=current,
+                    )
+            except (FenceRejected, RuntimeStateError) as error:
+                raise IdentityError(
+                    f"Codex seat changed before auto-bind: {error}"
+                ) from error
+        _binding_lease(project, binding)
         self.resume_attempted.add(key)
         self.resumed[key], subscribed = resume_or_loaded(
             self.client, project, binding["threadId"]
@@ -1015,9 +1264,60 @@ class WakeBridge:
         *,
         expected_binding_revision,
     ) -> bool:
+        binding = self.store.bindings.get(str(project)) or {}
+        lease = _binding_lease(project, binding)
+        agent_id = lease.agent_id if lease is not None else binding.get("agent")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise IdentityError(f"Codex binding lacks agent identity for {project}")
+        if lease is None:
+            try:
+                with legacy_harness_guard(project, "codex"):
+                    return self._wake_guarded(
+                        project,
+                        agent_id,
+                        thread_id,
+                        generation,
+                        count,
+                        expected_binding_revision=expected_binding_revision,
+                    )
+            except RuntimeStateError as error:
+                raise IdentityError(
+                    f"Codex seat changed before legacy wake: {error}"
+                ) from error
+        try:
+            with seat_shared_guard(
+                project,
+                lease.agent_id,
+                lease.session_id,
+                lease.revision,
+            ):
+                return self._wake_guarded(
+                    project,
+                    agent_id,
+                    thread_id,
+                    generation,
+                    count,
+                    expected_binding_revision=expected_binding_revision,
+                )
+        except (FenceRejected, RuntimeStateError) as error:
+            raise IdentityError(
+                f"Codex seat changed before wake: {error}"
+            ) from error
+
+    def _wake_guarded(
+        self,
+        project: Path,
+        agent_id: str,
+        thread_id: str,
+        generation: str,
+        count: int,
+        *,
+        expected_binding_revision,
+    ) -> bool:
         # The API lacks an atomic only-if-idle primitive, so status can still
         # change between read and turn/start. Binding selection is stricter:
-        # the state lock serializes bind() against the accepted wake.
+        # the binding-state lock serializes bind() against the accepted wake,
+        # while a leased caller also holds the project claim lock shared.
         thread = self._refresh(project, thread_id)
         if status_type(thread) == "active":
             self.active_observed.add(thread_id)
@@ -1036,7 +1336,7 @@ class WakeBridge:
         trust_reason = self._hook_trust_gate(project)
         if trust_reason:
             raise HumanGate("hook_trust", trust_reason)
-        inbox = project / ".roundtable" / "inbox" / "codex" / "new"
+        inbox = project / ".roundtable" / "inbox" / agent_id / "new"
         with self.store.transaction():
             current_binding = self.store.bindings.get(str(project)) or {}
             if (
@@ -1156,8 +1456,10 @@ class WakeBridge:
             and time.time() < safe_timestamp(project_state.get("retryAt"))
         ):
             return ProjectResult(False, "backoff")
+        binding = self.store.bindings.get(str(project)) or {}
+        bound_agent = binding.get("agent", "codex")
         try:
-            generation, ids = pending_generation(project)
+            generation, ids = pending_generation(project, bound_agent)
         except (IdentityError, OSError) as error:
             return self._record_project_error(project, 0, error)
         project_state = self.store.project_state(project)
@@ -1199,6 +1501,8 @@ class WakeBridge:
             return self._record_project_error(project, len(ids), error)
         project_state = self.store.project_state(project)
         binding = self.store.bindings.get(str(project)) or {}
+        if binding.get("agent") != bound_agent:
+            return ProjectResult(False, "binding agent changed; rescan required")
         binding_revision = binding.get("bindingRevision")
 
         if backing_off:
@@ -1472,9 +1776,38 @@ def bind_command(args) -> int:
     client = AppServerClient(args.socket)
     try:
         thread = validate_thread(project, read_thread(client, thread_id), thread_id)
+        lease = _lease_environment(project)
         store = StateStore(args.state_file)
-        store.bind(project, thread)
-        print(f"bound project={project} agent=codex thread={thread_id}")
+        if lease is None:
+            try:
+                with legacy_harness_guard(project, "codex"):
+                    store.bind(project, thread)
+            except RuntimeStateError as error:
+                raise IdentityError(
+                    f"Codex seat changed before legacy bind: {error}"
+                ) from error
+        else:
+            try:
+                with seat_shared_guard(
+                    project,
+                    lease.agent_id,
+                    lease.session_id,
+                    lease.revision,
+                ) as current:
+                    store.bind(project, thread, lease=current)
+                    update_wake(
+                        project,
+                        current.agent_id,
+                        current.session_id,
+                        current.revision,
+                        native_session_id=thread_id,
+                    )
+            except (FenceRejected, RuntimeStateError) as error:
+                raise IdentityError(
+                    f"Codex seat changed before bind: {error}"
+                ) from error
+        agent_id = lease.agent_id if lease is not None else "codex"
+        print(f"bound project={project} agent={agent_id} thread={thread_id}")
         return 0
     finally:
         client.close()
@@ -1557,6 +1890,7 @@ def run_command(args) -> int:
                     last_rpc_ok = utc_now()
                     last_error = None
                     heartbeat(heartbeat_file, projects, args.socket, last_rpc_ok, None)
+                    heartbeat_bound_seats(store, bridge.projects, results)
                     if args.once:
                         return 0 if all(result.ok for result in results) else 1
                     messages = client.drain_notifications(args.poll_seconds)

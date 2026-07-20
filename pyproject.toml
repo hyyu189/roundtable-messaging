@@ -39,11 +39,12 @@ roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
 [tool.setuptools]
 include-package-data = false
 packages = ["roundtable_packaging"]
-py-modules = ["_rtcodex", "_rtlauncher", "_rtlib"]
+py-modules = ["_rtcodex", "_rtlauncher", "_rtlib", "_rtruntime"]
 script-files = [
   "bin/_rtcodex.py",
   "bin/_rtlauncher.py",
   "bin/_rtlib.py",
+  "bin/_rtruntime.py",
   "bin/roundtable-init",
   "bin/rt-ack",
   "bin/rt-claude",

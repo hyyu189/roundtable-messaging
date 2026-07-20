@@ -1,81 +1,291 @@
-#!/usr/bin/env bash
-# rt-wait-inbox <agent> [max-minutes] — v2 delivery tripwire.
-# Blocks until a maildir message lands in the current project's inbox for
-# <agent>, or until an adaptive heartbeat timeout. Exits 0 either way and
-# prints the trigger cause.
-# - Wake condition ignores ack-* files (quiet delivery confirmations; drain
-#   them opportunistically on any other wake).
-# - Activity reset: rt-stop-gate touches $inbox/.last-active at every turn
-#   end; an mtime change restarts the countdown and clears heartbeat backoff,
-#   so heartbeats only tick during true idle stretches.
-# - Backoff: after 6 consecutive empty heartbeats (~4.5h idle) the timeout
-#   stretches to 240m, unless an explicit max-minutes argument pins it.
-#   Rationale: sub-hour heartbeats keep the conversation prompt-cache warm
-#   (cheap wakes, cheap return); once the operator is clearly away, drop to
-#   a floor that only guards against silent wake-path death.
-# Maintains an armed-marker (.armed-<pid>) so a Stop-hook gate can verify a
-# live tripwire exists before letting the agent go idle.
-# Run it as a harness-tracked background process (Claude: run_in_background;
-# Hermes: terminal(background=true, notify_on_complete=true)).
-set -u
-agent=${1:?usage: rt-wait-inbox <agent> [max-minutes]}
-explicit_min=${2:-}
-default_min=45
-floor_min=240
-backoff_after=6
+#!/usr/bin/env python3
+"""Wait for project mail while keeping host-local wake state fenced.
 
-# Project root = dir with .roundtable/agents.yaml (the project manifest).
-# A bare .roundtable dir is NOT enough — ~/.roundtable is the tool
-# installation, not a project, and must never grow a mailbox.
-dir=$PWD
-while [ "$dir" != "/" ] && [ ! -f "$dir/.roundtable/agents.yaml" ]; do dir=$(dirname "$dir"); done
-if [ ! -f "$dir/.roundtable/agents.yaml" ]; then
-  echo "rt-wait-inbox: no roundtable project (.roundtable/agents.yaml) at or above $PWD" >&2
-  exit 2
-fi
+The durable maildir remains under ``<project>/.roundtable/inbox``.  Process
+identity, activity, heartbeat, and adaptive-backoff state belong to the
+currently claimed host-local seat in ``RT_RUNTIME_DIR``.
+"""
 
-inbox="$dir/.roundtable/inbox/$agent"
-mkdir -p "$inbox/new" "$inbox/cur" "$inbox/tmp"
-marker="$inbox/.armed-$$"
-echo "$(date -u +%Y%m%dT%H%M%SZ) pid=$$ max_min=${explicit_min:-adaptive}" > "$marker"
-trap 'rm -f "$marker"' EXIT HUP INT TERM
+from __future__ import annotations
 
-beats_file="$inbox/.empty-beats"
-beats=$(cat "$beats_file" 2>/dev/null || echo 0)
-case $beats in ''|*[!0-9]*) beats=0 ;; esac
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import Any
 
-pick_max() {
-  if [ -n "$explicit_min" ]; then echo "$explicit_min"
-  elif [ "$beats" -ge "$backoff_after" ]; then echo "$floor_min"
-  else echo "$default_min"; fi
-}
+from _rtlib import is_project_root
+from _rtruntime import (
+    FenceRejected,
+    RuntimeStateError,
+    clear_wake,
+    load_validated_lease,
+    update_wake,
+)
 
-active_stamp() { stat -f %m "$inbox/.last-active" 2>/dev/null || echo 0; }
-wake_mail() { ls "$inbox/new" 2>/dev/null | grep -v '^ack-' || true; }
 
-max_min=$(pick_max)
-base=$(active_stamp)
-i=0
-mail=$(wake_mail)
-while [ -z "$mail" ] && [ "$i" -lt $((max_min * 12)) ]; do
-  sleep 5
-  now=$(active_stamp)
-  if [ "$now" != "$base" ]; then
-    base=$now; i=0; beats=0; echo 0 > "$beats_file"; max_min=$(pick_max)
-  else
-    i=$((i + 1))
-  fi
-  mail=$(wake_mail)
-done
+DEFAULT_MINUTES = 45
+FLOOR_MINUTES = 240
+BACKOFF_AFTER = 6
+POLL_SECONDS = 5
 
-acks=$(ls "$inbox/new" 2>/dev/null | grep -c '^ack-' || true)
-if [ -n "$mail" ]; then
-  echo 0 > "$beats_file"
-  echo "rt-wait-inbox: mail after $((i * 5))s:"
-  echo "$mail"
-else
-  beats=$((beats + 1)); echo "$beats" > "$beats_file"
-  echo "rt-wait-inbox: heartbeat timeout after ${max_min}m (inbox empty; consecutive empty beats: $beats)"
-fi
-[ "${acks:-0}" -gt 0 ] && echo "rt-wait-inbox: $acks quiet ack file(s) pending in new/ — drain to cur/ while you're awake"
-exit 0
+
+class StopRequested(Exception):
+    pass
+
+
+def _stop(_signum, _frame) -> None:
+    raise StopRequested
+
+
+def _project_at_or_above(start: Path) -> Path | None:
+    current = start.expanduser().resolve()
+    for candidate in (current, *current.parents):
+        if is_project_root(candidate):
+            return candidate
+    return None
+
+
+def _project_root() -> Path:
+    configured = os.environ.get("RT_PROJECT_ROOT")
+    discovered = _project_at_or_above(Path.cwd())
+    if configured:
+        project = Path(configured).expanduser().resolve()
+        if not is_project_root(project):
+            raise RuntimeStateError(
+                f"RT_PROJECT_ROOT is not a Roundtable project: {project}"
+            )
+        if discovered is not None and discovered != project:
+            raise RuntimeStateError(
+                f"RT_PROJECT_ROOT {project} does not match cwd project {discovered}"
+            )
+        return project
+    if discovered is None:
+        raise RuntimeStateError(
+            f"no roundtable project (.roundtable/agents.yaml) at or above {Path.cwd()}"
+        )
+    return discovered
+
+
+def _lease_environment(agent: str) -> tuple[str, str]:
+    session_id = os.environ.get("RT_SESSION_ID")
+    revision = os.environ.get("RT_LEASE_REVISION")
+    missing = [
+        name
+        for name, value in (
+            ("RT_SESSION_ID", session_id),
+            ("RT_LEASE_REVISION", revision),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeStateError(
+            "missing claimed-seat environment: " + ", ".join(missing)
+        )
+    launched_as = os.environ.get("RT_FROM")
+    if launched_as and launched_as != agent:
+        raise RuntimeStateError(
+            f"RT_FROM={launched_as!r} does not match requested agent {agent!r}"
+        )
+    return session_id, revision
+
+
+def _field(value: Any, name: str, default=None):
+    if hasattr(value, name):
+        return getattr(value, name)
+    for container_name in ("record", "state", "data"):
+        container = getattr(value, container_name, None)
+        if isinstance(container, dict) and name in container:
+            return container[name]
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return default
+
+
+def _integer_field(value: Any, name: str, default: int = 0) -> int:
+    raw = _field(value, name, default)
+    if isinstance(raw, bool):
+        return default
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _activity_stamp(value: Any):
+    for name in ("activity_revision", "activity_at", "last_activity_at"):
+        stamp = _field(value, name)
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _wake_mail(new_dir: Path) -> list[str]:
+    try:
+        names = sorted(path.name for path in new_dir.iterdir())
+    except FileNotFoundError:
+        return []
+    return [name for name in names if not name.startswith(("ack-", "."))]
+
+
+def _ack_count(new_dir: Path) -> int:
+    try:
+        return sum(
+            1
+            for path in new_dir.iterdir()
+            if path.name.startswith("ack-") and not path.name.startswith(".")
+        )
+    except FileNotFoundError:
+        return 0
+
+
+def _parse_minutes(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeStateError(f"max-minutes must be a non-negative integer: {raw}") from error
+    if value < 0:
+        raise RuntimeStateError(f"max-minutes must be a non-negative integer: {raw}")
+    return value
+
+
+def _pick_max(explicit: int | None, empty_beats: int) -> int:
+    if explicit is not None:
+        return explicit
+    return FLOOR_MINUTES if empty_beats >= BACKOFF_AFTER else DEFAULT_MINUTES
+
+
+def run(agent: str, explicit_minutes: int | None) -> int:
+    project = _project_root()
+    session_id, revision = _lease_environment(agent)
+    # Validate before touching either the durable inbox or host-local runtime.
+    load_validated_lease(project, agent, session_id, revision)
+
+    inbox = project / ".roundtable" / "inbox" / agent
+    new_dir = inbox / "new"
+    for path in (new_dir, inbox / "cur", inbox / "tmp"):
+        path.mkdir(parents=True, exist_ok=True)
+
+    watcher_pid = os.getpid()
+    try:
+        token = update_wake(
+            project,
+            agent,
+            session_id,
+            revision,
+            watcher_pid=watcher_pid,
+        )
+        empty_beats = _integer_field(token, "empty_beats")
+        activity = _activity_stamp(token)
+        max_minutes = _pick_max(explicit_minutes, empty_beats)
+        ticks = 0
+        mail = _wake_mail(new_dir)
+        superseded = False
+
+        while not mail and ticks < max_minutes * (60 // POLL_SECONDS):
+            time.sleep(POLL_SECONDS)
+            try:
+                token = update_wake(
+                    project,
+                    agent,
+                    session_id,
+                    revision,
+                    expected_watcher_pid=watcher_pid,
+                )
+            except FenceRejected:
+                superseded = True
+                break
+            current_activity = _activity_stamp(token)
+            if current_activity != activity:
+                activity = current_activity
+                ticks = 0
+                empty_beats = 0
+                max_minutes = _pick_max(explicit_minutes, empty_beats)
+                token = update_wake(
+                    project,
+                    agent,
+                    session_id,
+                    revision,
+                    empty_beats=0,
+                    expected_watcher_pid=watcher_pid,
+                )
+            else:
+                ticks += 1
+            mail = _wake_mail(new_dir)
+
+        if superseded:
+            print("rt-wait-inbox: seat lease or watcher was superseded")
+            return 0
+        if mail:
+            update_wake(
+                project,
+                agent,
+                session_id,
+                revision,
+                empty_beats=0,
+                expected_watcher_pid=watcher_pid,
+            )
+            print(f"rt-wait-inbox: mail after {ticks * POLL_SECONDS}s:")
+            print("\n".join(mail))
+        else:
+            empty_beats += 1
+            update_wake(
+                project,
+                agent,
+                session_id,
+                revision,
+                empty_beats=empty_beats,
+                expected_watcher_pid=watcher_pid,
+            )
+            print(
+                "rt-wait-inbox: heartbeat timeout after "
+                f"{max_minutes}m (inbox empty; consecutive empty beats: "
+                f"{empty_beats})"
+            )
+        acks = _ack_count(new_dir)
+        if acks:
+            print(
+                f"rt-wait-inbox: {acks} quiet ack file(s) pending in new/ "
+                "— drain to cur/ while you're awake"
+            )
+        return 0
+    except StopRequested:
+        return 0
+    finally:
+        try:
+            clear_wake(
+                project,
+                agent,
+                session_id,
+                revision,
+                expected_watcher_pid=watcher_pid,
+            )
+        except (FenceRejected, RuntimeStateError):
+            # A superseded watcher must never clear its successor's wake state.
+            pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not 1 <= len(argv) <= 2:
+        print(
+            "usage: rt-wait-inbox <agent> [max-minutes]",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        explicit = _parse_minutes(argv[1] if len(argv) == 2 else None)
+        return run(argv[0], explicit)
+    except (FenceRejected, RuntimeStateError, OSError) as error:
+        print(f"rt-wait-inbox: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    raise SystemExit(main())

@@ -176,6 +176,46 @@ FORBIDDEN_COMPONENTS = {
     "messages",
 }
 
+REQUIRED_PROJECT_ROOT_FILES = frozenset(
+    {
+        "_rtcodex.py",
+        "_rtlauncher.py",
+        "_rtlib.py",
+        "_rtruntime.py",
+    }
+)
+REQUIRED_PROJECT_PACKAGE_FILES = frozenset(
+    {
+        "roundtable_packaging/__init__.py",
+        "roundtable_packaging/cli.py",
+        "roundtable_packaging/smoke.py",
+    }
+)
+REQUIRED_PROJECT_SCRIPTS = frozenset(
+    {
+        "_rtcodex.py",
+        "_rtlauncher.py",
+        "_rtlib.py",
+        "_rtruntime.py",
+        "roundtable-init",
+        "rt-ack",
+        "rt-claude",
+        "rt-codex",
+        "rt-codex-daemon",
+        "rt-codex-wake",
+        "rt-doctor",
+        "rt-hermes",
+        "rt-inbox",
+        "rt-projects",
+        "rt-refresh",
+        "rt-resolve",
+        "rt-say",
+        "rt-startup-advisory",
+        "rt-stop-gate",
+        "rt-wait-inbox",
+    }
+)
+
 
 class ReleaseError(RuntimeError):
     """A release precondition or integrity failure."""
@@ -435,17 +475,30 @@ def _build_project_wheel(
 def _validate_project_wheel(wheel: Path, version: str) -> None:
     dist_info = f"roundtable_messaging-{version}.dist-info/"
     data_prefix = f"roundtable_messaging-{version}.data/"
-    allowed_root_files = {"_rtcodex.py", "_rtlauncher.py", "_rtlib.py"}
     with zipfile.ZipFile(wheel) as archive:
         names = [name for name in archive.namelist() if not name.endswith("/")]
     if not names:
         raise ReleaseError(f"project wheel is empty: {wheel}")
+    required = {
+        *REQUIRED_PROJECT_ROOT_FILES,
+        *REQUIRED_PROJECT_PACKAGE_FILES,
+        *(
+            f"{data_prefix}scripts/{script}"
+            for script in REQUIRED_PROJECT_SCRIPTS
+        ),
+    }
+    missing = required - set(names)
+    if missing:
+        raise ReleaseError(
+            "project wheel is missing required paths: "
+            + ", ".join(sorted(missing))
+        )
     for name in names:
         pure = PurePosixPath(name)
         if any(part in FORBIDDEN_COMPONENTS for part in pure.parts):
             raise ReleaseError(f"forbidden runtime path in project wheel: {name}")
         allowed = (
-            name in allowed_root_files
+            name in REQUIRED_PROJECT_ROOT_FILES
             or name.startswith("roundtable_packaging/")
             or name.startswith(dist_info)
             or name.startswith(f"{data_prefix}scripts/")

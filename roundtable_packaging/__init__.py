@@ -7,6 +7,13 @@ VERSION = "0.1.0"
 MANIFEST_SCHEMA = "roundtable.install.v1"
 MANAGED_MARKER = ".roundtable-managed.json"
 
+MANAGED_HELPERS = (
+    "_rtcodex.py",
+    "_rtlauncher.py",
+    "_rtlib.py",
+    "_rtruntime.py",
+)
+
 TOOLS = (
     "roundtable-init",
     "roundtable-smoke",

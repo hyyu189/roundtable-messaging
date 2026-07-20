@@ -33,6 +33,13 @@ The default install creates:
 Project registries, runtime state, and project-local `.roundtable` mailboxes are
 state, not versioned program files.
 
+Stable wrappers export one absolute host-local runtime root. Set
+`RT_RUNTIME_DIR` to override the default `<prefix>/.runtime`;
+`RT_CODEX_RUNTIME_DIR` remains a compatibility alias. If both are present they
+must name the same path, otherwise the command fails before launching a
+harness. The installer and Codex LaunchAgents create this root with user-only
+permissions.
+
 ## Source install
 
 Source installation requires CPython 3.11 through 3.14 with PyYAML, setuptools
@@ -45,7 +52,10 @@ mamba run -n general ./scripts/install.sh
 
 The source fallback builds a local project wheel without network access and
 creates its private environment with access to the bootstrap interpreter's
-PyYAML. This mode is for development and verification.
+PyYAML. Installation verifies that the command scripts and their managed
+runtime helpers are both present and records their digests, so a same-version
+reinstall cannot silently reuse a missing or locally modified lease helper.
+This mode is for development and verification.
 
 Verify the installed maildir core in an isolated HOME and PATH:
 

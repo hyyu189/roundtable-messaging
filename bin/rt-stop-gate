@@ -1,43 +1,178 @@
-#!/usr/bin/env bash
-# rt-stop-gate [agent] — Stop-hook gatekeeper for rt-messaging v2 (Claude/Codex
-# hook形态兼容:exit 2 + stderr = block reason;exit 0 = allow)。
-# Blocks the agent from going idle when (a) its project inbox has undrained
-# mail, or (b) no live rt-wait-inbox tripwire is armed. Outside roundtable
-# projects it is a no-op. One block per stop cycle (respects stop_hook_active).
-set -u
-agent=${1:-claude}
-input=$(cat 2>/dev/null || true)
+#!/usr/bin/env python3
+"""Stop-hook gate for a fenced Roundtable harness seat."""
 
-# Never double-block within one stop cycle (avoids block loops).
-case "$input" in *'"stop_hook_active":true'*|*'"stop_hook_active": true'*) exit 0 ;; esac
+from __future__ import annotations
 
-dir=${CLAUDE_PROJECT_DIR:-$PWD}
-while [ "$dir" != "/" ] && [ ! -f "$dir/.roundtable/agents.yaml" ]; do dir=$(dirname "$dir"); done
-[ -f "$dir/.roundtable/agents.yaml" ] || exit 0
-grep -q "^  $agent:" "$dir/.roundtable/agents.yaml" 2>/dev/null || exit 0
+import json
+import os
+import sys
+from pathlib import Path
 
-inbox="$dir/.roundtable/inbox/$agent"
+from _rtlib import is_project_root, load_agents_doc
+from _rtruntime import (
+    FenceRejected,
+    RuntimeStateError,
+    inspect_seat,
+    load_validated_lease,
+    update_activity,
+)
 
-# Activity stamp: lets an armed tripwire reset its heartbeat countdown while
-# the agent is in active use (see rt-wait-inbox).
-mkdir -p "$inbox" 2>/dev/null && touch "$inbox/.last-active" 2>/dev/null
 
-# ack-* files are quiet delivery confirmations: they never block a stop and
-# never wake; agents drain them opportunistically on other wakes.
-undrained=$(ls "$inbox/new" 2>/dev/null | grep -v '^ack-')
-if [ -n "$undrained" ]; then
-  echo "roundtable inbox has undrained mail: $(echo "$undrained" | tr '\n' ' '). Drain it now: read each file, act/ack (rt-ack <ids>), then mv to $inbox/cur/, then re-arm the tripwire (run in background: rt-wait-inbox $agent)." >&2
-  exit 2
-fi
+def _project_at_or_above(start: Path) -> Path | None:
+    current = start.expanduser().resolve()
+    for candidate in (current, *current.parents):
+        if is_project_root(candidate):
+            return candidate
+    return None
 
-for marker in "$inbox"/.armed-*; do
-  [ -e "$marker" ] || continue
-  pid=${marker##*.armed-}
-  if kill -0 "$pid" 2>/dev/null; then
-    exit 0
-  fi
-  rm -f "$marker"
-done
 
-echo "no live inbox tripwire for '$agent' in $dir. Arm it before stopping: run as a harness-tracked background process: rt-wait-inbox $agent" >&2
-exit 2
+def _project_root() -> Path | None:
+    start = Path(os.environ.get("CLAUDE_PROJECT_DIR", Path.cwd()))
+    discovered = _project_at_or_above(start)
+    configured = os.environ.get("RT_PROJECT_ROOT")
+    if not configured:
+        return discovered
+    project = Path(configured).expanduser().resolve()
+    if not is_project_root(project):
+        raise RuntimeStateError(
+            f"RT_PROJECT_ROOT is not a Roundtable project: {project}"
+        )
+    if discovered is not None and discovered != project:
+        raise RuntimeStateError(
+            f"RT_PROJECT_ROOT {project} does not match hook project {discovered}"
+        )
+    return project
+
+
+def _configured_agent(project: Path, agent: str) -> bool:
+    document = load_agents_doc(project, "rt-stop-gate")
+    agents = document.get("agents") if isinstance(document, dict) else None
+    if not isinstance(agents, dict):
+        return False
+    for base, config in agents.items():
+        if str(base).lower() == agent:
+            return True
+        if not isinstance(config, dict):
+            continue
+        instances = config.get("instances")
+        if not isinstance(instances, list):
+            continue
+        for instance in instances:
+            instance_id = instance.get("id") if isinstance(instance, dict) else instance
+            if isinstance(instance_id, str) and instance_id.lower() == agent:
+                return True
+    return False
+
+
+def _lease_environment(agent: str) -> tuple[str, str]:
+    session_id = os.environ.get("RT_SESSION_ID")
+    revision = os.environ.get("RT_LEASE_REVISION")
+    missing = [
+        name
+        for name, value in (
+            ("RT_SESSION_ID", session_id),
+            ("RT_LEASE_REVISION", revision),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeStateError(
+            "missing claimed-seat environment: " + ", ".join(missing)
+        )
+    launched_as = os.environ.get("RT_FROM")
+    if launched_as and launched_as != agent:
+        raise RuntimeStateError(
+            f"RT_FROM={launched_as!r} does not match requested agent {agent!r}"
+        )
+    return session_id, revision
+
+
+def _wake_is_healthy(inspection) -> bool:
+    healthy = None
+    for name in ("wake_healthy", "adapter_healthy"):
+        value = getattr(inspection, name, None)
+        if isinstance(value, bool):
+            healthy = value
+            break
+    if healthy is None:
+        healthy = getattr(inspection, "status", "") == "active_healthy"
+    token = getattr(inspection, "token", None)
+    return bool(healthy and token is not None and token.watcher_pid is not None)
+
+
+def run(agent: str, hook_input: str) -> int:
+    # Preserve the harness Stop-hook recursion contract.
+    try:
+        hook_payload = json.loads(hook_input or "{}")
+    except (TypeError, json.JSONDecodeError):
+        hook_payload = None
+    if isinstance(hook_payload, dict) and hook_payload.get("stop_hook_active") is True:
+        return 0
+    # Keep compatibility with older wrappers that prefixed diagnostic text to
+    # the JSON payload, while accepting any JSON whitespace.
+    compact = "".join(hook_input.split())
+    if '"stop_hook_active":true' in compact:
+        return 0
+
+    project = _project_root()
+    # Hooks are global. Outside a Roundtable project they remain a no-op.
+    if project is None:
+        return 0
+    if not _configured_agent(project, agent):
+        return 0
+
+    session_id, revision = _lease_environment(agent)
+    load_validated_lease(project, agent, session_id, revision)
+    update_activity(project, agent, session_id, revision)
+
+    inbox = project / ".roundtable" / "inbox" / agent
+    new_dir = inbox / "new"
+    try:
+        undrained = sorted(
+            path.name
+            for path in new_dir.iterdir()
+            if not path.name.startswith(("ack-", "."))
+        )
+    except FileNotFoundError:
+        undrained = []
+    if undrained:
+        rendered = " ".join(undrained)
+        print(
+            "roundtable inbox has undrained mail: "
+            f"{rendered}. Drain it now: read each file, act/ack "
+            "(rt-ack <ids>), then move it to "
+            f"{inbox / 'cur'}/, then re-arm the tripwire "
+            f"(run in background: rt-wait-inbox {agent}).",
+            file=sys.stderr,
+        )
+        return 2
+
+    inspection = inspect_seat(project, agent)
+    if _wake_is_healthy(inspection):
+        return 0
+    detail = getattr(inspection, "detail", "wake adapter is not healthy")
+    print(
+        f"no live inbox tripwire for {agent!r} in {project}: {detail}. "
+        "Arm it before stopping as a harness-tracked background process: "
+        f"rt-wait-inbox {agent}",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) > 1:
+        print("usage: rt-stop-gate [agent]", file=sys.stderr)
+        return 2
+    agent = argv[0] if argv else "claude"
+    hook_input = sys.stdin.read()
+    try:
+        return run(agent, hook_input)
+    except (FenceRejected, RuntimeStateError, OSError) as error:
+        print(f"rt-stop-gate: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

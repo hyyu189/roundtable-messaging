@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -16,6 +17,7 @@ from scripts import build_release
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OUTER_CHECKSUM_COMMAND = "cd artifacts && shasum -a 256 --check SHA256SUMS"
 
 
 def run(command: list[str], cwd: Path) -> None:
@@ -28,6 +30,33 @@ def run(command: list[str], cwd: Path) -> None:
         check=False,
     )
     assert process.returncode == 0, process.stderr
+
+
+def test_outer_checksum_command_works_from_repo_root(tmp_path):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    artifact = artifacts / "roundtable-messaging-test-macos.tar.gz"
+    artifact.write_bytes(b"release artifact fixture\n")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    (artifacts / "SHA256SUMS").write_text(f"{digest}  {artifact.name}\n")
+
+    for instructions in (
+        ROOT / ".github" / "workflows" / "release-artifact.yml",
+        ROOT / "docs" / "release.md",
+    ):
+        assert OUTER_CHECKSUM_COMMAND in instructions.read_text()
+
+    process = subprocess.run(
+        ["sh", "-c", OUTER_CHECKSUM_COMMAND],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert f"{artifact.name}: OK" in process.stdout
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +147,33 @@ def test_locked_matrix_and_hash_fail_closed(tmp_path):
             provided=wheel_dir,
             specs=incomplete,
         )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "_rtruntime.py",
+        "roundtable_messaging-0.1.0.data/scripts/_rtruntime.py",
+    ],
+)
+def test_project_wheel_validator_requires_runtime_helper_copies(tmp_path, missing):
+    wheel = tmp_path / "roundtable_messaging-0.1.0-py3-none-any.whl"
+    data_prefix = "roundtable_messaging-0.1.0.data/"
+    required = {
+        *build_release.REQUIRED_PROJECT_ROOT_FILES,
+        *build_release.REQUIRED_PROJECT_PACKAGE_FILES,
+        *(
+            f"{data_prefix}scripts/{script}"
+            for script in build_release.REQUIRED_PROJECT_SCRIPTS
+        ),
+    }
+    required.remove(missing)
+    with zipfile.ZipFile(wheel, mode="w") as archive:
+        for name in sorted(required):
+            archive.writestr(name, b"test\n")
+
+    with pytest.raises(build_release.ReleaseError, match="missing required paths"):
+        build_release._validate_project_wheel(wheel, "0.1.0")
 
 
 def archive_members(artifact: Path) -> tuple[str, set[str], dict[str, bytes]]:

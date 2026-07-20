@@ -51,7 +51,8 @@ project wheel digest, and dependency matrix. It also includes `PROVENANCE.md`,
 ## Verify and smoke
 
 ```bash
-shasum -a 256 --check artifacts/SHA256SUMS
+cd artifacts && shasum -a 256 --check SHA256SUMS
+cd ..
 tar -xzf artifacts/roundtable-messaging-0.1.0-macos.tar.gz
 cd roundtable-messaging-0.1.0
 shasum -a 256 --check SHA256SUMS

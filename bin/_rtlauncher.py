@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,13 @@ from _rtlib import (
     is_project_root,
     load_agents_doc,
     load_project_registry,
+)
+from _rtruntime import (
+    RuntimeStateError,
+    SeatAmbiguous,
+    SeatOccupied,
+    claim,
+    runtime_root,
 )
 
 
@@ -31,6 +40,21 @@ CONFIG_HARNESSES = {
 }
 CMUX_SHIM_PARTS = frozenset({"cmux-cli-shims"})
 CMUX_WRAPPER_NAMES = frozenset({"cmux-claude-wrapper", "cmux-codex-wrapper"})
+AGENT_ID_RE = re.compile(r"^[a-z0-9#_-]+$")
+LEASE_ENV_NAMES = (
+    "RT_PROJECT_ROOT",
+    "RT_FROM",
+    "RT_SESSION_ID",
+    "RT_LEASE_REVISION",
+)
+LEASE_CONTEXT_ENV_NAMES = tuple(
+    name for name in LEASE_ENV_NAMES if name != "RT_FROM"
+)
+CODEX_TOOL_ENV_NAMES = (
+    *LEASE_ENV_NAMES,
+    "RT_RUNTIME_DIR",
+    "RT_CODEX_RUNTIME_DIR",
+)
 
 
 class SelectionError(RuntimeError):
@@ -135,24 +159,129 @@ def configured_sender_ids(root: Path, harness: str) -> list[str]:
             instance_id = (
                 instance.get("id") if isinstance(instance, dict) else instance
             )
-            if isinstance(instance_id, str) and instance_id and instance_id not in ids:
+            if not isinstance(instance_id, str) or not AGENT_ID_RE.fullmatch(
+                instance_id
+            ):
+                raise SelectionError(
+                    f"rt-{harness}: configured instance id {instance_id!r} "
+                    "must match ^[a-z0-9#_-]+$"
+                )
+            if instance_id not in ids:
                 ids.append(instance_id)
     return ids
 
 
-def set_launch_identity(root: Path | None, harness: str) -> None:
-    if root is None or os.environ.get("RT_FROM"):
-        return
+def set_launch_identity(root: Path | None, harness: str) -> str | None:
+    existing = os.environ.get("RT_FROM")
+    if root is None:
+        return existing or None
     candidates = configured_sender_ids(root, harness)
+    if existing:
+        if existing not in candidates:
+            rendered = ", ".join(candidates) or "none"
+            raise SelectionError(
+                f"rt-{harness}: RT_FROM={existing!r} is not configured for "
+                f"{harness} in {root} (configured: {rendered})"
+            )
+        return existing
     if len(candidates) == 1:
         os.environ["RT_FROM"] = candidates[0]
-        return
+        return candidates[0]
     if len(candidates) > 1:
         rendered = ", ".join(candidates)
         raise SelectionError(
             f"rt-{harness}: multiple configured instances ({rendered}); "
             "set RT_FROM to the instance to launch"
         )
+    return None
+
+
+def claim_launch_seat(root: Path | None, harness: str, agent_id: str | None):
+    if root is None:
+        return None
+    if not agent_id:
+        raise SelectionError(
+            f"rt-{harness}: no configured {harness} instance in {root}; "
+            "add one to .roundtable/agents.yaml or set RT_FROM"
+        )
+    try:
+        token = claim(root, agent_id, harness)
+    except SeatOccupied as error:
+        status = error.inspection.status
+        condition = "unhealthy" if status == "active_unhealthy" else "active"
+        owner = getattr(getattr(error.inspection, "token", None), "agent_id", None)
+        occupied = owner if isinstance(owner, str) and owner else agent_id
+        request_detail = (
+            f"; requested seat {agent_id!r}"
+            if occupied != agent_id
+            else ""
+        )
+        raise SelectionError(
+            f"rt-{harness}: seat {occupied!r} is {condition} in {root}"
+            f"{request_detail}; "
+            f"{error.inspection.detail}"
+        ) from error
+    except SeatAmbiguous as error:
+        raise SelectionError(
+            f"rt-{harness}: seat {agent_id!r} has ambiguous runtime state in "
+            f"{root}; {error.inspection.detail}"
+        ) from error
+    except RuntimeStateError as error:
+        raise SelectionError(
+            f"rt-{harness}: could not claim seat {agent_id!r} in {root}: {error}"
+        ) from error
+
+    environment = {
+        "RT_PROJECT_ROOT": str(token.project_root),
+        "RT_FROM": token.agent_id,
+        "RT_SESSION_ID": token.session_id,
+        "RT_LEASE_REVISION": str(token.revision),
+    }
+    os.environ.update(environment)
+    return token
+
+
+def normalize_runtime_environment() -> Path:
+    """Expose one absolute runtime root to launchers and remote tool processes."""
+    try:
+        selected = runtime_root().expanduser().absolute()
+    except RuntimeStateError as error:
+        raise SelectionError(f"invalid Roundtable runtime root: {error}") from error
+    rendered = str(selected)
+    os.environ["RT_RUNTIME_DIR"] = rendered
+    os.environ["RT_CODEX_RUNTIME_DIR"] = rendered
+    return selected
+
+
+def codex_seat_overrides() -> list[str]:
+    arguments = []
+    for name in CODEX_TOOL_ENV_NAMES:
+        value = os.environ.get(name)
+        if value is None:
+            raise SelectionError(
+                f"rt-codex: missing required tool environment variable {name}"
+            )
+        arguments.extend(
+            [
+                "-c",
+                f"shell_environment_policy.set.{name}={json.dumps(value)}",
+            ]
+        )
+    return arguments
+
+
+def append_codex_seat_overrides(argv: list[str]) -> list[str]:
+    overrides = codex_seat_overrides()
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        return [*argv, *overrides]
+    return [*argv[:separator], *overrides, *argv[separator:]]
+
+
+def clear_unanchored_lease_context() -> None:
+    for name in LEASE_CONTEXT_ENV_NAMES:
+        os.environ.pop(name, None)
 
 
 def project_at_or_above(start: Path) -> Path | None:
@@ -179,12 +308,13 @@ def choose_launch_cwd(
     stderr=None,
     init_runner=subprocess.run,
 ) -> Path | None:
-    """Return a root to chdir to, or None to preserve the current cwd."""
+    """Return the canonical project root to launch from, or None if unanchored."""
     cwd = (cwd or Path.cwd()).expanduser().resolve()
     stdin = stdin or sys.stdin
     stderr = stderr or sys.stderr
-    if project_at_or_above(cwd) is not None:
-        return None
+    anchored = project_at_or_above(cwd)
+    if anchored is not None:
+        return anchored
     if not stdin.isatty():
         raise SelectionError(
             f"rt-{harness}: not in a Roundtable project and stdin is not a TTY"
@@ -240,9 +370,19 @@ def launch(harness: str, argv: list[str]) -> int:
     if selected is not None:
         os.chdir(selected)
     root = selected or project_at_or_above(Path.cwd())
-    set_launch_identity(root, harness)
-    command = [*COMMANDS[harness], *argv]
-    command[0] = str(harness_bin(harness))
+    if root is None:
+        clear_unanchored_lease_context()
+    agent_id = set_launch_identity(root, harness)
+    if root is not None:
+        normalize_runtime_environment()
+    executable = harness_bin(harness)
+    claim_launch_seat(root, harness, agent_id)
+    command = [*COMMANDS[harness]]
+    if harness == "codex" and root is not None:
+        command.extend(append_codex_seat_overrides(argv))
+    else:
+        command.extend(argv)
+    command[0] = str(executable)
     os.execv(command[0], command)
     return 127
 

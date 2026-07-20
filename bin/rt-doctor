@@ -25,7 +25,8 @@ from _rtcodex import (
     validated_releases_text,
     version_is_validated,
 )
-from _rtlib import load_project_registry, projects_registry_path
+from _rtlib import load_agents_doc, load_project_registry, projects_registry_path
+from _rtruntime import RuntimeStateError, harness_lease_records, inspect_seat
 
 
 def render_version(version) -> str:
@@ -82,12 +83,17 @@ def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def bridge_check(runtime_dir: Path, max_age: float) -> tuple[bool, str]:
+def bridge_check(
+    runtime_dir: Path,
+    max_age: float,
+    socket_path: Path = DEFAULT_SOCKET,
+) -> tuple[bool, str]:
     pid_path = runtime_dir / "rt-codex-wake.pid"
     alive, detail = pid_is_running(pid_path, "rt-codex-wake")
     if not alive:
@@ -105,13 +111,33 @@ def bridge_check(runtime_dir: Path, max_age: float) -> tuple[bool, str]:
         return False, "invalid bridge pid"
     if heartbeat.get("pid") != pid:
         return False, f"heartbeat pid {heartbeat.get('pid')} != live pid {pid}"
+    if heartbeat.get("schema") != "roundtable.codex-wake-heartbeat.v1":
+        return False, "heartbeat schema is missing or invalid"
+    reported_socket = heartbeat.get("socketPath")
+    if not isinstance(reported_socket, str) or not reported_socket:
+        return False, "heartbeat socketPath is missing or invalid"
+    expected_socket = socket_path.expanduser().absolute()
+    observed_socket = Path(reported_socket).expanduser().absolute()
+    if observed_socket != expected_socket:
+        return False, f"heartbeat socket {observed_socket} != requested {expected_socket}"
+    last_error = heartbeat.get("lastError")
+    if last_error not in (None, ""):
+        if not isinstance(last_error, str):
+            return False, "heartbeat lastError is invalid"
+        return False, f"bridge reports error: {last_error}"
     timestamp = parse_timestamp(heartbeat.get("heartbeatAt"))
     if timestamp is None:
         return False, "heartbeat timestamp is missing or invalid"
     age = (datetime.now(timezone.utc) - timestamp).total_seconds()
     if age > max_age:
         return False, f"heartbeat is stale ({age:.1f}s > {max_age:.1f}s)"
-    return True, f"{detail}, heartbeat age={age:.1f}s"
+    last_rpc_ok = parse_timestamp(heartbeat.get("lastRpcOkAt"))
+    if last_rpc_ok is None:
+        return False, "last successful bridge RPC timestamp is missing or invalid"
+    rpc_age = (datetime.now(timezone.utc) - last_rpc_ok).total_seconds()
+    if rpc_age > max_age:
+        return False, f"last successful bridge RPC is stale ({rpc_age:.1f}s > {max_age:.1f}s)"
+    return True, f"{detail}, heartbeat age={age:.1f}s, last RPC age={rpc_age:.1f}s"
 
 
 def process_cwd(pid: int) -> Path | None:
@@ -173,6 +199,417 @@ def tripwire_process(pid: int, agent: str) -> tuple[bool, str]:
     return proc.returncode == 0 and expected in command, command or "process unavailable"
 
 
+def configured_instances(project: Path) -> list[tuple[str, str]]:
+    document = load_agents_doc(project, "rt-doctor")
+    agents = document.get("agents") if isinstance(document, dict) else None
+    if not isinstance(agents, dict):
+        raise ValueError("agents is not a mapping")
+    configured = []
+    seen = set()
+    for base, raw_config in agents.items():
+        if not isinstance(base, str) or not base:
+            raise ValueError("agent names must be non-empty strings")
+        config = raw_config if isinstance(raw_config, dict) else {}
+        harness = config.get("harness") or base
+        if not isinstance(harness, str) or not harness:
+            raise ValueError(f"agent {base!r} has no valid harness")
+        instances = config.get("instances")
+        if not isinstance(instances, list) or not instances:
+            instances = [{"id": base}]
+        for raw_instance in instances:
+            instance_id = (
+                raw_instance.get("id")
+                if isinstance(raw_instance, dict)
+                else raw_instance
+            )
+            if not isinstance(instance_id, str) or not instance_id:
+                raise ValueError(f"agent {base!r} has an invalid instance id")
+            if instance_id in seen:
+                raise ValueError(f"duplicate configured instance {instance_id!r}")
+            seen.add(instance_id)
+            configured.append((instance_id, harness))
+    return configured
+
+
+def inspection_record(inspection) -> dict | None:
+    if inspection is None:
+        return None
+    if isinstance(inspection, dict):
+        record = inspection.get("record")
+    else:
+        record = getattr(inspection, "record", None)
+    return record if isinstance(record, dict) else None
+
+
+def inspection_value(inspection, *names, default=None):
+    if inspection is None:
+        return default
+    for name in names:
+        if isinstance(inspection, dict) and name in inspection:
+            return inspection[name]
+        if hasattr(inspection, name):
+            return getattr(inspection, name)
+    record = inspection_record(inspection)
+    if record is None:
+        return default
+    for name in names:
+        if name in record:
+            return record[name]
+    for container_name in ("wake", "watcher", "adapter"):
+        container = record.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        for name in names:
+            if name in container:
+                return container[name]
+    return default
+
+
+def inspection_status(inspection) -> str:
+    value = inspection_value(inspection, "status", default="ambiguous")
+    return value if isinstance(value, str) else "ambiguous"
+
+
+def launch_fix(project: Path, agent_id: str, harness: str) -> str:
+    normalized = harness_family(harness)
+    if normalized is None:
+        return f"restart {agent_id} from {project}"
+    return f"cd {project} && RT_FROM={agent_id} rt-{normalized}"
+
+
+def harness_family(harness: str | None) -> str | None:
+    return {
+        "claude": "claude",
+        "claude-code": "claude",
+        "codex": "codex",
+        "hermes": "hermes",
+        "hermes-agent": "hermes",
+    }.get(harness)
+
+
+def _positive_pid(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _anchor_check(
+    report: Report,
+    *,
+    name: str,
+    project: Path,
+    agent_id: str,
+    pid: int,
+    watcher: bool,
+) -> None:
+    if not pid_alive(pid):
+        report.item(
+            "WARN" if watcher else "FAIL",
+            name,
+            f"project={project} agent={agent_id} pid={pid} is not alive",
+            (
+                f"restart the wake watcher for {agent_id}"
+                if watcher
+                else f"restart {agent_id} from {project}"
+            ),
+        )
+        return
+    if watcher:
+        matches, command = tripwire_process(pid, agent_id)
+        if not matches:
+            report.item(
+                "WARN",
+                name,
+                f"project={project} agent={agent_id} pid={pid} "
+                f"does not match rt-wait-inbox: {command!r}",
+                f"restart the wake watcher for {agent_id}",
+            )
+    cwd = process_cwd(pid)
+    if cwd is None:
+        report.item(
+            "WARN",
+            name,
+            f"project={project} agent={agent_id} pid={pid} cwd unavailable",
+            f"inspect pid {pid}",
+        )
+        return
+    anchored = project_at_or_above(cwd)
+    if anchored == project:
+        report.item(
+            "OK",
+            name,
+            f"project={project} agent={agent_id} pid={pid} cwd={cwd}",
+        )
+    else:
+        report.item(
+            "FAIL",
+            name,
+            f"project={project} agent={agent_id} pid={pid} cwd={cwd} "
+            f"resolves_to={anchored} expected={project}",
+            f"restart the owning session from {project}",
+        )
+
+
+def inspect_project_seats(
+    report: Report,
+    registered: dict[str, Path],
+) -> tuple[dict[tuple[str, str], object], dict[str, set[str]]]:
+    inspections = {}
+    codex_instances = {}
+    for project in registered.values():
+        try:
+            configured = configured_instances(project)
+        except (OSError, UnicodeError, ValueError, SystemExit) as error:
+            report.item(
+                "FAIL",
+                "seat-config",
+                f"project={project}: {error}",
+                f"repair {project / '.roundtable' / 'agents.yaml'}",
+            )
+            continue
+        codex_instances[str(project)] = {
+            agent_id
+            for agent_id, harness in configured
+            if harness == "codex"
+        }
+        for agent_id, harness in configured:
+            key = (str(project), agent_id)
+            try:
+                inspection = inspect_seat(project, agent_id)
+            except (RuntimeStateError, OSError) as error:
+                inspections[key] = None
+                report.item(
+                    "FAIL",
+                    "seat",
+                    f"project={project} agent={agent_id} runtime inspection "
+                    f"failed: {error}",
+                    "inspect the host-local Roundtable runtime and restart the seat",
+                )
+                continue
+            inspections[key] = inspection
+            status = inspection_status(inspection)
+            detail = inspection_value(inspection, "detail", default="")
+            rendered = (
+                f"project={project} agent={agent_id} harness={harness} "
+                f"status={status}"
+                + (f" detail={detail}" if detail else "")
+            )
+            if status == "active_healthy":
+                level = "OK"
+                fix = "none"
+            elif status == "active_unhealthy":
+                level = "WARN"
+                fix = f"restart the wake adapter for {agent_id}"
+            elif status == "stale":
+                level = "WARN"
+                fix = launch_fix(project, agent_id, harness)
+            elif status == "vacant":
+                level = "WARN"
+                fix = launch_fix(project, agent_id, harness)
+            else:
+                level = "FAIL"
+                fix = "inspect and repair the host-local seat record before launch"
+            report.item(level, "seat", rendered, fix)
+
+            record = inspection_record(inspection)
+            if record is None:
+                continue
+            declared_agent = inspection_value(
+                inspection, "agentId", "agent_id"
+            )
+            declared_harness = inspection_value(inspection, "harness")
+            if declared_agent is not None and declared_agent != agent_id:
+                report.item(
+                    "FAIL",
+                    "seat-identity",
+                    f"project={project} configured agent={agent_id} but runtime "
+                    f"record declares agent={declared_agent!r}",
+                    "remove or repair the ambiguous host-local seat record",
+                )
+            if (
+                declared_harness is not None
+                and harness_family(str(declared_harness))
+                != harness_family(harness)
+            ):
+                report.item(
+                    "FAIL",
+                    "seat-identity",
+                    f"project={project} agent={agent_id} configured "
+                    f"harness={harness} but runtime record declares "
+                    f"harness={declared_harness!r}",
+                    "remove or repair the ambiguous host-local seat record",
+                )
+            if not status.startswith("active_"):
+                continue
+            declared_project = inspection_value(
+                inspection, "projectRoot", "project_root"
+            )
+            if declared_project:
+                try:
+                    declared = Path(str(declared_project)).expanduser().resolve()
+                except OSError:
+                    declared = None
+                if declared != project:
+                    report.item(
+                        "FAIL",
+                        "seat-owner-anchor",
+                        f"project={project} agent={agent_id} runtime project "
+                        f"anchor={declared_project!r}",
+                        f"restart the owning session from {project}",
+                    )
+            owner_pid = _positive_pid(
+                inspection_value(inspection, "ownerPid", "owner_pid")
+            )
+            if owner_pid is not None:
+                _anchor_check(
+                    report,
+                    name="seat-owner-anchor",
+                    project=project,
+                    agent_id=agent_id,
+                    pid=owner_pid,
+                    watcher=False,
+                )
+            watcher_pid = _positive_pid(
+                inspection_value(inspection, "watcherPid", "watcher_pid")
+            )
+            if watcher_pid is not None:
+                _anchor_check(
+                    report,
+                    name="seat-watcher-anchor",
+                    project=project,
+                    agent_id=agent_id,
+                    pid=watcher_pid,
+                    watcher=True,
+                )
+    return inspections, codex_instances
+
+
+def report_legacy_markers(report: Report, registered: dict[str, Path]) -> None:
+    for project in registered.values():
+        inbox = project / ".roundtable" / "inbox"
+        for marker in sorted(inbox.glob("*/.armed-*")):
+            report.item(
+                "WARN",
+                "legacy-tripwire-marker",
+                f"{marker} is not an authoritative session or watcher record",
+                f"remove legacy marker {marker}",
+            )
+
+
+def validate_binding_lease(
+    report: Report,
+    *,
+    project: str,
+    agent_id: str,
+    binding: dict,
+    inspection,
+    project_has_codex_record: bool = False,
+) -> bool:
+    session_present = "roundtableSessionId" in binding
+    revision_present = "leaseRevision" in binding
+    roundtable_session = binding.get("roundtableSessionId")
+    lease_revision = binding.get("leaseRevision")
+    if session_present != revision_present:
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"project={project} binding has partial Roundtable lease identity",
+            f"re-bind from the active Codex session: rt-codex-wake bind {project}",
+        )
+        return False
+    if session_present and (
+        not isinstance(roundtable_session, str)
+        or not roundtable_session
+        or not isinstance(lease_revision, str)
+        or not lease_revision
+    ):
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"project={project} binding has invalid Roundtable lease identity",
+            f"re-bind from the active Codex session: rt-codex-wake bind {project}",
+        )
+        return False
+
+    record = inspection_record(inspection)
+    if not session_present:
+        status = inspection_status(inspection)
+        if project_has_codex_record or record is not None or status != "vacant":
+            report.item(
+                "FAIL",
+                "codex-anchor",
+                f"project={project} binding lacks Roundtable lease identity while "
+                f"Codex runtime state exists (binding agent {agent_id} "
+                f"status={status})",
+                f"re-bind from the active Codex session: rt-codex-wake bind {project}",
+            )
+            return False
+        report.item(
+            "WARN",
+            "codex-anchor",
+            f"project={project} binding without Roundtable lease identity is "
+            f"accepted because no host-local runtime record exists for {agent_id}",
+            f"launch and re-bind Codex from {project}",
+        )
+        return True
+
+    if record is None:
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"project={project} binding references session={roundtable_session} "
+            "but no current host-local lease exists",
+            f"launch and re-bind Codex from {project}",
+        )
+        return False
+    status = inspection_status(inspection)
+    if status not in {"active_healthy", "active_unhealthy"}:
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"project={project} binding references a non-active seat "
+            f"status={status}",
+            f"launch and re-bind Codex from {project}",
+        )
+        return False
+    current_session = inspection_value(
+        inspection,
+        "sessionId",
+        "session_id",
+        "roundtableSessionId",
+    )
+    current_revision = inspection_value(
+        inspection,
+        "revision",
+        "leaseRevision",
+        "lease_revision",
+    )
+    if (
+        str(current_session) != str(roundtable_session)
+        or str(current_revision) != str(lease_revision)
+    ):
+        report.item(
+            "FAIL",
+            "codex-anchor",
+            f"project={project} binding lease mismatch: "
+            f"binding=({roundtable_session},{lease_revision}) "
+            f"current=({current_session},{current_revision})",
+            f"re-bind from the active Codex session: rt-codex-wake bind {project}",
+        )
+        return False
+    report.item(
+        "OK",
+        "codex-anchor",
+        f"project={project} binding lease matches session="
+        f"{roundtable_session} revision={lease_revision}",
+    )
+    return True
+
+
 def project_health_checks(
     report: Report,
     registry_path: Path,
@@ -203,53 +640,8 @@ def project_health_checks(
         )
 
     registered = {str(entry["root"]): entry["root"] for entry in entries}
-    saw_tripwire = False
-    for project in registered.values():
-        inbox = project / ".roundtable" / "inbox"
-        for marker in sorted(inbox.glob("*/.armed-*")):
-            try:
-                pid = int(marker.name.rsplit("-", 1)[1])
-            except (IndexError, ValueError):
-                report.item("WARN", "tripwire-anchor", f"invalid marker {marker}")
-                continue
-            if not pid_alive(pid):
-                continue
-            agent = marker.parent.name
-            is_tripwire, command = tripwire_process(pid, agent)
-            if not is_tripwire:
-                report.item(
-                    "WARN",
-                    "tripwire-anchor",
-                    f"stale or reused marker {marker}: pid={pid} command={command!r}",
-                    f"remove stale marker {marker}",
-                )
-                continue
-            saw_tripwire = True
-            cwd = process_cwd(pid)
-            if cwd is None:
-                report.item(
-                    "WARN",
-                    "tripwire-anchor",
-                    f"pid={pid} project={project} cwd unavailable",
-                    f"inspect pid {pid}",
-                )
-                continue
-            anchored = project_at_or_above(cwd)
-            if anchored == project:
-                report.item(
-                    "OK",
-                    "tripwire-anchor",
-                    f"pid={pid} cwd={cwd} project={project}",
-                )
-            else:
-                report.item(
-                    "FAIL",
-                    "tripwire-anchor",
-                    f"pid={pid} cwd={cwd} resolves_to={anchored} expected={project}",
-                    f"restart the owning harness from {project}",
-                )
-    if entries and not saw_tripwire:
-        report.item("OK", "tripwire-anchor", "no active tripwire markers")
+    inspections, codex_instances = inspect_project_seats(report, registered)
+    report_legacy_markers(report, registered)
 
     try:
         state = json.loads(state_file.read_text())
@@ -335,7 +727,16 @@ def project_health_checks(
                     f"rt-codex-wake unbind {project}",
                 )
                 continue
-            if binding.get("agent") != "codex" or binding.get("project") != project:
+            agent_id = binding.get("agent")
+            if (
+                not isinstance(agent_id, str)
+                or not agent_id
+                or binding.get("project") != project
+                or (
+                    registered_binding
+                    and agent_id not in codex_instances.get(project, set())
+                )
+            ):
                 report.item(
                     "FAIL",
                     "codex-anchor",
@@ -351,6 +752,26 @@ def project_health_checks(
                     f"binding for {project} has no threadId",
                     f"rt-codex-wake unbind {project}",
                 )
+                continue
+            inspection = inspections.get((project, agent_id))
+            try:
+                codex_records = harness_lease_records(Path(project), "codex")
+            except RuntimeStateError as error:
+                report.item(
+                    "FAIL",
+                    "codex-anchor",
+                    f"project={project} Codex runtime state is ambiguous: {error}",
+                    "repair the host-local runtime state, then re-run rt-doctor",
+                )
+                continue
+            if not validate_binding_lease(
+                report,
+                project=project,
+                agent_id=agent_id,
+                binding=binding,
+                inspection=inspection,
+                project_has_codex_record=bool(codex_records),
+            ):
                 continue
             if not rpc_ok:
                 report.item(
@@ -512,7 +933,11 @@ def main() -> int:
                 f"install or validate one of: {validated_releases_text()}",
             )
 
-    bridge_ok, bridge_detail = bridge_check(args.runtime_dir, args.bridge_max_age)
+    bridge_ok, bridge_detail = bridge_check(
+        args.runtime_dir,
+        args.bridge_max_age,
+        args.socket,
+    )
     if bridge_ok:
         bridge_level = "OK"
         bridge_fix = "none"
@@ -532,9 +957,24 @@ def main() -> int:
         bridge_fix,
     )
     state_file = args.state_file or args.runtime_dir / "rt-codex-wake-state.json"
-    project_health_checks(
-        report, args.registry, state_file, args.socket, rpc_ok
-    )
+    previous_runtime = os.environ.get("RT_RUNTIME_DIR")
+    previous_codex_runtime = os.environ.get("RT_CODEX_RUNTIME_DIR")
+    selected_runtime = str(args.runtime_dir.expanduser().resolve())
+    os.environ["RT_RUNTIME_DIR"] = selected_runtime
+    os.environ["RT_CODEX_RUNTIME_DIR"] = selected_runtime
+    try:
+        project_health_checks(
+            report, args.registry, state_file, args.socket, rpc_ok
+        )
+    finally:
+        if previous_runtime is None:
+            os.environ.pop("RT_RUNTIME_DIR", None)
+        else:
+            os.environ["RT_RUNTIME_DIR"] = previous_runtime
+        if previous_codex_runtime is None:
+            os.environ.pop("RT_CODEX_RUNTIME_DIR", None)
+        else:
+            os.environ["RT_CODEX_RUNTIME_DIR"] = previous_codex_runtime
     return 1 if report.failed else 0
 
 

@@ -22,7 +22,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import LAUNCH_AGENT_LABELS, MANAGED_MARKER, MANIFEST_SCHEMA, TOOLS, VERSION
+from . import (
+    LAUNCH_AGENT_LABELS,
+    MANAGED_HELPERS,
+    MANAGED_MARKER,
+    MANIFEST_SCHEMA,
+    TOOLS,
+    VERSION,
+)
 
 SUPPORTED_PYTHON_MIN = (3, 11)
 SUPPORTED_PYTHON_MAX = (3, 14)
@@ -254,7 +261,22 @@ def _wrapper_payload(prefix: Path, tool: str) -> bytes:
         "set -eu\n"
         f"prefix={quoted}\n"
         'export ROUNDTABLE_INSTALL_PREFIX="$prefix"\n'
-        'export RT_CODEX_RUNTIME_DIR="${RT_CODEX_RUNTIME_DIR:-$prefix/.runtime}"\n'
+        'generic_runtime=${RT_RUNTIME_DIR:-}\n'
+        'legacy_runtime=${RT_CODEX_RUNTIME_DIR:-}\n'
+        'if [ -n "$generic_runtime" ] && [ -n "$legacy_runtime" ] '
+        '&& [ "$generic_runtime" != "$legacy_runtime" ]; then\n'
+        '  echo "roundtable: RT_RUNTIME_DIR and RT_CODEX_RUNTIME_DIR '
+        'must resolve to one runtime root" >&2\n'
+        "  exit 2\n"
+        "fi\n"
+        'runtime_dir=${generic_runtime:-${legacy_runtime:-$prefix/.runtime}}\n'
+        'case "$runtime_dir" in\n'
+        "  /*) ;;\n"
+        '  *) echo "roundtable: runtime directory must be absolute: '
+        '$runtime_dir" >&2; exit 2 ;;\n'
+        "esac\n"
+        'export RT_RUNTIME_DIR="$runtime_dir"\n'
+        'export RT_CODEX_RUNTIME_DIR="$runtime_dir"\n'
         'export PATH="$prefix/current/bin:${PATH:-/usr/bin:/bin}"\n'
         f'exec "$prefix/current/bin/{tool}" "$@"\n'
     ).encode()
@@ -490,7 +512,13 @@ def _create_version(
                     f"roundtable-messaging=={VERSION}",
                 ]
             )
-        _run([str(installed_python), "-c", "import yaml"])
+        _run(
+            [
+                str(installed_python),
+                "-c",
+                "import _rtcodex, _rtlauncher, _rtlib, _rtruntime, yaml",
+            ]
+        )
 
         expected = [destination / "bin" / tool for tool in TOOLS]
         missing = [str(path) for path in expected if not path.is_file()]
@@ -498,6 +526,17 @@ def _create_version(
             raise InstallError(
                 "installed wheel is missing commands:\n"
                 + "\n".join(f"  - {path}" for path in missing)
+            )
+        expected_helpers = [
+            destination / "bin" / helper for helper in MANAGED_HELPERS
+        ]
+        missing_helpers = [
+            str(path) for path in expected_helpers if not path.is_file()
+        ]
+        if missing_helpers:
+            raise InstallError(
+                "installed wheel is missing managed helpers:\n"
+                + "\n".join(f"  - {path}" for path in missing_helpers)
             )
 
         templates = destination / "share" / "roundtable" / "templates"
@@ -512,6 +551,10 @@ def _create_version(
             "tools": {
                 tool: _sha256_path(destination / "bin" / tool)
                 for tool in TOOLS
+            },
+            "helpers": {
+                helper: _sha256_path(destination / "bin" / helper)
+                for helper in MANAGED_HELPERS
             },
         }
         _atomic_write(
@@ -568,6 +611,23 @@ def _validate_version_dir(
             or _sha256_path(path) != expected
         ):
             raise InstallError(f"{destination}: managed tool is missing or modified: {tool}")
+    helper_digests = marker.get("helpers")
+    if (
+        not isinstance(helper_digests, dict)
+        or set(helper_digests) != set(MANAGED_HELPERS)
+    ):
+        raise InstallError(f"{destination}: invalid managed helper digest set")
+    for helper, expected in helper_digests.items():
+        path = destination / "bin" / helper
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or not path.is_file()
+            or _sha256_path(path) != expected
+        ):
+            raise InstallError(
+                f"{destination}: managed helper is missing or modified: {helper}"
+            )
     templates = destination / "templates"
     expected_templates = destination / "share" / "roundtable" / "templates"
     if (

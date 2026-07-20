@@ -17,27 +17,13 @@ import secrets
 import select
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import time
 from pathlib import Path
 
-
-SOURCE_ROOT = Path(__file__).resolve().parents[1]
-INSTALL_PREFIX = os.environ.get("ROUNDTABLE_INSTALL_PREFIX")
-ROUND_ROOT = (
-    Path(INSTALL_PREFIX).expanduser().absolute() / "current"
-    if INSTALL_PREFIX
-    else SOURCE_ROOT
-)
-RUNTIME_DIR = Path(
-    os.environ.get("RT_CODEX_RUNTIME_DIR", ROUND_ROOT / ".runtime")
-).expanduser()
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
-DEFAULT_SOCKET = (CODEX_HOME / "app-server-control" / "app-server-control.sock").expanduser()
-APP_SERVER_LABEL = "com.roundtable.codex-app-server"
-WAKE_LABEL = "com.roundtable.codex-wake"
-VALIDATED_CODEX_RELEASES = frozenset({(0, 144, 6)})
+from _rtruntime import RuntimeStateError, runtime_root
 
 
 class CodexRuntimeError(RuntimeError):
@@ -50,6 +36,67 @@ class RpcError(CodexRuntimeError):
 
 class UnsupportedVersion(CodexRuntimeError):
     pass
+
+
+def configured_runtime_dir() -> Path:
+    try:
+        return runtime_root()
+    except RuntimeStateError as error:
+        raise CodexRuntimeError(f"invalid Roundtable runtime root: {error}") from error
+
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+INSTALL_PREFIX = os.environ.get("ROUNDTABLE_INSTALL_PREFIX")
+ROUND_ROOT = (
+    Path(INSTALL_PREFIX).expanduser().absolute() / "current"
+    if INSTALL_PREFIX
+    else SOURCE_ROOT
+)
+RUNTIME_DIR = configured_runtime_dir()
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+DEFAULT_SOCKET = (CODEX_HOME / "app-server-control" / "app-server-control.sock").expanduser()
+APP_SERVER_LABEL = "com.roundtable.codex-app-server"
+WAKE_LABEL = "com.roundtable.codex-wake"
+VALIDATED_CODEX_RELEASES = frozenset({(0, 144, 6)})
+
+
+def ensure_private_runtime_dir(path: Path | None = None) -> Path:
+    """Create or tighten the local runtime root without following a leaf symlink."""
+    root = Path(path if path is not None else RUNTIME_DIR).expanduser()
+    if not root.is_absolute():
+        raise CodexRuntimeError(f"runtime directory must be absolute: {root}")
+    try:
+        existing = root.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot inspect runtime directory {root}: {error}") from error
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        raise CodexRuntimeError(f"runtime directory is a symlink: {root}")
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(root, flags)
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot create private runtime directory {root}: {error}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise CodexRuntimeError(f"runtime path is not a directory: {root}")
+        if info.st_uid != os.getuid():
+            raise CodexRuntimeError(
+                f"runtime directory owner uid {info.st_uid} != {os.getuid()}: {root}"
+            )
+        os.fchmod(descriptor, 0o700)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+            raise CodexRuntimeError(f"cannot protect runtime directory {root}")
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot protect runtime directory {root}: {error}") from error
+    finally:
+        os.close(descriptor)
+    return root
 
 
 def _env_path() -> str:
@@ -102,12 +149,14 @@ def launch_agent_path(label: str) -> Path:
 
 
 def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    runtime_dir = ensure_private_runtime_dir()
     selected_codex = codex_bin()
     environment = {
         "HOME": str(Path.home()),
         "PATH": _env_path(),
         "CODEX_HOME": str(CODEX_HOME),
+        "RT_RUNTIME_DIR": str(runtime_dir),
+        "RT_CODEX_RUNTIME_DIR": str(runtime_dir),
         "RT_CODEX_BIN": str(selected_codex),
     }
     if INSTALL_PREFIX:
@@ -128,8 +177,8 @@ def app_server_plist(socket_path: Path = DEFAULT_SOCKET) -> dict:
         "ProcessType": "Background",
         "WorkingDirectory": str(Path.home()),
         "EnvironmentVariables": environment,
-        "StandardOutPath": str(RUNTIME_DIR / "codex-app-server.stdout.log"),
-        "StandardErrorPath": str(RUNTIME_DIR / "codex-app-server.stderr.log"),
+        "StandardOutPath": str(runtime_dir / "codex-app-server.stdout.log"),
+        "StandardErrorPath": str(runtime_dir / "codex-app-server.stderr.log"),
     }
 
 
@@ -138,7 +187,7 @@ def wake_plist(
     *,
     auto_discover: bool = False,
 ) -> dict:
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    runtime_dir = ensure_private_runtime_dir()
     selected_codex = codex_bin()
     arguments = [
         str(ROUND_ROOT / "bin" / "rt-codex-wake"),
@@ -152,7 +201,8 @@ def wake_plist(
         "HOME": str(Path.home()),
         "PATH": _env_path(),
         "CODEX_HOME": str(CODEX_HOME),
-        "RT_CODEX_RUNTIME_DIR": str(RUNTIME_DIR),
+        "RT_RUNTIME_DIR": str(runtime_dir),
+        "RT_CODEX_RUNTIME_DIR": str(runtime_dir),
         "RT_CODEX_BIN": str(selected_codex),
     }
     if INSTALL_PREFIX:
@@ -172,8 +222,8 @@ def wake_plist(
         "ProcessType": "Background",
         "WorkingDirectory": str(Path.home()),
         "EnvironmentVariables": environment,
-        "StandardOutPath": str(RUNTIME_DIR / "rt-codex-wake.stdout.log"),
-        "StandardErrorPath": str(RUNTIME_DIR / "rt-codex-wake.stderr.log"),
+        "StandardOutPath": str(runtime_dir / "rt-codex-wake.stdout.log"),
+        "StandardErrorPath": str(runtime_dir / "rt-codex-wake.stderr.log"),
     }
 
 
@@ -556,8 +606,8 @@ def ensure_daemon(socket_path: Path = DEFAULT_SOCKET, timeout: float = 10.0) -> 
             f"refusing daemon restart after non-liveness probe failure: {detail}"
         )
 
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    lock = RUNTIME_DIR / "codex-app-server-start.lock"
+    runtime_dir = ensure_private_runtime_dir()
+    lock = runtime_dir / "codex-app-server-start.lock"
     deadline = time.monotonic() + timeout
     descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     handle = os.fdopen(descriptor, "r+")

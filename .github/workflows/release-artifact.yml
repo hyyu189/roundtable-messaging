@@ -56,7 +56,7 @@ jobs:
         run: python scripts/build_release.py --output-dir artifacts
 
       - name: Verify outer checksum
-        run: shasum -a 256 --check artifacts/SHA256SUMS
+        run: cd artifacts && shasum -a 256 --check SHA256SUMS
 
       - name: Exercise the exact extracted artifact
         shell: bash

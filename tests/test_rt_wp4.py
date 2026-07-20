@@ -231,7 +231,7 @@ def test_roundtable_init_registers_via_rt_projects_file(tmp_path):
     assert entries[0]["registered_at"].endswith("Z")
 
 
-def test_launcher_project_ancestor_is_direct_even_without_tty(tmp_path):
+def test_launcher_project_ancestor_normalizes_to_root_even_without_tty(tmp_path):
     project = write_project(tmp_path / "project")
     nested = project / "nested" / "deeper"
     nested.mkdir(parents=True)
@@ -240,7 +240,7 @@ def test_launcher_project_ancestor_is_direct_even_without_tty(tmp_path):
         "codex", cwd=nested, stdin=io.StringIO(), stderr=io.StringIO()
     )
 
-    assert selected is None
+    assert selected == project
 
 
 def test_launcher_outside_project_non_tty_fails_without_prompt(tmp_path):
@@ -330,6 +330,18 @@ def test_launcher_exec_preserves_harness_contract(
     tmp_path, monkeypatch, harness, expected
 ):
     project = write_project(tmp_path / "project")
+    configured_harness = {
+        "claude": "claude-code",
+        "codex": "codex",
+        "hermes": "hermes-agent",
+    }[harness]
+    (project / ".roundtable" / "agents.yaml").write_text(
+        "schema: roundtable.agents.v1\n"
+        f"project: {project}\n"
+        "agents:\n"
+        f"  {harness}:\n"
+        f"    harness: {configured_harness}\n"
+    )
     argv = expected[len(_rtlauncher.COMMANDS[harness]) :]
     observed = {}
 
@@ -340,8 +352,26 @@ def test_launcher_exec_preserves_harness_contract(
         _rtlauncher, "choose_launch_cwd", lambda _harness: project
     )
     monkeypatch.setenv("RT_FROM", harness)
+    for name in (
+        "RT_PROJECT_ROOT",
+        "RT_SESSION_ID",
+        "RT_LEASE_REVISION",
+        "RT_RUNTIME_DIR",
+        "RT_CODEX_RUNTIME_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         _rtlauncher.os, "chdir", lambda path: observed.setdefault("cwd", path)
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "claim",
+        lambda root, agent_id, selected_harness: SimpleNamespace(
+            project_root=root,
+            agent_id=agent_id,
+            session_id=f"{selected_harness}-session",
+            revision=7,
+        ),
     )
 
     def fake_execv(program, command):
@@ -356,6 +386,8 @@ def test_launcher_exec_preserves_harness_contract(
         _rtlauncher.launch(harness, argv)
 
     expected = [str(fake_binary), *expected[1:]]
+    if harness == "codex":
+        expected.extend(_rtlauncher.codex_seat_overrides())
     assert observed == {"cwd": project, "program": expected[0], "command": expected}
 
 
@@ -408,6 +440,24 @@ def test_launcher_sets_unique_instance_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
     monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
     monkeypatch.setattr(_rtlauncher, "harness_bin", lambda _harness: tmp_path / "claude")
+    monkeypatch.setattr(
+        _rtlauncher,
+        "claim",
+        lambda root, agent_id, harness: SimpleNamespace(
+            project_root=root,
+            agent_id=agent_id,
+            session_id=f"{harness}-session",
+            revision=1,
+        ),
+    )
+    for name in (
+        "RT_PROJECT_ROOT",
+        "RT_SESSION_ID",
+        "RT_LEASE_REVISION",
+        "RT_RUNTIME_DIR",
+        "RT_CODEX_RUNTIME_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     def capture_identity(_program, _command):
         observed["sender"] = os.environ.get("RT_FROM")
@@ -436,6 +486,8 @@ def test_launcher_requires_explicit_identity_for_multiple_instances(
         "      - id: claude#2\n"
     )
     monkeypatch.delenv("RT_FROM", raising=False)
+    monkeypatch.delenv("RT_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("RT_CODEX_RUNTIME_DIR", raising=False)
     monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
     monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
 
@@ -592,7 +644,8 @@ def test_doctor_reports_tripwire_and_codex_wrong_anchor(tmp_path, monkeypatch, c
     output = capsys.readouterr().out
     assert report.failed
     assert f"OK registry: {project}" in output
-    assert f"FAIL tripwire-anchor: pid=123 cwd={wrong}" in output
+    assert f"WARN legacy-tripwire-marker: {marker}" in output
+    assert "tripwire-anchor" not in output
     assert f"FAIL codex-anchor: thread=thread-1 cwd={wrong} expected={project}" in output
 
 

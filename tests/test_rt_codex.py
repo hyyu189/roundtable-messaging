@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -1085,9 +1086,9 @@ def test_malformed_project_backs_off_without_blocking_other_project(
     original = wake.pending_generation
     calls = {str(bad): 0, str(good): 0}
 
-    def counted(project):
+    def counted(project, agent_id="codex"):
         calls[str(project)] += 1
-        return original(project)
+        return original(project, agent_id)
 
     monkeypatch.setattr(wake, "pending_generation", counted)
     store = wake.StateStore(tmp_path / "state.json")
@@ -1746,6 +1747,28 @@ def test_rt_codex_socket_environment_cannot_redefine_validated_default(tmp_path)
     assert proc.stdout.strip() != env["RT_CODEX_SOCKET"]
 
 
+def test_rt_codex_import_rejects_split_runtime_roots(tmp_path):
+    env = os.environ.copy()
+    env["RT_RUNTIME_DIR"] = str((tmp_path / "generic").resolve())
+    env["RT_CODEX_RUNTIME_DIR"] = str((tmp_path / "legacy").resolve())
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'bin'); import _rtcodex",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "select different runtime roots" in proc.stderr
+
+
 def test_daemon_version_mismatch_fails_closed(monkeypatch):
     monkeypatch.setattr(
         _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
@@ -1794,19 +1817,51 @@ def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):
     fake_codex = tmp_path / "codex"
     fake_codex.write_text("#!/bin/sh\n")
     fake_codex.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o755)
+    runtime.chmod(0o755)
     monkeypatch.setenv("RT_CODEX_BIN", str(fake_codex))
-    monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", tmp_path / "runtime")
+    monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", runtime)
 
     app = _rtcodex.app_server_plist(tmp_path / "app.sock")
     bridge = _rtcodex.wake_plist(tmp_path / "app.sock")
 
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
     assert app["RunAtLoad"] and app["KeepAlive"]
     assert app["ProgramArguments"][-2:] == ["--listen", f"unix://{tmp_path / 'app.sock'}"]
     assert app["ProgramArguments"][0] == str(fake_codex)
     assert app["EnvironmentVariables"]["RT_CODEX_BIN"] == str(fake_codex)
+    assert app["EnvironmentVariables"]["RT_RUNTIME_DIR"] == str(tmp_path / "runtime")
+    assert app["EnvironmentVariables"]["RT_CODEX_RUNTIME_DIR"] == str(
+        tmp_path / "runtime"
+    )
     assert bridge["RunAtLoad"] and bridge["KeepAlive"] == {"SuccessfulExit": False}
     assert bridge["ProgramArguments"][-1] == "run"
     assert bridge["EnvironmentVariables"]["RT_CODEX_BIN"] == str(fake_codex)
+    assert bridge["EnvironmentVariables"]["RT_RUNTIME_DIR"] == str(
+        tmp_path / "runtime"
+    )
+
+
+def test_codex_runtime_root_rejects_symlink(tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    target.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", runtime)
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="is a symlink"):
+        _rtcodex.ensure_private_runtime_dir()
+
+
+def test_codex_runtime_root_rejects_foreign_owner(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setattr(_rtcodex, "RUNTIME_DIR", runtime)
+    monkeypatch.setattr(_rtcodex.os, "getuid", lambda: runtime.stat().st_uid + 1)
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="owner uid"):
+        _rtcodex.ensure_private_runtime_dir()
 
 
 def test_launchd_payloads_preserve_stable_install_prefix(tmp_path, monkeypatch):

@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from roundtable_packaging import MANAGED_HELPERS
+from roundtable_packaging import cli as packaging_cli
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / "scripts" / "install.sh"
@@ -53,6 +56,85 @@ def run_script(
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_wrapper(
+    wrapper: Path,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("RT_RUNTIME_DIR", None)
+    environment.pop("RT_CODEX_RUNTIME_DIR", None)
+    if overrides:
+        environment.update(overrides)
+    return subprocess.run(
+        [str(wrapper)],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def write_runtime_probe(tmp_path: Path) -> tuple[Path, Path]:
+    prefix = tmp_path / "prefix"
+    target = prefix / "current" / "bin" / "probe"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n%s\\n' \"$RT_RUNTIME_DIR\" \"$RT_CODEX_RUNTIME_DIR\"\n"
+    )
+    target.chmod(0o755)
+    wrapper = tmp_path / "probe-wrapper"
+    wrapper.write_bytes(packaging_cli._wrapper_payload(prefix, "probe"))
+    wrapper.chmod(0o755)
+    return prefix, wrapper
+
+
+def test_wrapper_resolves_default_generic_and_legacy_runtime_roots(tmp_path):
+    prefix, wrapper = write_runtime_probe(tmp_path)
+    generic = (tmp_path / "generic-runtime").absolute()
+    legacy = (tmp_path / "legacy-runtime").absolute()
+    cases = (
+        ({}, prefix / ".runtime"),
+        ({"RT_RUNTIME_DIR": str(generic)}, generic),
+        ({"RT_CODEX_RUNTIME_DIR": str(legacy)}, legacy),
+    )
+
+    for overrides, expected in cases:
+        result = run_wrapper(wrapper, overrides=overrides)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [str(expected), str(expected)]
+
+
+def test_wrapper_fails_closed_on_conflicting_runtime_roots(tmp_path):
+    _, wrapper = write_runtime_probe(tmp_path)
+
+    result = run_wrapper(
+        wrapper,
+        overrides={
+            "RT_RUNTIME_DIR": str((tmp_path / "generic").absolute()),
+            "RT_CODEX_RUNTIME_DIR": str((tmp_path / "legacy").absolute()),
+        },
+    )
+
+    assert result.returncode == 2
+    assert "must resolve to one runtime root" in result.stderr
+    assert result.stdout == ""
+
+
+def test_wrapper_rejects_relative_runtime_root(tmp_path):
+    _, wrapper = write_runtime_probe(tmp_path)
+
+    result = run_wrapper(
+        wrapper,
+        overrides={"RT_RUNTIME_DIR": "relative/runtime"},
+    )
+
+    assert result.returncode == 2
+    assert "runtime directory must be absolute" in result.stderr
 
 
 @pytest.fixture(scope="module")
@@ -103,8 +185,10 @@ def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
         names = set(archive.namelist())
 
     assert "roundtable_packaging/cli.py" in names
+    assert "_rtruntime.py" in names
     assert any(name.endswith(".data/scripts/rt-say") for name in names)
     assert any(name.endswith(".data/scripts/_rtlib.py") for name in names)
+    assert any(name.endswith(".data/scripts/_rtruntime.py") for name in names)
     assert any(
         name.endswith(".data/data/share/roundtable/templates/agents.yaml.tmpl")
         for name in names
@@ -135,14 +219,24 @@ def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path
     manifest = json.loads(manifest_path.read_text())
     assert manifest["schema"] == "roundtable.install.v1"
     assert (prefix / "current").is_symlink()
+    marker = json.loads(
+        (prefix / "current" / ".roundtable-managed.json").read_text()
+    )
+    assert set(marker["helpers"]) == set(MANAGED_HELPERS)
     assert (link_dir / "rt-say").is_symlink()
     assert (prefix / "bin" / "rt-say").stat().st_mode & stat.S_IXUSR
+    wrapper = (prefix / "bin" / "rt-say").read_text()
+    assert 'export RT_RUNTIME_DIR="$runtime_dir"' in wrapper
+    assert 'export RT_CODEX_RUNTIME_DIR="$runtime_dir"' in wrapper
 
     root_probe = subprocess.run(
         [
             str(prefix / "current" / "bin" / "python"),
             "-c",
-            "import _rtcodex; print(_rtcodex.ROUND_ROOT)",
+            (
+                "import _rtcodex, _rtlauncher, _rtlib, _rtruntime; "
+                "print(_rtcodex.ROUND_ROOT)"
+            ),
         ],
         env={
             **packaging_env(home),
@@ -295,7 +389,18 @@ def test_modified_wrapper_makes_uninstall_fail_closed(tmp_path):
     assert (prefix / "install-manifest.json").exists()
 
 
-def test_same_version_reinstall_rejects_modified_installed_tool(tmp_path):
+@pytest.mark.parametrize(
+    ("relative", "expected"),
+    [
+        ("rt-say", "managed tool is missing or modified: rt-say"),
+        ("_rtruntime.py", "managed helper is missing or modified: _rtruntime.py"),
+    ],
+)
+def test_same_version_reinstall_rejects_modified_installed_runtime(
+    tmp_path,
+    relative,
+    expected,
+):
     home = tmp_path / "home"
     home.mkdir()
     prefix = home / ".roundtable"
@@ -310,8 +415,8 @@ def test_same_version_reinstall_rejects_modified_installed_tool(tmp_path):
     )
     assert installed.returncode == 0, installed.stderr
 
-    tool = prefix / "current" / "bin" / "rt-say"
-    tool.write_text("#!/bin/sh\nexit 99\n")
+    managed = prefix / "current" / "bin" / relative
+    managed.write_text("#!/bin/sh\nexit 99\n")
     repeated = run_script(
         INSTALL,
         "--prefix",
@@ -322,8 +427,8 @@ def test_same_version_reinstall_rejects_modified_installed_tool(tmp_path):
     )
 
     assert repeated.returncode == 1
-    assert "managed tool is missing or modified: rt-say" in repeated.stderr
-    assert tool.read_text() == "#!/bin/sh\nexit 99\n"
+    assert expected in repeated.stderr
+    assert managed.read_text() == "#!/bin/sh\nexit 99\n"
 
 
 def test_install_shell_rejects_unsupported_bootstrap_python(tmp_path):
