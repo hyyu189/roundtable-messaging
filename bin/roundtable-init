@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
 import re
 import shutil
@@ -220,11 +219,11 @@ def preflight(project_dir, *, create_root, values, templates):
     else:
         ensure_plain_directory(project_dir, writable=True)
 
-    use_claude_skills = (Path.home() / ".claude").is_dir()
     directory_rels = {
         "handoff",
         "log",
         "skills",
+        ".claude",
         ".roundtable",
         *(
             str(Path(rel).parent)
@@ -232,9 +231,6 @@ def preflight(project_dir, *, create_root, values, templates):
             if str(Path(rel).parent) != "."
         ),
     }
-    if use_claude_skills:
-        directory_rels.add(".claude")
-
     directories = []
     missing_directories = set()
     for rel in sorted(directory_rels, key=lambda value: (len(Path(value).parts), value)):
@@ -284,17 +280,16 @@ def preflight(project_dir, *, create_root, values, templates):
             gitkeeps.append(project_dir / rel / ".gitkeep")
 
     claude_skills = None
-    if use_claude_skills:
-        target = project_dir / ".claude" / "skills"
-        if target.is_symlink():
-            if os.readlink(target) != "../skills":
-                fail(f"refusing foreign symbolic link: {target}")
-        elif target.exists():
-            # A user-managed directory is valid and remains untouched, but a
-            # regular file cannot serve as Claude's project skill directory.
-            ensure_plain_directory(target)
-        else:
-            claude_skills = target
+    target = project_dir / ".claude" / "skills"
+    if target.is_symlink():
+        if os.readlink(target) != "../skills":
+            fail(f"refusing foreign symbolic link: {target}")
+    elif target.exists():
+        # A user-managed directory is valid and remains untouched, but a
+        # regular file cannot serve as Claude's project skill directory.
+        ensure_plain_directory(target)
+    else:
+        claude_skills = target
 
     return {
         "create_root": create_root,
@@ -380,11 +375,6 @@ def main():
 
     values = {
         "project_name": project_name,
-        "project_dir": str(project_dir),
-        # JSON strings are valid YAML scalars. Keep the human-facing path
-        # unquoted for Markdown templates while making agents.yaml safe for
-        # spaces, comment characters, quotes, and other YAML punctuation.
-        "project_dir_yaml": json.dumps(str(project_dir), ensure_ascii=False),
         "date": date.today().isoformat(),
     }
 

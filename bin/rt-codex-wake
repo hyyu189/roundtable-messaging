@@ -890,7 +890,14 @@ def project_config_has_codex(project: Path) -> bool:
     if not isinstance(codex, dict) or codex.get("harness") != "codex":
         return False
     try:
-        project_matches = Path(configured_project).expanduser().resolve() == project
+        configured_path = Path(configured_project).expanduser()
+        # New project configs use ``project: "."`` so a cloned repository keeps
+        # its Roundtable identity. Resolve that value relative to the config's
+        # project root, not the wake bridge's launchd working directory. Keep
+        # accepting absolute paths emitted by older Roundtable releases.
+        if not configured_path.is_absolute():
+            configured_path = project / configured_path
+        project_matches = configured_path.resolve() == project
     except (OSError, RuntimeError):
         project_matches = False
     return project_matches

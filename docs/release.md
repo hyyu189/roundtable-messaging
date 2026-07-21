@@ -169,8 +169,9 @@ Before tagging or attaching the archive to a public release:
 8. `README.md`, `docs/compatibility.md`, provenance, and Devpost copy describe
    only the gates that actually passed.
 
-At this release-candidate stage, the npm cold start and corrected
-launchd-to-socket-peer identity gate have passed on the development machine.
-The current candidate's live host cutover, Codex SessionStart identity spike,
-and full wake E2E have not yet passed. They must not be presented in a video,
-README support table, or Devpost submission as completed evidence.
+At this release-candidate stage, RC5's npm live host cutover, cold start,
+corrected launchd-to-socket-peer identity, SessionStart thread/lease identity,
+and automatic binding have passed on the development machine. Clean-account
+repetition and full credentialed wake E2E have not yet passed. They must not be
+presented in a video, README support table, or Devpost submission as completed
+evidence.

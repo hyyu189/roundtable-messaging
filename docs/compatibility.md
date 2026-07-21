@@ -14,7 +14,7 @@ real vendor session can wake.
 | --- | --- | --- |
 | Claude Code | Global skill link; owned SessionStart inbox hook; owned Stop drain gate; plan/apply/status/remove tests | Clean-account skill discovery and real send-to-wake-to-drain/ack |
 | Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests | Clean-account plugin load/injection and real send-to-wake-to-drain/ack |
-| Codex | Shared executable resolver; global skill link; owned SessionStart auto-bind hook; owned app-server and wake plist generation; fail-closed service preflight tests | Live hook identity spike, coordinated host cutover, and real send-to-wake-to-drain/ack |
+| Codex | Shared executable resolver; global skill link; owned SessionStart auto-bind hook; owned app-server and wake plist generation; fail-closed service preflight tests; development-host cutover and thread/lease identity spike | Clean-account repeat and real send-to-wake-to-drain/ack |
 
 The Codex plist files are written but not loaded by setup. This is an
 intentional safety boundary, not evidence that the daemon is running.
@@ -62,6 +62,19 @@ With no native Hermes arguments, the Roundtable seat launches as
 `hermes --tui`. Any explicit arguments are passed through unchanged, preserving
 oneshot, headless, and management modes; callers can request `--tui` alongside
 resume or other native arguments when desired.
+
+The packaged Hermes plugin starts its fenced inbox watcher from the TUI's
+initial `on_session_reset` event, before the user has sent a first prompt, and
+replaces that watcher on later native session resets. Classic interactive CLI
+sessions use Hermes' direct message-injection API. TUI sessions use Hermes'
+public managed background-completion rail, addressed with the exact native
+session key. A token handshake releases the bounded notification helper only
+after Hermes confirms `notify_on_complete`, avoiding its spawn-before-notify
+race. If the host does not explicitly confirm asynchronous delivery, the
+adapter stops rather than adopting or silently losing the mail. This path was
+inspected against Hermes Agent `0.19.0`; older releases are not yet a support
+claim. These paths have focused automated coverage, but the real credentialed
+send-to-wake-to-drain/ack gate remains required before promotion.
 
 Inside a Roundtable project, each launcher exports `RT_FROM` automatically when
 exactly one configured instance uses that harness. A multi-instance
@@ -164,23 +177,23 @@ operator deliberately running `/clear` inside a nested Codex that inherited
 that lease as a same-user cooperative boundary, not as a supported nested-Codex
 routing topology; stronger per-client lifecycle identity is deferred to P1.
 
-This path has focused automated coverage, but it is not yet a public support
-claim. After the live machine cutover, a real spike must prove that Codex's
-SessionStart `session_id` is the same ID returned by `thread/read` and that the
-private runtime launch intent resolves to the same current fenced lease. That
-is followed by the complete credentialed send-to-wake-to-drain/ack gate.
+This path has focused automated coverage and the installed RC5 proved on the
+development host that Codex's SessionStart `session_id` is the ID returned by
+`thread/read`, while the private runtime launch intent resolves to the same
+current fenced lease. It is still not a public support claim: a clean-account
+repeat and the complete credentialed send-to-wake-to-drain/ack gate remain.
 
 ## Validation matrix
 
 | Codex distribution | CLI | App-server | Result |
 | --- | ---: | ---: | --- |
 | npm | `0.144.6` | isolated `0.144.6` | `initialize`, thread read/list, hooks list, and turn-history protocol smoke passed |
-| npm | `0.144.6` | Roundtable launchd `0.144.6` | live cold start passed; current source proved launchd-to-socket-peer ownership after correcting the fixed standalone-slot metadata assumption; isolated upgrade passed, while live candidate cutover and wake E2E remain pending |
+| npm | `0.144.6` | Roundtable launchd `0.144.6` | RC5 live cutover, cold start, launchd-to-socket-peer ownership, SessionStart thread/lease identity, auto-bind, and isolated upgrade passed; credentialed wake E2E remains pending |
 | standalone | not installed | not installed | resolver and fixtures only; support is not yet claimed |
 | any future or unlisted release | any | any | rejected until explicitly validated |
 
-Before the Build Week release, npm `0.144.6` still needs the live candidate
-cutover plus the real SessionStart and send-to-wake-to-drain/ack gate.
+Before the Build Week release, npm `0.144.6` still needs a clean-account repeat
+plus the real send-to-wake-to-drain/ack gate.
 Standalone support requires an official standalone installation followed by
 the same gate; an app-bundled internal Codex binary does not qualify as the
 standalone distribution.

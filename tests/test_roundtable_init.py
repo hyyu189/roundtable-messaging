@@ -42,6 +42,8 @@ def test_new_project_defaults_to_no_git(tmp_path):
     project = parent / "plain"
     assert result.returncode == 0, result.stderr
     assert (project / ".roundtable" / "agents.yaml").is_file()
+    assert (project / ".claude" / "skills").is_symlink()
+    assert os.readlink(project / ".claude" / "skills") == "../skills"
     assert not (project / ".git").exists()
     assert "git: not initialized (use --git to opt in)" in result.stdout
 
@@ -109,7 +111,7 @@ def test_here_preserves_user_files_and_marked_appends_are_idempotent(tmp_path):
         assert content.count("END Roundtable") == 1
 
 
-def test_here_serializes_yaml_sensitive_project_path_exactly(tmp_path):
+def test_here_writes_a_portable_project_reference_for_yaml_sensitive_path(tmp_path):
     project = tmp_path / "existing ${date} # notes"
     project.mkdir()
 
@@ -119,10 +121,80 @@ def test_here_serializes_yaml_sensitive_project_path_exactly(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert document["project"] == str(project.resolve())
+    assert document["project"] == "."
     assert (project / "README.md").read_text().startswith(
         "# existing ${date} # notes\n"
     )
+
+
+def test_git_commit_is_portable_and_tracks_relative_claude_link(tmp_path):
+    parent = tmp_path / "projects"
+    parent.mkdir()
+
+    result = run_init(tmp_path, "portable", "--parent", str(parent), "--git")
+
+    project = parent / "portable"
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=all"],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert tracked.returncode == 0, tracked.stderr
+    tracked_paths = tracked.stdout.splitlines()
+    assert ".roundtable/agents.yaml" in tracked_paths
+    assert ".roundtable/.gitignore" in tracked_paths
+    assert ".claude/skills" in tracked_paths
+    assert (project / ".claude" / "skills").is_symlink()
+    assert os.readlink(project / ".claude" / "skills") == "../skills"
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == ""
+
+    tracked_text = "\n".join(
+        (project / path).read_text()
+        for path in tracked_paths
+        if (project / path).is_file() and not (project / path).is_symlink()
+    )
+    assert str(project.resolve()) not in tracked_text
+    assert str(tmp_path.resolve()) not in tracked_text
+
+
+def test_here_preserves_user_managed_claude_skills_directory_unignored(tmp_path):
+    project = tmp_path / "existing-project"
+    user_skill = project / ".claude" / "skills" / "private" / "SKILL.md"
+    user_skill.parent.mkdir(parents=True)
+    user_skill.write_text("user managed\n")
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"],
+        cwd=project,
+        check=True,
+    )
+
+    result = run_init(tmp_path, "--here", cwd=project)
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", ".claude/skills/private/SKILL.md"],
+        cwd=project,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert user_skill.read_text() == "user managed\n"
+    assert (project / ".claude" / "skills").is_dir()
+    assert not (project / ".claude" / "skills").is_symlink()
+    assert ".claude/skills" not in (project / ".gitignore").read_text().splitlines()
+    assert ignored.returncode == 1
 
 
 def test_here_recognizes_an_existing_generated_project_from_an_earlier_date(tmp_path):

@@ -8,9 +8,10 @@ harnesses through native mechanisms instead of injecting keystrokes.
 > pass automated clean-home install, setup, core smoke, and uninstall
 > tests. The result is a release candidate, not yet a public support claim: the
 > npm Codex cold start and the corrected launchd-to-socket-peer identity check
-> have passed on the development machine. The SessionStart identity spike,
-> real credentialed harness wake tests, and the mainstream terminal matrix
-> remain promotion gates.
+> have passed on the development machine. The installed RC5 also passed the
+> SessionStart thread/lease identity and automatic-binding spike. Real
+> credentialed harness wake tests and the mainstream terminal matrix remain
+> promotion gates.
 
 ## Why it exists
 
@@ -62,7 +63,7 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
-| npm Codex CLI `0.144.6` | Exact-release protocol smoke, live cold start, launchd-to-socket-peer identity, isolated upgrade, and automated service/auto-bind coverage pass; live candidate cutover, hook identity, and full wake E2E remain release gates |
+| npm Codex CLI `0.144.6` | Exact-release protocol smoke, live RC5 cutover, cold start, launchd-to-socket-peer identity, SessionStart thread/lease identity, auto-bind, and isolated upgrade pass; full credentialed wake E2E remains a release gate |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
 | tmux and cross-host SSH | Not yet supported |
@@ -166,12 +167,12 @@ iTerm2, Ghostty, or another normal terminal; cmux supplies optional topology and
 workspace affordances only. tmux lifecycle integration and cross-host SSH
 transport are not P0 features.
 
-The remaining Codex promotion gate is a real clean-account spike proving that
-the trusted hook's `session_id` is the same native thread ID read through the
-app-server and that the launcher's private runtime intent resolves to the same
-current fenced lease, followed by credentialed send-to-wake-to-drain/ack E2E.
-Until that passes, automatic binding is release-candidate behavior rather than
-a public support claim.
+The development machine has proved that the trusted hook's `session_id` is the
+same native thread ID read through the app-server and that the launcher's
+private runtime intent resolves to the same current fenced lease. The remaining
+Codex promotion gate is a clean-account repeat plus credentialed
+send-to-wake-to-drain/ack E2E; automatic binding therefore remains
+release-candidate behavior rather than a public support claim.
 
 ## Development install
 

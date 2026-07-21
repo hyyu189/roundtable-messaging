@@ -9,8 +9,12 @@ validating the lease and watching the durable maildir.
 from __future__ import annotations
 
 import atexit
+import hashlib
+import json
 import os
 from pathlib import Path
+import secrets
+import shlex
 import shutil
 import subprocess
 import threading
@@ -28,6 +32,9 @@ _HEARTBEAT_MARKER = "rt-wait-inbox: heartbeat timeout after "
 _SUPERSEDED_MARKER = "rt-wait-inbox: seat lease or watcher was superseded"
 _MAIL_DRAIN_POLL_SECONDS = 0.25
 _STOP_JOIN_SECONDS = 2.0
+_TUI_SENTINEL_POLLS = 150
+_TUI_SENTINEL_POLL_SECONDS = 0.1
+_TUI_RELEASE_TIMEOUT_SECONDS = 5
 
 _MAIL_MESSAGE = (
     "[Roundtable] New durable mail is waiting. Run `rt-inbox`, process the "
@@ -94,10 +101,12 @@ class _RoundtableBridge:
         self._closed = False
         self._diagnostic_sent = False
 
-    def on_session_start(self, **_kwargs: Any) -> None:
+    def on_session_start(self, **kwargs: Any) -> None:
         environment = _activation_environment()
         if environment is None:
             return
+        session_id = str(kwargs.get("session_id") or "").strip()
+        platform = str(kwargs.get("platform") or "").strip().lower()
 
         with self._lock:
             if self._closed or (
@@ -112,11 +121,20 @@ class _RoundtableBridge:
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._watch,
-                args=(environment, waiter),
+                args=(environment, waiter, session_id, platform),
                 name="roundtable-hermes-watcher",
                 daemon=True,
             )
             self._thread.start()
+
+    def on_session_reset(self, **kwargs: Any) -> None:
+        # The TUI gateway publishes its initial built session, as well as
+        # /new and /reset replacements, through on_session_reset.  Stop any
+        # prior watcher first so an unexpected unpaired reset can never leave
+        # two consumers racing on one durable inbox.  A later first-turn
+        # on_session_start is idempotent while this replacement is alive.
+        self._shutdown(permanent=False)
+        self.on_session_start(**kwargs)
 
     def on_session_finalize(self, **_kwargs: Any) -> None:
         # Hermes can finalize one native session and start another inside the
@@ -159,7 +177,13 @@ class _RoundtableBridge:
                     self._diagnostic_sent = False
                     self._stop.clear()
 
-    def _watch(self, environment: dict[str, str], waiter: str) -> None:
+    def _watch(
+        self,
+        environment: dict[str, str],
+        waiter: str,
+        session_id: str,
+        platform: str,
+    ) -> None:
         project_root = Path(environment["RT_PROJECT_ROOT"]).expanduser()
         agent = environment["RT_FROM"]
 
@@ -201,7 +225,11 @@ class _RoundtableBridge:
 
             output = output or ""
             if process.returncode == 0 and _MAIL_MARKER in output:
-                if not self._inject(_MAIL_MESSAGE):
+                if not self._deliver(
+                    _MAIL_MESSAGE,
+                    session_id=session_id,
+                    platform=platform,
+                ):
                     self._fail(_CONFIG_MESSAGE)
                     return
                 while (
@@ -220,6 +248,143 @@ class _RoundtableBridge:
 
             self._fail(_CONFIG_MESSAGE)
             return
+
+    def _deliver(
+        self,
+        message: str,
+        *,
+        session_id: str,
+        platform: str,
+    ) -> bool:
+        """Deliver through the native host path for this Hermes surface."""
+
+        if self._inject(message):
+            return True
+        if platform != "tui" or not session_id:
+            return False
+
+        # Hermes deliberately exposes inject_message only to the classic
+        # interactive CLI.  Its public, session-agnostic dispatch_tool API is
+        # the supported bridge for gateway/TUI plugins.  Run a real bounded
+        # process whose completion carries the exact durable session key;
+        # Hermes' TUI notification poller then positive-proofs ownership and
+        # starts the recipient turn.
+        dispatcher = getattr(self._ctx, "dispatch_tool", None)
+        if not callable(dispatcher):
+            return False
+
+        # terminal(background=True) starts its process before Hermes records
+        # notify_on_complete.  A one-shot command could therefore exit inside
+        # that host race. Use a unique capability token and a token-salted
+        # hashed /tmp path instead: the helper cannot exit successfully until the
+        # foreground release call returns from the same exact session key. The
+        # random token also salts the hashed filename, preventing a stale file
+        # or predictable /tmp symlink from colliding with a new activation.
+        token = secrets.token_hex(32)
+        sentinel_digest = hashlib.sha256(
+            f"{session_id}\0{token}".encode("utf-8")
+        ).hexdigest()
+        sentinel = f"/tmp/roundtable-hermes-{sentinel_digest}.sentinel"
+        quoted_sentinel = shlex.quote(sentinel)
+        quoted_token = shlex.quote(token)
+        wait_command = (
+            f"rt_sentinel={quoted_sentinel}; rt_token={quoted_token}; rt_i=0; "
+            f"while [ \"$rt_i\" -lt {_TUI_SENTINEL_POLLS} ]; do "
+            "if [ -f \"$rt_sentinel\" ] && "
+            "[ \"$(/bin/cat \"$rt_sentinel\" 2>/dev/null)\" = "
+            "\"$rt_token\" ]; then "
+            f"/usr/bin/printf '%s\\n' {shlex.quote(message)}; exit 0; "
+            "fi; rt_i=$((rt_i + 1)); "
+            f"/bin/sleep {_TUI_SENTINEL_POLL_SECONDS}; done; exit 1"
+        )
+        release_command = (
+            "umask 077; set -C; "
+            f"/usr/bin/printf '%s' {quoted_token} > {quoted_sentinel}"
+        )
+
+        try:
+            raw_background = dispatcher(
+                "terminal",
+                {
+                    "command": wait_command,
+                    "background": True,
+                    "notify_on_complete": True,
+                    "pty": False,
+                },
+                task_id=session_id,
+            )
+        except Exception:
+            return False
+
+        background = self._decode_dispatch_result(raw_background)
+        raw_process_id = background.get("session_id") if background else None
+        process_id = (
+            raw_process_id.strip()
+            if isinstance(raw_process_id, str)
+            else ""
+        )
+        if not (
+            process_id
+            and background is not None
+            and background.get("notify_on_complete") is True
+            and not background.get("error")
+        ):
+            if process_id:
+                self._cleanup_dispatched_process(
+                    dispatcher, process_id=process_id, session_id=session_id
+                )
+            return False
+
+        try:
+            raw_release = dispatcher(
+                "terminal",
+                {
+                    "command": release_command,
+                    "background": False,
+                    "timeout": _TUI_RELEASE_TIMEOUT_SECONDS,
+                    "pty": False,
+                },
+                task_id=session_id,
+            )
+        except Exception:
+            raw_release = None
+        release = self._decode_dispatch_result(raw_release)
+        if release is not None and release.get("exit_code") == 0 and not release.get(
+            "error"
+        ):
+            return True
+
+        self._cleanup_dispatched_process(
+            dispatcher, process_id=process_id, session_id=session_id
+        )
+        return False
+
+    @staticmethod
+    def _decode_dispatch_result(raw_result: Any) -> dict[str, Any] | None:
+        try:
+            result = (
+                json.loads(raw_result)
+                if isinstance(raw_result, str)
+                else raw_result
+            )
+        except (TypeError, ValueError):
+            return None
+        return result if isinstance(result, dict) else None
+
+    @staticmethod
+    def _cleanup_dispatched_process(
+        dispatcher: Any, *, process_id: str, session_id: str
+    ) -> None:
+        try:
+            dispatcher(
+                "process",
+                {"action": "kill", "session_id": process_id},
+                task_id=session_id,
+            )
+        except Exception:
+            # Delivery already failed closed. Cleanup is best-effort and an
+            # explicit process kill consumes any completion Hermes observed.
+            pass
 
     def _inject(self, message: str) -> bool:
         try:
@@ -268,5 +433,6 @@ def register(ctx: Any) -> None:
 
     bridge = _RoundtableBridge(ctx)
     ctx.register_hook("on_session_start", bridge.on_session_start)
+    ctx.register_hook("on_session_reset", bridge.on_session_reset)
     ctx.register_hook("on_session_finalize", bridge.on_session_finalize)
     atexit.register(bridge.close)

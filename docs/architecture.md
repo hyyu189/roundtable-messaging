@@ -90,6 +90,14 @@ project-identity requirement and is initialized only with `--git`. The
 unified `roundtable` command exposes this as the default interactive journey;
 the individual harness launchers retain their scriptable entry points.
 
+Generated project identity is repository-relative: `agents.yaml` stores
+`project: "."`, which consumers resolve against the directory that owns the
+configuration. This keeps a cloned project portable while retaining support
+for older absolute-path configs. Runtime mailboxes stay project-local and
+ignored. The Claude project-skill bridge is a portable relative symlink and is
+part of the optional initial commit; an existing user-managed skills directory
+is preserved instead.
+
 ## P0 state placement and session ownership
 
 Roundtable separates project facts from facts that are meaningful only on one

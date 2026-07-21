@@ -105,6 +105,41 @@ def test_project_config_parser_preserves_yaml_comment_characters(tmp_path):
     assert wake.project_config_has_codex(project.resolve()) is True
 
 
+def test_project_config_resolves_relative_project_from_config_root(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "portable-project"
+    state = project / ".roundtable"
+    state.mkdir(parents=True)
+    (state / "agents.yaml").write_text(
+        "schema: roundtable.agents.v1\n"
+        'project: "."\n'
+        "agents:\n"
+        "  codex:\n"
+        "    harness: codex\n"
+    )
+    elsewhere = tmp_path / "wake-launchd-cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert wake.project_config_has_codex(project.resolve()) is True
+
+
+def test_project_config_rejects_relative_project_outside_config_root(tmp_path):
+    project = tmp_path / "configured-project"
+    state = project / ".roundtable"
+    state.mkdir(parents=True)
+    (state / "agents.yaml").write_text(
+        "schema: roundtable.agents.v1\n"
+        'project: "../other"\n'
+        "agents:\n"
+        "  codex:\n"
+        "    harness: codex\n"
+    )
+
+    assert wake.project_config_has_codex(project.resolve()) is False
+
+
 def add_mail(project: Path, msg_id: str) -> Path:
     inbox = project / ".roundtable" / "inbox" / "codex" / "new"
     inbox.mkdir(parents=True, exist_ok=True)

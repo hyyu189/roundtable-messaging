@@ -8,9 +8,10 @@ manifest and stops before overwriting an unrelated or locally modified path.
 
 The source-install path and extracted offline artifact pass automated
 clean-home installation, repeated-install, conflict, command, harness-setup,
-core-smoke, and uninstall tests. The artifact remains a release candidate until
-the Codex SessionStart identity spike passes and real credentialed harness wake
-tests plus the terminal UX matrix pass the promotion gates.
+core-smoke, and uninstall tests. RC5's development-host Codex SessionStart
+thread/lease identity and automatic binding spike also passed. The artifact
+remains a release candidate until clean-account repetition, real credentialed
+harness wake tests, and the terminal UX matrix pass the promotion gates.
 
 To preview the managed installer without touching a live installation, use
 isolated paths:
@@ -88,6 +89,15 @@ folder, lists only seats whose harness executable is available (and marks
 configured-but-missing harnesses unavailable), previews missing one-time
 integration for the chosen harness, and asks before applying any owned
 configuration. Git is optional and a project may be a non-code folder.
+
+New project scaffolds are path-portable: the committed
+`.roundtable/agents.yaml` records `project: "."`, while runtime inboxes remain
+ignored. Harness orientation files likewise use the project-relative cwd, and
+the portable `.claude/skills -> ../skills` bridge is included in the optional
+initial Git commit. An existing user-managed Claude skills directory is
+preserved and never hidden by a generated ignore rule. Existing absolute-path
+Roundtable configs remain readable and are not rewritten behind the user's
+back.
 
 The equivalent standalone controls are intentionally explicit:
 

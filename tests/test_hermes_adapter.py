@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -10,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "integrations" / "hermes" / "roundtable" / "__init__.py"
+MANIFEST = ROOT / "integrations" / "hermes" / "roundtable" / "plugin.yaml"
 
 
 def _load_plugin():
@@ -21,12 +23,26 @@ def _load_plugin():
 
 
 class FakeContext:
-    def __init__(self, *, inject_result=True, inject_error=None) -> None:
+    def __init__(
+        self,
+        *,
+        inject_result=True,
+        inject_error=None,
+        dispatch_result=None,
+        dispatch_results=None,
+        dispatch_error=None,
+    ) -> None:
         self.hooks = {}
         self.injected: list[tuple[str, str]] = []
         self.injected_event = threading.Event()
         self.inject_result = inject_result
         self.inject_error = inject_error
+        self.dispatch_result = dispatch_result
+        self.dispatch_results = (
+            list(dispatch_results) if dispatch_results is not None else None
+        )
+        self.dispatch_error = dispatch_error
+        self.dispatch_calls = []
 
     def register_hook(self, name, callback) -> None:
         self.hooks[name] = callback
@@ -37,6 +53,17 @@ class FakeContext:
         if self.inject_error is not None:
             raise self.inject_error
         return self.inject_result
+
+    def dispatch_tool(self, name, args, **kwargs):
+        self.dispatch_calls.append((name, args, kwargs))
+        if self.dispatch_error is not None:
+            raise self.dispatch_error
+        if self.dispatch_results is not None:
+            result = self.dispatch_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        return self.dispatch_result
 
 
 class FakeProcess:
@@ -116,6 +143,20 @@ def _wait_until(predicate, timeout=2.0):
     raise AssertionError("condition did not become true")
 
 
+def test_registers_classic_and_tui_session_hooks_declared_by_manifest():
+    plugin = _load_plugin()
+    context = FakeContext()
+
+    plugin.register(context)
+
+    assert {
+        "on_session_start",
+        "on_session_reset",
+        "on_session_finalize",
+    }.issubset(context.hooks)
+    assert "  - on_session_reset\n" in MANIFEST.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     "missing",
     ["RT_PROJECT_ROOT", "RT_FROM", "RT_SESSION_ID", "RT_LEASE_REVISION"],
@@ -164,6 +205,240 @@ def test_activation_prefers_managed_waiter_and_restarts_after_heartbeat(
 
     context.hooks["on_session_finalize"]()
     assert blocking.terminated
+
+
+def test_tui_reset_starts_and_restarts_without_watcher_overlap(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    _set_activation(monkeypatch, tmp_path)
+    first = FakeProcess()
+    second = FakeProcess()
+    popen = FakePopen([first, second])
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+    context = FakeContext()
+
+    plugin.register(context)
+    context.hooks["on_session_reset"](
+        session_id="tui-session-1", platform="tui"
+    )
+    assert first.communicating.wait(1)
+
+    # Hermes may emit classic on_session_start on the first turn after its
+    # initial TUI reset.  It must not create a second watcher.
+    context.hooks["on_session_start"](
+        session_id="tui-session-1", platform="tui"
+    )
+    time.sleep(0.05)
+    assert len(popen.calls) == 1
+
+    # A reset is a session replacement even if a host omits the usual
+    # preceding finalize.  The old process must be fully reaped first.
+    context.hooks["on_session_reset"](
+        session_id="tui-session-2", platform="tui"
+    )
+    assert first.terminated
+    assert first.returncode == -15
+    assert second.communicating.wait(1)
+    assert len(popen.calls) == 2
+
+    context.hooks["on_session_finalize"]()
+    assert second.terminated
+
+
+def _start_tui_mail(plugin, tmp_path, monkeypatch, context, *, session_id):
+    project, _waiter = _set_activation(monkeypatch, tmp_path)
+    new_dir = project / ".roundtable" / "inbox" / "hermes" / "new"
+    new_dir.mkdir(parents=True)
+    (new_dir / "message-1").write_text("pending", encoding="utf-8")
+    popen = FakePopen(
+        [("rt-wait-inbox: mail after 5s:\nmessage-1\n", 0)]
+    )
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+
+    plugin.register(context)
+    context.hooks["on_session_reset"](
+        session_id=session_id, platform="tui"
+    )
+    return project, popen
+
+
+def test_tui_mail_handshake_uses_exact_session_key_and_call_order(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin.secrets, "token_hex", lambda size: "ab" * size)
+    context = FakeContext(
+        inject_result=False,
+        dispatch_results=[
+            (
+                '{"session_id":"process-1","notify_on_complete":true,'
+                '"error":null}'
+            ),
+            '{"exit_code":0,"error":null}',
+        ],
+    )
+
+    _project, _popen = _start_tui_mail(
+        plugin,
+        tmp_path,
+        monkeypatch,
+        context,
+        session_id="tui-session-key",
+    )
+    _wait_until(lambda: len(context.dispatch_calls) == 2)
+
+    background_name, background_args, background_kwargs = (
+        context.dispatch_calls[0]
+    )
+    release_name, release_args, release_kwargs = context.dispatch_calls[1]
+    assert [background_name, release_name] == ["terminal", "terminal"]
+    assert background_kwargs == release_kwargs == {
+        "task_id": "tui-session-key"
+    }
+    assert background_args["background"] is True
+    assert background_args["notify_on_complete"] is True
+    assert background_args["pty"] is False
+    assert "workdir" not in background_args
+    assert plugin._MAIL_MESSAGE in background_args["command"]
+    assert set(release_args) == {"command", "background", "timeout", "pty"}
+    assert release_args["background"] is False
+    assert release_args["timeout"] == plugin._TUI_RELEASE_TIMEOUT_SECONDS
+    assert release_args["pty"] is False
+
+    path_pattern = r"/tmp/roundtable-hermes-[0-9a-f]{64}\.sentinel"
+    background_paths = set(re.findall(path_pattern, background_args["command"]))
+    release_paths = set(re.findall(path_pattern, release_args["command"]))
+    expected_digest = plugin.hashlib.sha256(
+        b"tui-session-key\0" + ("ab" * 32).encode("utf-8")
+    ).hexdigest()
+    expected_path = f"/tmp/roundtable-hermes-{expected_digest}.sentinel"
+    assert background_paths == release_paths == {expected_path}
+    assert "ab" * 32 in background_args["command"]
+    assert "ab" * 32 in release_args["command"]
+    assert "/bin/rm" not in background_args["command"]
+    assert "/bin/mv" not in release_args["command"]
+    assert context.injected == [(plugin._MAIL_MESSAGE, "user")]
+
+    context.hooks["on_session_finalize"]()
+
+
+def test_tui_release_failure_kills_spawned_notification_process(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    context = FakeContext(
+        inject_result=False,
+        dispatch_results=[
+            (
+                '{"session_id":"process-1","notify_on_complete":true,'
+                '"error":null}'
+            ),
+            '{"exit_code":1,"error":"release failed"}',
+            '{"status":"killed","session_id":"process-1"}',
+        ],
+    )
+
+    _project, popen = _start_tui_mail(
+        plugin,
+        tmp_path,
+        monkeypatch,
+        context,
+        session_id="tui-session-key",
+    )
+    _wait_until(lambda: len(context.injected) == 2)
+
+    assert [call[0] for call in context.dispatch_calls] == [
+        "terminal",
+        "terminal",
+        "process",
+    ]
+    assert all(
+        call[2] == {"task_id": "tui-session-key"}
+        for call in context.dispatch_calls
+    )
+    assert context.dispatch_calls[-1][1] == {
+        "action": "kill",
+        "session_id": "process-1",
+    }
+    assert "invalid" in context.injected[-1][0]
+
+    context.hooks["on_session_reset"](
+        session_id="tui-session-key-2", platform="tui"
+    )
+    time.sleep(0.05)
+    assert len(popen.calls) == 1
+
+
+def test_tui_unsupported_background_dispatch_is_killed_before_release(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    context = FakeContext(
+        inject_result=False,
+        dispatch_results=[
+            (
+                '{"session_id":"process-1","notify_on_complete":false,'
+                '"notify_unsupported":"stateless host","error":null}'
+            ),
+            '{"status":"killed","session_id":"process-1"}',
+        ],
+    )
+
+    _project, _popen = _start_tui_mail(
+        plugin,
+        tmp_path,
+        monkeypatch,
+        context,
+        session_id="tui-session-key",
+    )
+    _wait_until(lambda: len(context.injected) == 2)
+
+    assert [call[0] for call in context.dispatch_calls] == [
+        "terminal",
+        "process",
+    ]
+    assert context.dispatch_calls[-1][1] == {
+        "action": "kill",
+        "session_id": "process-1",
+    }
+    assert all(
+        call[2] == {"task_id": "tui-session-key"}
+        for call in context.dispatch_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "background_result",
+    [
+        "{not-json",
+        '{"session_id":null,"notify_on_complete":false,"error":null}',
+    ],
+    ids=["malformed-json", "null-process-id"],
+)
+def test_tui_unaddressable_background_result_fails_without_release(
+    tmp_path, monkeypatch, background_result
+):
+    plugin = _load_plugin()
+    context = FakeContext(
+        inject_result=False,
+        dispatch_results=[background_result],
+    )
+
+    _project, _popen = _start_tui_mail(
+        plugin,
+        tmp_path,
+        monkeypatch,
+        context,
+        session_id="tui-session-key",
+    )
+    _wait_until(lambda: len(context.injected) == 2)
+
+    assert len(context.dispatch_calls) == 1
+    assert context.dispatch_calls[0][0] == "terminal"
+    assert context.dispatch_calls[0][2] == {
+        "task_id": "tui-session-key"
+    }
 
 
 def test_mail_is_injected_once_until_non_ack_mail_is_drained(
