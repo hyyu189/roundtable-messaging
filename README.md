@@ -21,7 +21,7 @@ separates durable delivery from wake-up:
 
 1. a sender atomically writes a message into the recipient's project mailbox;
 2. an optional harness adapter wakes an online recipient;
-3. the recipient drains, acknowledges, and archives the message;
+3. the recipient acts, then `rt-ack` acknowledges and archives the message;
 4. an offline recipient keeps the message until it returns.
 
 The core has no terminal-emulator dependency. Terminal.app, iTerm2, Ghostty,
@@ -59,7 +59,7 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 
 | Surface | Status |
 | --- | --- |
-| Installer runtime | Requires an existing CPython 3.11–3.14; the archive bundles all Python package dependencies, not the interpreter |
+| Installer runtime | Requires an existing CPython 3.11–3.14; the installer discovers versioned executables on PATH, while the archive bundles package dependencies but not the interpreter |
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
@@ -88,8 +88,8 @@ and multi-auth switching are roadmap items.
 The judge and new-user path begins with the release artifact, not a source
 checkout or rebuild. It requires an existing CPython 3.11 through 3.14; the
 archive is offline for package dependencies but does not bundle CPython. The
-installer explains how to select a supported interpreter if `python3` is not
-the right one:
+installer tries `python3.14` through `python3.11` before the generic `python3`,
+and explains how to select a supported interpreter if none is on PATH:
 
 ```bash
 tar -xzf roundtable-messaging-<version>-macos.tar.gz
@@ -158,7 +158,7 @@ roundtable setup                  read-only harness integration preview
 roundtable doctor                 diagnose setup, leases, and wake services
 rt-say AGENT KIND "MESSAGE"       deliver durable mail
 rt-inbox                          inspect waiting mail
-rt-ack ID                         acknowledge a message
+rt-ack ID                         acknowledge and archive a message
 ```
 
 All participants in one Roundtable currently run on the same host. The durable

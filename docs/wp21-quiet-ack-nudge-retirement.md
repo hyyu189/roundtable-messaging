@@ -11,6 +11,13 @@ both that filename and the legacy `<msgid>.md` spelling for sync acknowledgement
 Wake and stop-gate consumers ignore `ack-*`; an already-awake agent can drain
 them normally.
 
+After the quiet acknowledgement is durably published, `rt-ack` also moves each
+exact processed inbound file from the recipient's `new/` directory to `cur/`.
+An acknowledgement failure leaves the inbound file untouched; an archive
+conflict never overwrites an existing `cur/` entry. This keeps the logical
+inbox view and the physical watcher state consistent, so native adapters can
+re-arm without relying on an agent to construct a separate `mv` command.
+
 ## Sole normal delivery path
 
 This document originally introduced per-agent `maildir` versus `dual`

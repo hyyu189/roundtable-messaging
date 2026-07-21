@@ -25,8 +25,9 @@ Each dependency filename, official `files.pythonhosted.org` URL, and SHA-256
 digest is pinned in `scripts/build_release.py`. Downloads and caller-provided
 offline wheels are verified against those digests.
 
-The archive does not bundle a Python interpreter. Installation requires an
-existing CPython 3.11 through 3.14 and fails before writing anything if that
+The archive does not bundle a Python interpreter. Installation searches the
+versioned `python3.14` through `python3.11` commands before generic `python3`,
+requires CPython 3.11 through 3.14, and fails before writing anything if that
 prerequisite is absent or unsupported. This is an explicit candidate support
 boundary, not a claim that stock macOS alone is sufficient.
 

@@ -6,7 +6,7 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 7.0.0
+version: 7.1.0
 author: Roundtable contributors
 license: MIT
 platforms: [macos]
@@ -81,7 +81,7 @@ roundtable-init new-git-project --git
 | `roundtable-init --here` / `roundtable-init NAME` | Adopt the current directory or create and register a project; add `--git` only when wanted. |
 | `rt-claude` / `rt-hermes` / `rt-codex` | Claim a fenced project seat and launch the real harness executable. |
 | `rt-say <agent> <kind> "body"` | Write the message into the target's project mailbox (atomic maildir). |
-| `rt-ack <id>[,<id>...] ["note"]` | Acknowledge received message(s). Comma-batches. Lands as a quiet `ack-*` file. |
+| `rt-ack <id>[,<id>...] ["note"]` | Acknowledge and archive received message(s). Comma-batches. The sender gets a quiet `ack-*` file. |
 | `rt-inbox` | List un-ack'd inbound messages. |
 | `rt-projects <list\|add\|rm>` | Maintain the validated project registry (single discovery source). |
 | `rt-doctor` | Health checks: daemon, socket, RPC, version, bridge, registry, anchor audit. |
@@ -112,9 +112,13 @@ named `new/ack-<msgid>.md`: quiet confirmations that never wake anyone and
 never block a stop; drain them whenever you are awake for another reason.
 
 **Receiving (drain protocol)** — when woken by a tripwire/bridge or told the
-inbox has mail: read every file in `inbox/<you>/new/`, act on each, `rt-ack`
-the ids (comma-batch), `mv` the files to `inbox/<you>/cur/`, then **re-arm**
-before going idle.
+inbox has mail: run `rt-inbox -f json`, act on every non-ack message, then
+`rt-ack` the ids (comma-batch). A successful `rt-ack` sends the quiet
+confirmation and atomically archives those exact inbound files from `new/` to
+`cur/`; a failed acknowledgement leaves them in `new/`. Move any quiet
+`ack-*` files to `cur/` without acknowledging them. Hermes and Codex re-arm
+automatically after the triggered non-ack generation is archived; Claude must
+follow any re-arm instruction from its Stop hook.
 
 **Arming (Claude)** — the setup-owned SessionStart hook launches the fenced
 inbox watcher for a Roundtable-launched session. Its Stop hook prevents Claude
@@ -159,8 +163,8 @@ in `~/.roundtable/docs/legacy-v1-keyboard.md`; human-coordinated use only.
 
 1. Inbound arrives as a mail file `[FROM→YOU kind id=<msg_id>] body`.
 2. Do what it asks.
-3. `rt-ack <msg_id> ["note"]` — batch with commas. Ack because it's the
-   sender's only delivery confirmation.
+3. `rt-ack <msg_id> ["note"]` — batch with commas. This both sends the
+   sender's delivery confirmation and archives the processed inbound message.
 
 ## When mail sits unanswered
 

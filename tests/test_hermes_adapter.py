@@ -478,6 +478,70 @@ def test_mail_is_injected_once_until_non_ack_mail_is_drained(
     assert blocking.terminated
 
 
+def test_mail_arriving_during_drain_gets_its_own_wake_generation(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "_MAIL_DRAIN_POLL_SECONDS", 0.01)
+    project, _waiter = _set_activation(monkeypatch, tmp_path)
+    new_dir = project / ".roundtable" / "inbox" / "hermes" / "new"
+    new_dir.mkdir(parents=True)
+    first = new_dir / "message-1"
+    first.write_text("first", encoding="utf-8")
+    blocking = FakeProcess()
+    popen = FakePopen(
+        [
+            ("rt-wait-inbox: mail after 5s:\nmessage-1\n", 0),
+            ("rt-wait-inbox: mail after 0s:\nmessage-2\n", 0),
+            blocking,
+        ]
+    )
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+    context = FakeContext()
+
+    plugin.register(context)
+    context.hooks["on_session_start"]()
+    _wait_until(lambda: len(context.injected) == 1)
+
+    second = new_dir / "message-2"
+    second.write_text("arrived during first turn", encoding="utf-8")
+    time.sleep(0.05)
+    assert len(context.injected) == 1
+    assert len(popen.calls) == 1
+
+    first.unlink()
+    _wait_until(lambda: len(context.injected) == 2)
+    assert len(popen.calls) == 2
+
+    second.unlink()
+    _wait_until(lambda: len(popen.calls) == 3)
+    context.hooks["on_session_finalize"]()
+    assert blocking.terminated
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "rt-wait-inbox: mail after 5s:\n",
+        "rt-wait-inbox: mail after 5s:\n../outside\n",
+        "rt-wait-inbox: mail after 5s:\nack-quiet\n",
+        "rt-wait-inbox: mail after 5s:\n padded-name\n",
+    ],
+)
+def test_invalid_waiter_generation_fails_closed(tmp_path, monkeypatch, output):
+    plugin = _load_plugin()
+    _set_activation(monkeypatch, tmp_path)
+    popen = FakePopen([(output, 0)])
+    monkeypatch.setattr(plugin.subprocess, "Popen", popen)
+    context = FakeContext()
+
+    plugin.register(context)
+    context.hooks["on_session_start"]()
+    _wait_until(lambda: context.injected == [(plugin._CONFIG_MESSAGE, "user")])
+
+    assert len(popen.calls) == 1
+
+
 @pytest.mark.parametrize(
     "context",
     [

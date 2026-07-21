@@ -276,7 +276,7 @@ def test_ack_infers_sender_from_message_recipient_without_cmux(tmp_path):
     project = tmp_path / "project"
     state = write_project(project)
     original = "20260718T120000Z-codex-to-claude-101"
-    write_mail(state, original, "codex", "claude")
+    mail = write_mail(state, original, "codex", "claude")
 
     result = run_tool("rt-ack", original, "received", cwd=project)
 
@@ -287,7 +287,123 @@ def test_ack_infers_sender_from_message_recipient_without_cmux(tmp_path):
     ack = ack_files[0].read_text()
     assert ack.startswith("[CLAUDE→CODEX sync-ack id=")
     assert f"refs={original} received" in ack
+    archived = mail.parents[1] / "cur" / mail.name
+    assert not mail.exists()
+    assert archived.read_text() == (
+        f"[CODEX→CLAUDE directive id={original}] test"
+    )
     assert "Traceback" not in result.stderr
+
+
+def test_ack_failure_never_archives_inbound_mail(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120001Z-codex-to-claude-106"
+    mail = write_mail(state, original, "codex", "claude")
+    (state / "inbox" / "codex").write_text("blocks ack delivery")
+
+    result = run_tool("rt-ack", original, cwd=project)
+
+    assert result.returncode != 0
+    assert "failed to publish inbox message" in result.stderr
+    assert mail.is_file()
+    assert not (mail.parents[1] / "cur" / mail.name).exists()
+
+
+def test_ack_archives_only_exact_batch_refs(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    first = "20260718T120002Z-codex-to-claude-107"
+    second = "20260718T120003Z-codex-to-claude-108"
+    unrelated = "20260718T120004Z-codex-to-claude-109"
+    first_mail = write_mail(state, first, "codex", "claude", "first")
+    second_mail = write_mail(state, second, "codex", "claude", "second")
+    unrelated_mail = write_mail(state, unrelated, "codex", "claude", "keep")
+
+    result = run_tool("rt-ack", f"{first},{second}", cwd=project)
+
+    assert result.returncode == 0, result.stderr
+    cur = first_mail.parents[1] / "cur"
+    assert (cur / first_mail.name).is_file()
+    assert (cur / second_mail.name).is_file()
+    assert not first_mail.exists()
+    assert not second_mail.exists()
+    assert unrelated_mail.is_file()
+    assert not (cur / unrelated_mail.name).exists()
+
+
+def test_ack_is_idempotent_when_mail_is_already_archived_or_missing(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    archived_ref = "20260718T120005Z-codex-to-claude-110"
+    missing_ref = "20260718T120006Z-codex-to-claude-111"
+    mail = write_mail(state, archived_ref, "codex", "claude", "archived")
+    cur = mail.parents[1] / "cur"
+    cur.mkdir()
+    archived = cur / mail.name
+    mail.rename(archived)
+
+    result = run_tool(
+        "rt-ack", f"{archived_ref},{missing_ref}", cwd=project
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert archived.read_text().endswith(" archived")
+    assert not mail.exists()
+    assert not (cur / f"{missing_ref}.md").exists()
+
+
+def test_ack_finishes_interrupted_same_inode_archive(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120007Z-codex-to-claude-112"
+    mail = write_mail(state, original, "codex", "claude", "recover")
+    cur = mail.parents[1] / "cur"
+    cur.mkdir()
+    archived = cur / mail.name
+    os.link(mail, archived)
+    assert mail.stat().st_ino == archived.stat().st_ino
+
+    result = run_tool("rt-ack", original, cwd=project)
+
+    assert result.returncode == 0, result.stderr
+    assert not mail.exists()
+    assert archived.read_text().endswith(" recover")
+
+
+def test_ack_reports_committed_ack_without_overwriting_archive_conflict(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    original = "20260718T120008Z-codex-to-claude-113"
+    mail = write_mail(state, original, "codex", "claude", "new copy")
+    cur = mail.parents[1] / "cur"
+    cur.mkdir()
+    conflict = cur / mail.name
+    conflict.write_text("different archived copy")
+
+    result = run_tool("rt-ack", original, cwd=project)
+
+    assert result.returncode != 0
+    assert "acknowledgement delivered" in result.stderr
+    assert "failed to archive inbound mail" in result.stderr
+    assert "refusing to overwrite conflicting archive" in result.stderr
+    assert mail.read_text().endswith(" new copy")
+    assert conflict.read_text() == "different archived copy"
+    ack_files = list((state / "inbox" / "codex" / "new").glob("ack-*.md"))
+    assert len(ack_files) == 1
+    assert f"refs={original}" in ack_files[0].read_text()
+
+
+def test_ack_rejects_path_traversal_ref_before_delivery(tmp_path):
+    project = tmp_path / "project"
+    state = write_project(project)
+    unsafe = "20260718T120009Z-codex-to-claude-../../outside"
+
+    result = run_tool("rt-ack", unsafe, cwd=project)
+
+    assert result.returncode != 0
+    assert result.stderr == f"rt-ack: cannot parse msg_id: {unsafe}\n"
+    assert not (state / "inbox").exists()
 
 
 def test_ack_validated_sender_does_not_invoke_ambient_cmux(tmp_path):

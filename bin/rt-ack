@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections import defaultdict
@@ -25,9 +26,85 @@ def usage():
 
 def parse_ref(ref):
     match = MSG_ID_RE.match(ref)
-    if not match:
+    if (
+        not match
+        or Path(ref).name != ref
+        or "/" in ref
+        or "\x00" in ref
+    ):
         raise SystemExit(f"rt-ack: cannot parse msg_id: {ref}")
     return match.groups()
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def lstat_or_none(path):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def archive_inbound(ref, recipient):
+    """Move one exact inbound ref from new/ to cur/ without clobbering.
+
+    A hard-link followed by unlink gives us a no-clobber publication and a
+    recoverable intermediate state. If a prior attempt stopped between those
+    operations, both names identify the same inode and this retry completes the
+    unlink. Missing mail is a compatibility no-op: rt-ack historically accepted
+    a valid ref after a manual drain or when only legacy ledger state remained.
+    """
+
+    mail_root = ROOT / ".roundtable" / "inbox"
+    inbox = mail_root / recipient
+    new_dir = inbox / "new"
+    cur_dir = inbox / "cur"
+    source = new_dir / f"{ref}.md"
+    destination = cur_dir / f"{ref}.md"
+
+    for directory in (mail_root, inbox, new_dir):
+        if directory.is_symlink():
+            raise OSError(f"maildir path is a symlink: {directory}")
+        if directory.exists() and not directory.is_dir():
+            raise OSError(f"maildir path is not a directory: {directory}")
+
+    source_stat = lstat_or_none(source)
+    destination_stat = lstat_or_none(destination)
+    if source_stat is None:
+        if destination_stat is not None and not stat.S_ISREG(destination_stat.st_mode):
+            raise OSError(f"archive destination is not a regular file: {destination}")
+        return
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise OSError(f"inbound mail is not a regular file: {source}")
+
+    cur_dir.mkdir(parents=True, exist_ok=True)
+    if cur_dir.is_symlink() or not cur_dir.is_dir():
+        raise OSError(f"archive directory is not a real directory: {cur_dir}")
+
+    destination_stat = lstat_or_none(destination)
+    if destination_stat is not None:
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise OSError(f"archive destination is not a regular file: {destination}")
+        if (source_stat.st_dev, source_stat.st_ino) != (
+            destination_stat.st_dev,
+            destination_stat.st_ino,
+        ):
+            raise FileExistsError(
+                f"refusing to overwrite conflicting archive: {destination}"
+            )
+        fsync_directory(cur_dir)
+    else:
+        os.link(source, destination, follow_symlinks=False)
+        fsync_directory(cur_dir)
+
+    source.unlink()
+    fsync_directory(new_dir)
 
 
 def main():
@@ -99,7 +176,21 @@ def main():
             raise SystemExit(proc.returncode)
         if proc.stderr.strip():
             print(proc.stderr.strip(), file=sys.stderr)
-        outputs.append(proc.stdout.strip())
+        output = proc.stdout.strip()
+        try:
+            for ref in group_refs:
+                archive_inbound(ref, inferred_sender)
+        except OSError as error:
+            for committed_output in outputs:
+                if committed_output:
+                    print(committed_output)
+            if output:
+                print(output)
+            raise SystemExit(
+                "rt-ack: acknowledgement delivered for "
+                f"refs={csv}, but failed to archive inbound mail: {error}"
+            ) from None
+        outputs.append(output)
 
     print("\n".join(output for output in outputs if output))
 

@@ -670,6 +670,17 @@ def test_rt_say_inbox_ack_flow_with_fake_cmux(tmp_path):
     ack_proc = run_tool("rt-ack", msg_id, "received", cwd=project, env=ack_env)
 
     assert ack_proc.returncode == 0, ack_proc.stderr
+    inbound_new = (
+        project
+        / ".roundtable"
+        / "inbox"
+        / "claude"
+        / "new"
+        / f"{msg_id}.md"
+    )
+    inbound_cur = inbound_new.parents[1] / "cur" / inbound_new.name
+    assert not inbound_new.exists()
+    assert inbound_cur.is_file()
     after_ack = run_tool("rt-inbox", cwd=project, env={**base_env, "RT_FROM": "claude"})
     assert msg_id not in after_ack.stdout
     ack_file = next((project / ".roundtable" / "inbox" / "codex" / "new").glob("ack-*.md"))
@@ -1274,6 +1285,10 @@ def test_rt_ack_mail_commit_survives_ledger_failure_and_cur_ref_stays_effective(
     assert ack.returncode == 0
     assert "maildir delivery committed but ledger update failed" in ack.stderr
     assert "Traceback" not in ack.stderr
+    original_new = state / "inbox" / "claude" / "new" / f"{original}.md"
+    original_cur = state / "inbox" / "claude" / "cur" / f"{original}.md"
+    assert not original_new.exists()
+    assert original_cur.is_file()
     ack_file = next((state / "inbox" / "codex" / "new").glob("ack-*.md"))
     ack_file.rename(state / "inbox" / "codex" / "cur" / ack_file.name)
     inbox = run_tool("rt-inbox", "claude", cwd=project, env=env)

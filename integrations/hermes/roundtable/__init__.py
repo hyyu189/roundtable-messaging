@@ -37,8 +37,10 @@ _TUI_SENTINEL_POLL_SECONDS = 0.1
 _TUI_RELEASE_TIMEOUT_SECONDS = 5
 
 _MAIL_MESSAGE = (
-    "[Roundtable] New durable mail is waiting. Run `rt-inbox`, process the "
-    "non-ack messages, and acknowledge them with `rt-ack`."
+    "[Roundtable] New durable mail is waiting. Run `rt-inbox -f json`, "
+    "process each non-ack message, and acknowledge it with `rt-ack <id>`; "
+    "successful acknowledgement also archives that message to `cur/`. The "
+    "watcher re-arms automatically after the triggered messages are archived."
 )
 _FENCE_MESSAGE = (
     "[Roundtable] This Hermes watcher stopped because its session lease was "
@@ -74,15 +76,54 @@ def _resolve_waiter(environment: dict[str, str]) -> str | None:
     return shutil.which("rt-wait-inbox", path=environment.get("PATH"))
 
 
-def _pending_non_ack_mail(project_root: Path, agent: str) -> bool:
+def _triggered_non_ack_mail(output: str) -> tuple[str, ...] | None:
+    """Return the exact mail generation reported by ``rt-wait-inbox``.
+
+    A second message can arrive while Hermes is processing the first. Waiting
+    for the whole ``new/`` directory to drain would silently absorb that newer
+    message into the first wake. The waiter output is the generation boundary:
+    once those exact files leave ``new/``, a fresh waiter can immediately wake
+    Hermes for anything that arrived later.
+    """
+
+    lines = output.splitlines()
+    marker_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith(_MAIL_MARKER)
+        ),
+        None,
+    )
+    if marker_index is None:
+        return None
+
+    names: list[str] = []
+    for raw_name in lines[marker_index + 1 :]:
+        if raw_name.startswith("rt-wait-inbox:"):
+            break
+        name = raw_name.strip()
+        if not name:
+            continue
+        if (
+            name != raw_name
+            or Path(name).name != name
+            or name.startswith(("ack-", "."))
+            or "\x00" in name
+        ):
+            return None
+        names.append(name)
+    return tuple(dict.fromkeys(names)) or None
+
+
+def _generation_is_pending(
+    project_root: Path,
+    agent: str,
+    generation: tuple[str, ...],
+) -> bool:
     new_dir = project_root / ".roundtable" / "inbox" / agent / "new"
     try:
-        return any(
-            not entry.name.startswith(("ack-", "."))
-            for entry in new_dir.iterdir()
-        )
-    except FileNotFoundError:
-        return False
+        return any((new_dir / name).exists() for name in generation)
     except OSError:
         # Fail closed: do not start another watcher while the durable inbox
         # cannot be inspected.
@@ -225,6 +266,10 @@ class _RoundtableBridge:
 
             output = output or ""
             if process.returncode == 0 and _MAIL_MARKER in output:
+                generation = _triggered_non_ack_mail(output)
+                if generation is None:
+                    self._fail(_CONFIG_MESSAGE)
+                    return
                 if not self._deliver(
                     _MAIL_MESSAGE,
                     session_id=session_id,
@@ -234,7 +279,11 @@ class _RoundtableBridge:
                     return
                 while (
                     not self._stop.is_set()
-                    and _pending_non_ack_mail(project_root, agent)
+                    and _generation_is_pending(
+                        project_root,
+                        agent,
+                        generation,
+                    )
                 ):
                     self._stop.wait(_MAIL_DRAIN_POLL_SECONDS)
                 continue

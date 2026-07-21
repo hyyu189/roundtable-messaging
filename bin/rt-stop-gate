@@ -139,9 +139,9 @@ def run(agent: str, hook_input: str) -> int:
         rendered = " ".join(undrained)
         print(
             "roundtable inbox has undrained mail: "
-            f"{rendered}. Drain it now: read each file, act/ack "
-            "(rt-ack <ids>), then move it to "
-            f"{inbox / 'cur'}/, then re-arm the tripwire "
+            f"{rendered}. Drain it now: read each file, act, then acknowledge "
+            "it (`rt-ack <ids>` also archives the exact inbound file), then "
+            "re-arm the tripwire "
             f"(run in background: rt-wait-inbox {agent}).",
             file=sys.stderr,
         )

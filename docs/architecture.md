@@ -217,7 +217,7 @@ A terminal host is first-class when a clean installation can:
 1. launch each configured harness in its project with the correct identity;
 2. send and inspect durable mail while the recipient is offline;
 3. wake an online recipient through the harness adapter, not injected keys;
-4. acknowledge and drain the message;
+4. acknowledge and atomically archive the message with `rt-ack`;
 5. diagnose and recover the harness adapter without installing cmux.
 
 `roundtable-smoke` automates the core portion in an isolated environment with

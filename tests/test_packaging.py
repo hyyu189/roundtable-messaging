@@ -184,7 +184,7 @@ def built_wheel(tmp_path_factory):
         check=False,
     )
     assert process.returncode == 0, process.stderr
-    matches = list(wheel_dir.glob("roundtable_messaging-0.1.3-*.whl"))
+    matches = list(wheel_dir.glob("roundtable_messaging-0.1.4-*.whl"))
     assert len(matches) == 1
     return matches[0]
 
@@ -542,6 +542,58 @@ def test_install_shell_rejects_unsupported_bootstrap_python(tmp_path):
     assert process.returncode == 1
     assert "must be CPython 3.11 through 3.14" in process.stderr
     assert not (home / ".roundtable").exists()
+
+
+def test_install_and_uninstall_find_versioned_python_after_unsupported_python3(
+    tmp_path,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python3").symlink_to("/usr/bin/false")
+    (fake_bin / "python3.14").symlink_to(sys.executable)
+    environment = packaging_env(home)
+    environment.pop("ROUNDTABLE_BOOTSTRAP_PYTHON")
+    environment["PATH"] = os.pathsep.join(
+        (str(fake_bin), "/usr/bin", "/bin")
+    )
+
+    process = subprocess.run(
+        [
+            str(INSTALL),
+            "--prefix",
+            str(home / ".roundtable"),
+            "--link-dir",
+            str(home / ".local" / "bin"),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert (home / ".roundtable" / "current").is_symlink()
+
+    removed = subprocess.run(
+        [
+            str(UNINSTALL),
+            "--prefix",
+            str(home / ".roundtable"),
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not (home / ".roundtable" / "current").exists()
 
 
 def test_tampered_manifest_cannot_delete_outside_prefix(tmp_path):

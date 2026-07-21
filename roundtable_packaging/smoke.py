@@ -212,8 +212,9 @@ def smoke(bin_dir: Path) -> dict:
             / f"{message_id}.md"
         )
         current = new_path.parents[1] / "cur"
-        current.mkdir(exist_ok=True)
-        new_path.rename(current / new_path.name)
+        archived_path = current / new_path.name
+        if new_path.exists() or not archived_path.is_file():
+            raise SmokeFailure("rt-ack did not archive the exact inbound message")
         drained = run_tool(
             commands,
             "rt-inbox",

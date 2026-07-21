@@ -69,8 +69,9 @@ between multiple auth homes remains outside the P0 lifecycle contract.
 
 The host must already have CPython 3.11 through 3.14. The archive bundles the
 Roundtable wheel and every Python package dependency, but not the interpreter;
-stock macOS alone does not guarantee this prerequisite. If `python3` is not a
-supported interpreter, set
+stock macOS alone does not guarantee this prerequisite. The installer searches
+`python3.14`, `python3.13`, `python3.12`, `python3.11`, and then `python3` on
+PATH. If none is the intended supported interpreter, set
 `ROUNDTABLE_BOOTSTRAP_PYTHON=/absolute/path/to/python3`.
 
 Then extract the release archive and run its installer. No source checkout,
