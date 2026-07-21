@@ -61,6 +61,7 @@ def test_outer_checksum_command_works_from_repo_root(tmp_path):
 
 def test_release_workflow_exercises_read_only_artifact_migration():
     workflow = (ROOT / ".github" / "workflows" / "release-artifact.yml").read_text()
+    release_doc = (ROOT / "docs" / "release.md").read_text()
 
     assert 'prefix="$setup_home/.roundtable"' in workflow
     assert 'link_dir="$setup_home/.local/bin"' in workflow
@@ -70,6 +71,9 @@ def test_release_workflow_exercises_read_only_artifact_migration():
     assert 'test ! -e "$prefix"' in workflow
     assert 'export PATH="$link_dir:$PATH"' in workflow
     assert 'HOME="$setup_home" roundtable --help' in workflow
+    assert "/tmp/roundtable-release-home/.roundtable" in release_doc
+    assert "/tmp/roundtable-release-home/.local/bin" in release_doc
+    assert "/tmp/roundtable-release-smoke" not in release_doc
 
 
 @pytest.fixture(scope="module")

@@ -73,32 +73,32 @@ cd roundtable-messaging-0.1.0
 shasum -a 256 --check SHA256SUMS
 mkdir -p /tmp/roundtable-release-home
 ./migrate --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-smoke \
-  --link-dir /tmp/roundtable-release-smoke-bin
-./install --prefix /tmp/roundtable-release-smoke \
-  --link-dir /tmp/roundtable-release-smoke-bin
-/tmp/roundtable-release-smoke-bin/roundtable-setup \
+  --prefix /tmp/roundtable-release-home/.roundtable \
+  --link-dir /tmp/roundtable-release-home/.local/bin
+./install --prefix /tmp/roundtable-release-home/.roundtable \
+  --link-dir /tmp/roundtable-release-home/.local/bin
+/tmp/roundtable-release-home/.local/bin/roundtable-setup \
   --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-smoke \
+  --prefix /tmp/roundtable-release-home/.roundtable \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-smoke-bin/roundtable-setup apply \
+/tmp/roundtable-release-home/.local/bin/roundtable-setup apply \
   --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-smoke \
+  --prefix /tmp/roundtable-release-home/.roundtable \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-smoke-bin/roundtable-setup status \
+/tmp/roundtable-release-home/.local/bin/roundtable-setup status \
   --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-smoke \
+  --prefix /tmp/roundtable-release-home/.roundtable \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-smoke-bin/roundtable-smoke
-/tmp/roundtable-release-smoke-bin/roundtable-setup remove \
+/tmp/roundtable-release-home/.local/bin/roundtable-smoke
+/tmp/roundtable-release-home/.local/bin/roundtable-setup remove \
   --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-smoke \
+  --prefix /tmp/roundtable-release-home/.roundtable \
   --harness claude \
   --harness hermes
-./uninstall --prefix /tmp/roundtable-release-smoke
+./uninstall --prefix /tmp/roundtable-release-home/.roundtable
 ```
 
 The migration invocation is a read-only `not-found` plan against the clean
