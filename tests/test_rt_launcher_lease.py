@@ -385,6 +385,8 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
         str(fake_binary),
         "--remote",
         "unix://",
+        "-C",
+        str(project),
         *user_argv,
         *injected,
     ]
@@ -483,3 +485,73 @@ def test_codex_injects_reserved_overrides_before_double_dash(monkeypatch):
             f"shell_environment_policy.set.{name}="
             f"{_rtlauncher.json.dumps(value)}"
         ) in result[:separator]
+
+
+def test_codex_anchor_is_explicit_and_precedes_double_dash(tmp_path):
+    project = (tmp_path / "project").resolve()
+
+    result = _rtlauncher.anchor_codex_project(
+        project,
+        ["--model", "gpt-5.6", "--", "--cd", "/literal/prompt"],
+    )
+
+    assert result == [
+        "-C",
+        str(project),
+        "--model",
+        "gpt-5.6",
+        "--",
+        "--cd",
+        "/literal/prompt",
+    ]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-C", "/other"],
+        ["-C/other"],
+        ["--cd", "/other"],
+        ["--cd=/other"],
+    ],
+)
+def test_codex_anchor_rejects_user_working_root_override(tmp_path, argv):
+    with pytest.raises(
+        _rtlauncher.SelectionError,
+        match="-C/--cd is managed by Roundtable",
+    ):
+        _rtlauncher.anchor_codex_project(tmp_path, argv)
+
+
+def test_codex_cd_conflict_fails_before_preflight_or_claim(tmp_path, monkeypatch):
+    project = write_project(
+        tmp_path / "project", agent_id="codex", harness="codex"
+    )
+    calls = []
+
+    clear_lease_environment(monkeypatch)
+    monkeypatch.setenv("RT_FROM", "codex")
+    monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
+    monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(
+        _rtlauncher, "harness_bin", lambda _harness: tmp_path / "codex"
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "preflight_codex_services",
+        lambda **_kwargs: calls.append("preflight"),
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "claim",
+        lambda *_args: calls.append("claim"),
+    )
+    monkeypatch.setattr(_rtlauncher.os, "execv", lambda *_args: calls.append("exec"))
+
+    with pytest.raises(
+        _rtlauncher.SelectionError,
+        match="-C/--cd is managed by Roundtable",
+    ):
+        _rtlauncher.launch("codex", ["--cd", "/other"])
+
+    assert calls == []

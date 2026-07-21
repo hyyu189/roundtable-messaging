@@ -177,21 +177,21 @@ def test_locked_matrix_and_hash_fail_closed(tmp_path):
     "missing",
     [
         "_rtruntime.py",
-        "roundtable_messaging-0.1.6.data/scripts/roundtable",
-        "roundtable_messaging-0.1.6.data/scripts/_rtruntime.py",
+        "roundtable_messaging-0.1.7.data/scripts/roundtable",
+        "roundtable_messaging-0.1.7.data/scripts/_rtruntime.py",
         (
-            "roundtable_messaging-0.1.6.data/data/share/roundtable/"
+            "roundtable_messaging-0.1.7.data/data/share/roundtable/"
             "integrations/hermes/roundtable/plugin.yaml"
         ),
         (
-            "roundtable_messaging-0.1.6.data/data/share/roundtable/"
+            "roundtable_messaging-0.1.7.data/data/share/roundtable/"
             "skills/shared/roundtable/SKILL.md"
         ),
     ],
 )
 def test_project_wheel_validator_requires_runtime_helper_copies(tmp_path, missing):
-    wheel = tmp_path / "roundtable_messaging-0.1.6-py3-none-any.whl"
-    data_prefix = "roundtable_messaging-0.1.6.data/"
+    wheel = tmp_path / "roundtable_messaging-0.1.7-py3-none-any.whl"
+    data_prefix = "roundtable_messaging-0.1.7.data/"
     required = {
         *build_release.REQUIRED_PROJECT_ROOT_FILES,
         *build_release.REQUIRED_PROJECT_PACKAGE_FILES,
@@ -210,7 +210,7 @@ def test_project_wheel_validator_requires_runtime_helper_copies(tmp_path, missin
             archive.writestr(name, b"test\n")
 
     with pytest.raises(build_release.ReleaseError, match="missing required paths"):
-        build_release._validate_project_wheel(wheel, "0.1.6")
+        build_release._validate_project_wheel(wheel, "0.1.7")
 
 
 def archive_members(artifact: Path) -> tuple[str, set[str], dict[str, bytes]]:
@@ -264,7 +264,7 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
     )
 
     root, relative, files = archive_members(first.artifact)
-    assert root == "roundtable-messaging-0.1.6"
+    assert root == "roundtable-messaging-0.1.7"
     assert {
         "BUILD-METADATA.json",
         "CREDITS.md",
@@ -289,7 +289,7 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
     assert "migrate" not in relative
     assert "roundtable_packaging/migrate.py" not in relative
     assert any(
-        name.startswith("wheels/roundtable_messaging-0.1.6-")
+        name.startswith("wheels/roundtable_messaging-0.1.7-")
         and name.endswith("-py3-none-any.whl")
         for name in relative
     )
@@ -303,7 +303,7 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
     metadata_name = f"{root}/BUILD-METADATA.json"
     metadata = json.loads(files[metadata_name])
     assert metadata["source_commit"] == first.commit
-    assert metadata["version"] == "0.1.6"
+    assert metadata["version"] == "0.1.7"
     assert metadata["project_wheel"]["tag"] == "py3-none-any"
     toolchain = metadata["deterministic_build"]["toolchain"]
     assert toolchain["implementation"]

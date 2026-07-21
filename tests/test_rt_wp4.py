@@ -474,6 +474,7 @@ def test_launcher_exec_preserves_harness_contract(
 
     expected = [str(fake_binary), *expected[1:]]
     if harness == "codex":
+        expected[3:3] = ["-C", str(project)]
         expected.extend(_rtlauncher.codex_seat_overrides())
     assert observed == {"cwd": project, "program": expected[0], "command": expected}
 

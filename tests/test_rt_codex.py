@@ -2434,6 +2434,14 @@ def test_launchd_payload_uses_registry_and_persists_only_auto_discover(tmp_path,
 def test_explicit_launch_agent_reload_applies_unchanged_plist(tmp_path, monkeypatch):
     path = tmp_path / "agent.plist"
     commands = []
+    prints = iter(
+        [
+            subprocess.CompletedProcess([], 0, "loaded", ""),
+            subprocess.CompletedProcess([], 0, "removing", ""),
+            subprocess.CompletedProcess([], 113, "", "not found"),
+        ]
+    )
+    sleeps = []
 
     class Result:
         returncode = 0
@@ -2442,7 +2450,8 @@ def test_explicit_launch_agent_reload_applies_unchanged_plist(tmp_path, monkeypa
 
     monkeypatch.setattr(_rtcodex, "launch_agent_path", lambda _label: path)
     monkeypatch.setattr(_rtcodex, "_write_plist", lambda _path, _payload: False)
-    monkeypatch.setattr(_rtcodex, "launchd_loaded", lambda _label: True)
+    monkeypatch.setattr(_rtcodex, "_launchd_print", lambda _label: next(prints))
+    monkeypatch.setattr(_rtcodex.time, "sleep", sleeps.append)
     monkeypatch.setattr(
         _rtcodex.subprocess,
         "run",
@@ -2453,6 +2462,77 @@ def test_explicit_launch_agent_reload_applies_unchanged_plist(tmp_path, monkeypa
 
     assert commands[0][1] == "bootout"
     assert commands[1][1] == "bootstrap"
+    assert sleeps == [0.1]
+
+
+def test_launch_agent_reload_timeout_fails_before_bootstrap(tmp_path, monkeypatch):
+    path = tmp_path / "agent.plist"
+    commands = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(_rtcodex, "launch_agent_path", lambda _label: path)
+    monkeypatch.setattr(_rtcodex, "_write_plist", lambda _path, _payload: False)
+    monkeypatch.setattr(
+        _rtcodex,
+        "_launchd_print",
+        lambda _label: subprocess.CompletedProcess([], 0, "loaded", ""),
+    )
+    monkeypatch.setattr(
+        _rtcodex.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Result(),
+    )
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="timed out.*unload"):
+        _rtcodex.install_launch_agent(
+            "test.agent",
+            {"Label": "test.agent"},
+            reload=True,
+            unload_timeout=0,
+        )
+
+    assert [command[1] for command in commands] == ["bootout"]
+
+
+def test_launch_agent_reload_inspection_error_fails_before_bootstrap(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "agent.plist"
+    commands = []
+    prints = iter(
+        [
+            subprocess.CompletedProcess([], 0, "loaded", ""),
+            subprocess.CompletedProcess([], 64, "", "not authorized"),
+        ]
+    )
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(_rtcodex, "launch_agent_path", lambda _label: path)
+    monkeypatch.setattr(_rtcodex, "_write_plist", lambda _path, _payload: False)
+    monkeypatch.setattr(_rtcodex, "_launchd_print", lambda _label: next(prints))
+    monkeypatch.setattr(
+        _rtcodex.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Result(),
+    )
+
+    with pytest.raises(
+        _rtcodex.CodexRuntimeError,
+        match="exit 64.*not authorized",
+    ):
+        _rtcodex.install_launch_agent(
+            "test.agent", {"Label": "test.agent"}, reload=True
+        )
+
+    assert [command[1] for command in commands] == ["bootout"]
 
 
 def test_doctor_failure_matrix_and_install_fix(monkeypatch, capsys):

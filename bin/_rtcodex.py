@@ -345,9 +345,10 @@ def _launchd_print(label: str) -> subprocess.CompletedProcess[str]:
         check=False,
     )
     if proc.returncode not in {0, 113}:
-        detail = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+        detail = (proc.stderr or proc.stdout).strip() or "no diagnostic output"
         raise CodexRuntimeError(
-            f"launchctl print failed for {label}: {detail}"
+            f"launchctl print failed for {label} "
+            f"(exit {proc.returncode}): {detail}"
         )
     return proc
 
@@ -444,7 +445,40 @@ def launchd_running(label: str) -> bool:
     return proc.returncode == 0 and _launchd_scalar(proc.stdout, "state") == "running"
 
 
-def install_launch_agent(label: str, payload: dict, *, reload: bool = False) -> Path:
+def _wait_for_launchd_unloaded(
+    label: str,
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.1,
+) -> None:
+    """Wait until a successful bootout has actually left the launchd domain."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        proc = _launchd_print(label)
+        if proc.returncode == 113:
+            return
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip() or "no diagnostic output"
+            raise CodexRuntimeError(
+                f"launchctl print failed for {label} "
+                f"(exit {proc.returncode}): {detail}"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CodexRuntimeError(
+                f"timed out waiting for LaunchAgent to unload: {label}"
+            )
+        time.sleep(min(poll_interval, remaining))
+
+
+def install_launch_agent(
+    label: str,
+    payload: dict,
+    *,
+    reload: bool = False,
+    unload_timeout: float = 10.0,
+) -> Path:
     path = launch_agent_path(label)
     _write_plist(path, payload)
     loaded = launchd_loaded(label)
@@ -462,6 +496,10 @@ def install_launch_agent(label: str, payload: dict, *, reload: bool = False) -> 
             raise CodexRuntimeError(
                 f"launchctl bootout failed for {label}: {proc.stderr.strip()}"
             )
+        # launchctl can return from bootout before launchd has removed the
+        # service.  Bootstrapping the same label during that transition fails
+        # with a misleading I/O error, so observe the not-loaded state first.
+        _wait_for_launchd_unloaded(label, timeout=unload_timeout)
         loaded = False
     if not loaded:
         proc = subprocess.run(

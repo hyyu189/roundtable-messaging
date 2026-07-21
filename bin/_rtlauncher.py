@@ -281,6 +281,35 @@ def append_codex_seat_overrides(argv: list[str]) -> list[str]:
     return [*argv[:separator], *overrides, *argv[separator:]]
 
 
+def anchor_codex_project(root: Path, argv: list[str]) -> list[str]:
+    """Make the selected project the explicit native Codex working root.
+
+    Roundtable's seat identity is keyed by the canonical project path, so a
+    caller-provided ``-C``/``--cd`` cannot be allowed to make the native
+    thread disagree with its lease.  Arguments after ``--`` are prompt
+    literals rather than CLI options and must remain untouched.
+    """
+
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        option_argv = argv
+    else:
+        option_argv = argv[:separator]
+    for argument in option_argv:
+        if (
+            argument in {"-C", "--cd"}
+            or argument.startswith("-C")
+            or argument.startswith("--cd=")
+        ):
+            raise SelectionError(
+                "rt-codex: -C/--cd is managed by Roundtable's selected "
+                "project; choose the project through `roundtable`, or use "
+                "native `codex` for a different working root"
+            )
+    return ["-C", str(root.expanduser().resolve()), *argv]
+
+
 def clear_unanchored_lease_context() -> None:
     for name in LEASE_CONTEXT_ENV_NAMES:
         os.environ.pop(name, None)
@@ -463,6 +492,11 @@ def launch(harness: str, argv: list[str]) -> int:
     if root is not None or harness == "codex":
         normalize_runtime_environment()
     executable = harness_bin(harness)
+    codex_argv = (
+        anchor_codex_project(root, argv)
+        if harness == "codex" and root is not None
+        else argv
+    )
     if harness == "codex":
         # Service repair must happen before publishing a seat lease.  A
         # declined/deferred reload therefore cannot strand an occupied seat.
@@ -492,7 +526,7 @@ def launch(harness: str, argv: list[str]) -> int:
     if harness == "hermes" and not argv:
         command.append("--tui")
     if harness == "codex" and root is not None:
-        command.extend(append_codex_seat_overrides(argv))
+        command.extend(append_codex_seat_overrides(codex_argv))
     else:
         command.extend(argv)
     command[0] = str(executable)
