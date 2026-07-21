@@ -62,6 +62,10 @@ def test_outer_checksum_command_works_from_repo_root(tmp_path):
 def test_release_workflow_exercises_read_only_artifact_migration():
     workflow = (ROOT / ".github" / "workflows" / "release-artifact.yml").read_text()
 
+    assert 'prefix="$setup_home/.roundtable"' in workflow
+    assert 'link_dir="$setup_home/.local/bin"' in workflow
+    assert 'export CODEX_HOME="$setup_home/.codex"' in workflow
+    assert "unset ROUNDTABLE_RUNTIME_ROOT" in workflow
     assert "./migrate --home" in workflow
     assert 'test ! -e "$prefix"' in workflow
     assert 'export PATH="$link_dir:$PATH"' in workflow

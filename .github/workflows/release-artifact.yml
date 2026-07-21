@@ -63,11 +63,13 @@ jobs:
         run: |
           set -euo pipefail
           extract_root="$RUNNER_TEMP/roundtable-release-extract"
-          prefix="$RUNNER_TEMP/roundtable-release-prefix"
-          link_dir="$RUNNER_TEMP/roundtable-release-bin"
           setup_home="$RUNNER_TEMP/roundtable-release-home"
+          prefix="$setup_home/.roundtable"
+          link_dir="$setup_home/.local/bin"
           fake_launchctl="$RUNNER_TEMP/roundtable-fake-launchctl"
           launchctl_sentinel="$RUNNER_TEMP/roundtable-launchctl-invoked"
+          export CODEX_HOME="$setup_home/.codex"
+          unset ROUNDTABLE_RUNTIME_ROOT
           mkdir -p \
             "$extract_root" \
             "$setup_home/.local/bin" \
