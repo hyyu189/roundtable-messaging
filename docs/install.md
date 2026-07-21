@@ -288,12 +288,12 @@ trusted, manual binding remains available as a fallback:
 rt-codex-wake bind /absolute/path/to/project
 ```
 
-Manual bind is not part of the normal user journey. The current machine has not
-yet run the live spike proving that Codex's hook `session_id` equals the
-app-server thread ID and that the private runtime launch intent resolves to the
-same current fenced lease. That spike and the real send-to-wake-to-drain/ack
-path remain release promotion gates even though the configuration and queueing
-paths are automated and tested.
+Manual bind is not part of the normal user journey. The development machine has
+run the live spike proving that Codex's hook `session_id` equals the app-server
+thread ID and that the private runtime launch intent resolves to the same
+current fenced lease. A clean-account repeat and the real
+send-to-wake-to-drain/ack path remain release promotion gates even though the
+configuration and queueing paths are automated and tested.
 
 ## Offline release install
 
