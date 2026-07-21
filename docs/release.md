@@ -67,8 +67,8 @@ notice, the compatibility matrix, and the source-commit ledger. Top-level
 ```bash
 cd artifacts && shasum -a 256 --check SHA256SUMS
 cd ..
-tar -xzf artifacts/roundtable-messaging-0.1.0-macos.tar.gz
-cd roundtable-messaging-0.1.0
+tar -xzf artifacts/roundtable-messaging-<version>-macos.tar.gz
+cd roundtable-messaging-<version>
 shasum -a 256 --check SHA256SUMS
 export HOME=/tmp/roundtable-release-home
 export CODEX_HOME="$HOME/.codex"
