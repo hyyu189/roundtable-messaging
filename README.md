@@ -58,6 +58,21 @@ commit-by-commit rather than described as GPT-5.6-only work.
 
 All productization work begun in this public repository is GPT-5.6/Codex-led.
 
+### How Codex accelerated the build
+
+Ocean set the product boundaries: durable maildir is the delivery fact source,
+native harness lifecycle hooks provide wake-up, cmux is optional, onboarding is
+project-first, and tmux, cross-host transport, and multi-auth switching stay
+outside the Build Week P0. GPT-5.6 in Codex turned those decisions into the
+Messaging v2 implementation and then drove the release loop: provenance-safe
+history replay, terminal-independent delivery, Codex daemon and wake identity
+checks, unified setup and launch UX, offline packaging, public-safety checks,
+and focused regressions for every live-cutover finding. This let the human lead
+make small architecture and UX decisions against running software while Codex
+implemented, tested, reviewed, and rebuilt the candidate in the same session.
+Historical Fable 5 and Hermes contributions remain attributed separately in
+[`PROVENANCE.md`](PROVENANCE.md) and [`CREDITS.md`](CREDITS.md).
+
 ## Current compatibility status
 
 | Surface | Status |

@@ -25,6 +25,8 @@ INBOX_DIR = STATE_DIR / "inbox"
 LEDGER_LOCK = LOCK_DIR / "ledger.lock"
 LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3, "acked": 4}
 AGENT_COMPONENT_RE = re.compile(r"^[a-z0-9#_-]+$")
+MAIL_KIND_RE = re.compile(r"^[^\s\]\x00]+$")
+UNSUPPORTED_MESSAGE_OPTIONS = ("--kind", "--refs")
 LEGACY_FAILURE_EXIT = 3
 LEGACY_OPERATION_ACTIVE = False
 
@@ -149,6 +151,28 @@ def infer_sender_from_harness_env(root):
 def validate_agent_component(value, label):
     if not AGENT_COMPONENT_RE.fullmatch(value):
         raise SystemExit(f"rt-say: invalid {label} agent component: {value}")
+
+
+def reject_unsupported_message_options(args):
+    for arg in args:
+        option = arg.split("=", 1)[0]
+        if option in UNSUPPORTED_MESSAGE_OPTIONS:
+            print(
+                f"rt-say: {option} is not supported; use "
+                "rt-say <agent-or-instance> <kind> <body...>",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+
+def validate_mail_kind(value):
+    if not MAIL_KIND_RE.fullmatch(value):
+        print(
+            "rt-say: invalid kind: expected one non-empty token without "
+            "whitespace, ']', or NUL",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
 
 def fsync_directory(path):
@@ -493,6 +517,8 @@ def main():
         print_help()
         return
 
+    reject_unsupported_message_options(args)
+
     verbose = False
     if "--verbose" in args:
         verbose = True
@@ -519,6 +545,7 @@ def main():
     target = args[0].lower()
     kind = args[1]
     body_arg = " ".join(args[2:])
+    validate_mail_kind(kind)
     fenced_agent = require_fenced_seat(ROOT, "rt-say") if fenced else ""
     ack_mode = os.environ.get("RT_ACK_MODE") == "1"
     if kind == "sync-ack" and not ack_mode:

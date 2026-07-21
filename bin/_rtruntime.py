@@ -178,7 +178,10 @@ def runtime_root() -> Path:
 
 def canonical_project(project: Path | str) -> Path:
     try:
-        return Path(project).expanduser().resolve()
+        # Runtime identity is meaningful only for an existing project.  Use
+        # strict resolution so symlink loops fail closed on Python 3.13+ as
+        # they did on earlier supported interpreters.
+        return Path(project).expanduser().resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as error:
         raise RuntimeStateError(f"cannot resolve project root {project}: {error}") from error
 

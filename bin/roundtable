@@ -213,7 +213,11 @@ def canonical_existing_folder(raw: str, cwd: Path) -> Path:
             f"roundtable: refusing symbolic-link project folder: {candidate}"
         )
     try:
-        resolved = candidate.resolve()
+        # ``Path.resolve()`` changed its non-strict symlink-loop behavior in
+        # Python 3.13.  A project anchor must already exist, so resolve it
+        # strictly and reject loops/missing components consistently on every
+        # supported interpreter.
+        resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as error:
         raise OnboardingError(
             f"roundtable: cannot resolve project folder {candidate}: {error}"

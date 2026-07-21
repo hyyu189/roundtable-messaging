@@ -699,7 +699,11 @@ def notify_needs_human(
 
 def canonical_project(path: Path) -> Path:
     try:
-        project = path.expanduser().resolve()
+        # Registered project identity requires an existing canonical root.
+        # Non-strict resolve stopped raising for symlink loops in Python 3.13,
+        # so strict resolution keeps the wake bridge fail-closed across the
+        # full supported interpreter matrix.
+        project = path.expanduser().resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as error:
         raise IdentityError(f"cannot resolve project root {path}: {error}") from error
     if not (project / ".roundtable" / "agents.yaml").is_file():

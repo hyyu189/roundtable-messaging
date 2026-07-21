@@ -1338,10 +1338,12 @@ def _send_server_json(conn, payload):
     conn.sendall(header + raw)
 
 
-def test_real_unix_websocket_initialize_envelope(tmp_path):
-    # Darwin sockaddr_un paths are limited to roughly 104 bytes; pytest's
-    # default temp path is longer than that on this machine.
-    path = Path("/private/tmp") / f"rtws-{os.getpid()}-{tmp_path.name[-6:]}.sock"
+def test_real_unix_websocket_initialize_envelope(tmp_path, monkeypatch):
+    # Darwin sockaddr_un paths are limited to roughly 104 bytes.  Keep the
+    # socket inside pytest's isolated directory while passing the kernel a
+    # short relative path; unlike /private/tmp, this is portable to Linux.
+    monkeypatch.chdir(tmp_path)
+    path = Path("rtws.sock")
     path.unlink(missing_ok=True)
     ready = threading.Event()
     observed = []

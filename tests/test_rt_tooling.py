@@ -714,6 +714,66 @@ def test_rt_say_default_maildir_writes_exact_mail_without_legacy_nudge(tmp_path)
     assert records[0]["send_text"] == f"[CODEX→CLAUDE question id={msg_id}] line 1 line 2 with spaces"
 
 
+def test_rt_say_rejects_flag_style_kind_and_refs_without_side_effects(tmp_path):
+    cases = (
+        (
+            "kind",
+            (
+                "claude",
+                "message body",
+                "--kind",
+                "reply",
+                "--refs",
+                "20260721T222627Z-codex-to-hermes-27944",
+                "--no-nudge",
+            ),
+            "--kind is not supported",
+        ),
+        (
+            "refs",
+            (
+                "claude",
+                "reply",
+                "message body",
+                "--refs=20260721T222627Z-codex-to-hermes-27944",
+            ),
+            "--refs is not supported",
+        ),
+    )
+
+    for label, arguments, expected_error in cases:
+        project, state, env, trace_dir = say_project(tmp_path / label)
+
+        proc = run_tool("rt-say", *arguments, cwd=project, env=env)
+
+        assert proc.returncode == 2
+        assert expected_error in proc.stderr
+        assert "rt-say <agent-or-instance> <kind> <body...>" in proc.stderr
+        assert not (state / "inbox").exists()
+        assert read_ledger(state) == []
+        assert read_cmux_calls(trace_dir) == []
+
+
+def test_rt_say_rejects_non_single_token_kind_without_side_effects(tmp_path):
+    for index, kind in enumerate(("", "two words", "line\nbreak", "bad]kind")):
+        project, state, env, trace_dir = say_project(tmp_path / str(index))
+
+        proc = run_tool(
+            "rt-say",
+            "claude",
+            kind,
+            "message body",
+            cwd=project,
+            env=env,
+        )
+
+        assert proc.returncode == 2
+        assert "invalid kind: expected one non-empty token" in proc.stderr
+        assert not (state / "inbox").exists()
+        assert read_ledger(state) == []
+        assert read_cmux_calls(trace_dir) == []
+
+
 def test_rt_say_explicit_legacy_preserves_busy_submit_policy_per_harness(tmp_path):
     cases = [
         ("claude", "codex", "surface:2", "none", None, False),
