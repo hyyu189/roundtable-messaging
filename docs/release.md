@@ -60,8 +60,7 @@ The archive has its own `SHA256SUMS` covering every payload file and
 project wheel digest, and dependency matrix. It also includes `PROVENANCE.md`,
 `CREDITS.md`, the Apache license, `NOTICE` with the applicable predecessor MIT
 notice, the compatibility matrix, and the source-commit ledger. Top-level
-`install`, `uninstall`, and `migrate` launchers run directly from the extracted
-artifact.
+`install` and `uninstall` launchers run directly from the extracted artifact.
 
 ## Verify and smoke
 
@@ -71,41 +70,44 @@ cd ..
 tar -xzf artifacts/roundtable-messaging-0.1.0-macos.tar.gz
 cd roundtable-messaging-0.1.0
 shasum -a 256 --check SHA256SUMS
-mkdir -p /tmp/roundtable-release-home
-./migrate --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-home/.roundtable \
-  --link-dir /tmp/roundtable-release-home/.local/bin
-./install --prefix /tmp/roundtable-release-home/.roundtable \
-  --link-dir /tmp/roundtable-release-home/.local/bin
-/tmp/roundtable-release-home/.local/bin/roundtable-setup \
-  --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-home/.roundtable \
+export HOME=/tmp/roundtable-release-home
+export CODEX_HOME="$HOME/.codex"
+export RT_RUNTIME_DIR="$HOME/.roundtable/.runtime"
+export RT_CODEX_RUNTIME_DIR="$RT_RUNTIME_DIR"
+prefix="$HOME/.roundtable"
+link_dir="$HOME/.local/bin"
+mkdir -p "$HOME"
+./install --prefix "$prefix" --link-dir "$link_dir"
+"$link_dir/roundtable-setup" \
+  --home "$HOME" \
+  --prefix "$prefix" \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-home/.local/bin/roundtable-setup apply \
-  --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-home/.roundtable \
+"$link_dir/roundtable-setup" apply \
+  --home "$HOME" \
+  --prefix "$prefix" \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-home/.local/bin/roundtable-setup status \
-  --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-home/.roundtable \
+"$link_dir/roundtable-setup" status \
+  --home "$HOME" \
+  --prefix "$prefix" \
   --harness claude \
   --harness hermes
-/tmp/roundtable-release-home/.local/bin/roundtable-smoke
-/tmp/roundtable-release-home/.local/bin/roundtable-setup remove \
-  --home /tmp/roundtable-release-home \
-  --prefix /tmp/roundtable-release-home/.roundtable \
+"$link_dir/roundtable-smoke"
+"$link_dir/roundtable-setup" remove \
+  --home "$HOME" \
+  --prefix "$prefix" \
   --harness claude \
   --harness hermes
-./uninstall --prefix /tmp/roundtable-release-home/.roundtable
+./uninstall --prefix "$prefix"
 ```
 
-The migration invocation is a read-only `not-found` plan against the clean
-home. The first setup invocation has no subcommand and is likewise a read-only
-plan. This manual example omits Codex because plist generation requires an
-executable Codex installation; the CI exercise supplies a harmless fake
-executable, and the promotion gate uses the real validated CLI.
+The exported `HOME`, `CODEX_HOME`, and runtime variables keep the entire manual
+exercise inside the disposable home. The first setup invocation has no
+subcommand and is a read-only plan. This manual example omits Codex because
+plist generation requires an executable Codex installation; the CI exercise
+supplies a harmless fake executable, and the promotion gate uses the real
+validated CLI.
 
 The GitHub `release-artifact` workflow runs the full tests and safety gate,
 builds the same archive, verifies both checksum layers, installs the extracted
@@ -122,11 +124,9 @@ harmless fake executables. It proves that:
   its bootout sentinel;
 - the installed core smoke and package uninstall still pass afterward.
 
-Focused tests also exercise recognized pre-manifest migration plan, apply,
-idempotence, rollback, service-loaded refusal, and fail-closed foreign or
-modified paths. The workflow uploads a 14-day candidate artifact and
-deliberately does not publish a GitHub Release. Configuration automation is not
-a substitute for a live cutover or credentialed real-harness E2E.
+The workflow uploads a 14-day candidate artifact and deliberately does not
+publish a GitHub Release. Configuration automation is not a substitute for
+credentialed real-harness E2E.
 
 ## Judge journey
 
@@ -147,25 +147,6 @@ path. On first Codex use, the judge may need to review the user hook once with
 `/hooks`. Subsequent SessionStart binding is intended to be automatic, with
 manual `rt-codex-wake bind` retained only as a fallback.
 
-For a recognized pre-manifest installation, the journey begins before
-`./install`:
-
-```bash
-./migrate
-./migrate apply
-./install
-```
-
-The user must first stop the two recognized legacy Codex jobs from outside
-Codex; migration only queries those labels with read-only `launchctl print` and
-never controls their state. If `apply` reports those exact labels as loaded,
-the operator can explicitly run
-`launchctl bootout gui/$UID/com.roundtable.codex-wake` and then
-`launchctl bootout gui/$UID/com.roundtable.codex-app-server` from the ordinary
-terminal before retrying. If installation has not yet replaced the migrated
-leaves, `./migrate rollback` restores their recorded bytes, modes, and link
-targets.
-
 ## Promotion gates
 
 Before tagging or attaching the archive to a public release:
@@ -174,22 +155,19 @@ Before tagging or attaching the archive to a public release:
 2. the extracted archive passes install, terminal-baseline smoke, and
    uninstall on a clean macOS account, including the
    `plan -> apply -> status -> remove --unload-codex` setup cycle;
-3. a disposable recognized legacy layout passes artifact
-   `plan -> apply -> rollback`, then the real development installation passes a
-   coordinated migration and cutover without losing registry or mailbox state;
-4. clean-account Claude and Hermes setup passes skill discovery, lifecycle
+3. clean-account Claude and Hermes setup passes skill discovery, lifecycle
    hook, tripwire, and real send-to-wake-to-drain/ack acceptance;
-5. npm Codex `0.144.6` passes the coordinated default-daemon reload, verifies
-   that trusted SessionStart `session_id` and injected Roundtable environment
-   match the app-server thread and launcher lease, and completes real
-   send-to-wake-to-drain/ack acceptance;
-6. standalone Codex passes that same acceptance before support is claimed;
-7. the same harness acceptance passes in Terminal.app, iTerm2, and Ghostty;
-8. the five-minute judge path creates or adopts a non-Git directory, launches
+4. npm Codex `0.144.6` passes the coordinated default-daemon reload, verifies
+   that trusted SessionStart `session_id` matches the app-server thread and the
+   private runtime launch intent resolves to the same current fenced lease,
+   then completes real send-to-wake-to-drain/ack acceptance;
+5. standalone Codex passes that same acceptance before support is claimed;
+6. the same harness acceptance passes in Terminal.app, iTerm2, and Ghostty;
+7. the five-minute judge path creates or adopts a non-Git directory, launches
    a project-anchored harness, and completes one visible message round trip;
-9. `README.md`, `docs/compatibility.md`, provenance, and Devpost copy describe
+8. `README.md`, `docs/compatibility.md`, provenance, and Devpost copy describe
    only the gates that actually passed.
 
-At this release-candidate stage, the live development-machine cutover and
-Codex hook identity spike have not yet run. They must not be presented in a
-video, README support table, or Devpost submission as completed evidence.
+At this release-candidate stage, the Codex hook identity spike has not yet run.
+It must not be presented in a video, README support table, or Devpost
+submission as completed evidence.

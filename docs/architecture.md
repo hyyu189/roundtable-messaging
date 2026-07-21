@@ -114,6 +114,7 @@ retaining that readable path in metadata:
   projects/<canonical-path-hash>/
     project.json
     claim.lock
+    codex-launch-intent.json
     agents/<agent-key>/
       state.lock
       lease.json
@@ -127,11 +128,11 @@ directory.
 
 Runtime directories and files are private to the local user and updates use a
 short host-local lock plus atomic replacement. Project-local Claude and Hermes
-markers such as `.armed-<pid>`, `.last-active`, and `.empty-beats` are migrated
-to the fenced lease record; old project-local markers are diagnostic-only.
+markers such as `.armed-<pid>`, `.last-active`, and `.empty-beats` now live in
+the fenced lease record; old project-local markers are diagnostic-only.
 Codex binding, bridge PID, heartbeat, locks, and logs are also host-local. The
 optional cmux `runtime.json` and legacy operation locks follow the same
-placement principle, but migrate in separate changes so they do not complicate
+placement principle, but will move in separate changes so they do not complicate
 the session-ownership change.
 
 ### Logical seat, Roundtable session, and native session

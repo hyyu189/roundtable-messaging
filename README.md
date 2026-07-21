@@ -5,11 +5,10 @@ durable per-project mailboxes as the delivery fact source and wakes supported
 harnesses through native mechanisms instead of injecting keystrokes.
 
 > Build status: the source installer and deterministic offline release archive
-> pass automated clean-home install, setup, migration, core smoke, and uninstall
+> pass automated clean-home install, setup, core smoke, and uninstall
 > tests. The result is a release candidate, not yet a public support claim: the
-> current machine has not been cut over to this candidate, the Codex
-> SessionStart identity spike has not run, and real credentialed harness wake
-> tests plus the mainstream terminal matrix remain promotion gates.
+> Codex SessionStart identity spike has not run, and real credentialed harness
+> wake tests plus the mainstream terminal matrix remain promotion gates.
 
 ## Why it exists
 
@@ -109,24 +108,6 @@ without a reload race. Claude and Hermes may still use the explicit
 unanchored option; users who want unanchored Codex can run native `codex`
 directly, outside Roundtable messaging.
 
-If this Mac already has the recognized pre-manifest Roundtable layout, do not
-install over it. Use the migration tool in the extracted artifact first:
-
-```bash
-./migrate                 # read-only plan
-./migrate apply           # backup and remove only recognized legacy program paths
-./install
-```
-
-Migration preserves project registries, host runtime state, and all
-project-local mailboxes. `apply` refuses to run from inside Codex or while a
-recognized legacy Codex service is loaded; service shutdown and the one-time
-cutover must be coordinated from a normal terminal. It only queries the two
-known service labels with read-only `launchctl print`; it never loads, unloads,
-or restarts them. The current development machine has not yet performed this
-cutover. If `apply` has completed but `./install` has not yet replaced those
-paths, `./migrate rollback` restores the legacy layout.
-
 ## Setup and day-to-day use
 
 For normal users, the first `roundtable` launch is the onboarding flow. The
@@ -170,7 +151,6 @@ The most common day-to-day commands are:
 roundtable                         project-first onboarding and launch
 roundtable setup                  read-only harness integration preview
 roundtable doctor                 diagnose setup, leases, and wake services
-roundtable migrate                preview recognized legacy installation state
 rt-say AGENT KIND "MESSAGE"       deliver durable mail
 rt-inbox                          inspect waiting mail
 rt-ack ID                         acknowledge a message
@@ -182,11 +162,12 @@ iTerm2, Ghostty, or another normal terminal; cmux supplies optional topology and
 workspace affordances only. tmux lifecycle integration and cross-host SSH
 transport are not P0 features.
 
-The remaining Codex promotion gate is a real post-cutover spike proving that
+The remaining Codex promotion gate is a real clean-account spike proving that
 the trusted hook's `session_id` is the same native thread ID read through the
-app-server and that the launcher environment survives into the hook, followed
-by credentialed send-to-wake-to-drain/ack E2E. Until that passes, automatic
-binding is release-candidate behavior rather than a public support claim.
+app-server and that the launcher's private runtime intent resolves to the same
+current fenced lease, followed by credentialed send-to-wake-to-drain/ack E2E.
+Until that passes, automatic binding is release-candidate behavior rather than
+a public support claim.
 
 ## Development install
 

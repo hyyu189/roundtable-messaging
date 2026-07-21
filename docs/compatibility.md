@@ -140,8 +140,8 @@ fallback.
 
 The launcher thread's first `startup` or `resume` request wins for its lease;
 an interactive Codex started later from one of that thread's tool shells cannot
-replace it merely by inheriting the Roundtable environment. A `clear` event is
-allowed to replace the current native thread for the same lease. P0 treats an
+replace it merely by sharing the project cwd. A `clear` event is allowed to
+replace the current native thread for the same lease. P0 treats an
 operator deliberately running `/clear` inside a nested Codex that inherited
 that lease as a same-user cooperative boundary, not as a supported nested-Codex
 routing topology; stronger per-client lifecycle identity is deferred to P1.
@@ -149,8 +149,8 @@ routing topology; stronger per-client lifecycle identity is deferred to P1.
 This path has focused automated coverage, but it is not yet a public support
 claim. After the live machine cutover, a real spike must prove that Codex's
 SessionStart `session_id` is the same ID returned by `thread/read` and that the
-launcher-injected Roundtable environment reaches the hook. That is followed by
-the complete credentialed send-to-wake-to-drain/ack gate.
+private runtime launch intent resolves to the same current fenced lease. That
+is followed by the complete credentialed send-to-wake-to-drain/ack gate.
 
 ## Validation matrix
 
@@ -188,27 +188,13 @@ share a Roundtable merely because both were launched over SSH; a future
 cross-host transport must preserve durable delivery and identity fencing across
 machines.
 
-## Legacy and migration boundary
+## Legacy delivery boundary
 
 The current source tree replaces the earlier cmux keyboard-nudge delivery path.
 cmux surface IDs and project-local `.armed-*` markers are not delivery or
 liveness facts in Messaging v2. Existing maildir state remains durable, while
 session leases and heartbeats live under the host-local
 `~/.roundtable/.runtime/` tree.
-
-An active installation created before the managed package and harness manifests
-needs an explicit migration plan. The extracted artifact provides `./migrate`
-(read-only by default), `./migrate apply`, and `./migrate rollback`. The
-recognizer accepts only clean tracked predecessor program files, recognized
-command links, the unmodified canonical skill, and known old Roundtable Codex
-plist shapes. It backs those leaves up byte-for-byte and preserves registry,
-runtime, and mailbox state. Unknown or modified material fails closed.
-
-Migration only queries the two known service labels with read-only
-`launchctl print`; it never loads, unloads, or restarts them. `apply` refuses to
-run inside Codex or while a recognized legacy service remains loaded. The
-development machine has not yet exercised the one-time live migration/cutover,
-so this remains a release promotion gate rather than a completed support claim.
 
 ## Official surface notes
 

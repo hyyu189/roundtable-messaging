@@ -463,6 +463,11 @@ def test_launcher_exec_preserves_harness_contract(
         "preflight_codex_services",
         lambda *, ready_action=None: ready_action() if ready_action else None,
     )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "arm_codex_launch_intent",
+        lambda _token: None,
+    )
 
     with pytest.raises(ExecCalled):
         _rtlauncher.launch(harness, argv)

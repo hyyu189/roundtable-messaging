@@ -267,6 +267,11 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
         "claim",
         claim_after_preflight,
     )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "arm_codex_launch_intent",
+        lambda _token: launch_order.append("arm"),
+    )
 
     def fake_execv(program, command):
         observed["program"] = program
@@ -307,7 +312,7 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
         "RT_RUNTIME_DIR": str(custom_runtime),
         "RT_CODEX_RUNTIME_DIR": str(custom_runtime),
     }
-    assert launch_order == ["preflight", "claim"]
+    assert launch_order == ["preflight", "claim", "arm"]
 
 
 def test_unanchored_codex_fails_before_preflight_or_exec(tmp_path, monkeypatch):
@@ -327,6 +332,44 @@ def test_unanchored_codex_fails_before_preflight_or_exec(tmp_path, monkeypatch):
     )
 
     with pytest.raises(_rtlauncher.SelectionError, match="requires a Roundtable project"):
+        _rtlauncher.launch("codex", [])
+
+    assert calls == []
+
+
+def test_codex_does_not_exec_when_binding_intent_cannot_be_armed(
+    tmp_path,
+    monkeypatch,
+):
+    project = write_project(
+        tmp_path / "project", agent_id="codex", harness="codex"
+    )
+    calls = []
+    clear_lease_environment(monkeypatch)
+    monkeypatch.setenv("RT_FROM", "codex")
+    monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: project)
+    monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(_rtlauncher, "harness_bin", lambda _harness: tmp_path / "codex")
+    monkeypatch.setattr(
+        _rtlauncher,
+        "claim",
+        lambda root, agent_id, _harness: lease(root, agent_id),
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "arm_codex_launch_intent",
+        lambda _token: (_ for _ in ()).throw(
+            _rtlauncher.RuntimeStateError("unsafe runtime")
+        ),
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "preflight_codex_services",
+        lambda *, ready_action: ready_action(),
+    )
+    monkeypatch.setattr(_rtlauncher.os, "execv", lambda *_args: calls.append("exec"))
+
+    with pytest.raises(_rtlauncher.SelectionError, match="could not arm"):
         _rtlauncher.launch("codex", [])
 
     assert calls == []

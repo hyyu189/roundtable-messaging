@@ -8,15 +8,12 @@ manifest and stops before overwriting an unrelated or locally modified path.
 
 The source-install path and extracted offline artifact pass automated
 clean-home installation, repeated-install, conflict, command, harness-setup,
-legacy-migration, core-smoke, and uninstall tests. The artifact remains a
-release candidate until the current machine is cut over, the Codex
-SessionStart identity spike passes, and real credentialed harness wake tests
-plus the terminal UX matrix pass the promotion gates.
+core-smoke, and uninstall tests. The artifact remains a release candidate until
+the Codex SessionStart identity spike passes and real credentialed harness wake
+tests plus the terminal UX matrix pass the promotion gates.
 
-Do not run the installer over an active pre-manifest `~/.roundtable`
-installation. Use the artifact's conservative migration flow described below,
-or preview the managed installer in isolated paths without touching the live
-installation:
+To preview the managed installer without touching a live installation, use
+isolated paths:
 
 ```bash
 mamba run -n general ./scripts/install.sh \
@@ -263,10 +260,10 @@ when no Roundtable project or messaging is wanted.
 Claude's installed hooks and the Hermes plugin handle their native inbox wake
 lifecycle. A fresh Codex thread normally binds without user input. The trusted
 SessionStart hook writes an atomic request containing the native session ID,
-cwd, and fenced Roundtable launcher identity, then returns without making an
-app-server RPC. The wake bridge later validates the exact thread ID, exact cwd,
-interactive source, root-thread status, and current lease before committing the
-binding.
+cwd, and fence resolved from the launcher's private runtime intent, then
+returns without making an app-server RPC. The wake bridge later validates the
+exact thread ID, exact cwd, interactive source, root-thread status, and current
+lease before committing the binding.
 
 If diagnostics show that auto-bind was blocked or the hook has not yet been
 trusted, manual binding remains available as a fallback:
@@ -277,10 +274,10 @@ rt-codex-wake bind /absolute/path/to/project
 
 Manual bind is not part of the normal user journey. The current machine has not
 yet run the live spike proving that Codex's hook `session_id` equals the
-app-server thread ID and that the injected Roundtable environment reaches the
-hook. That spike and the real send-to-wake-to-drain/ack path remain release
-promotion gates even though the configuration and queueing paths are automated
-and tested.
+app-server thread ID and that the private runtime launch intent resolves to the
+same current fenced lease. That spike and the real send-to-wake-to-drain/ack
+path remain release promotion gates even though the configuration and queueing
+paths are automated and tested.
 
 ## Offline release install
 
@@ -294,47 +291,6 @@ Roundtable wheel and compatible PyYAML wheels. From the unpacked archive:
 Release mode uses `--no-index --only-binary` and does not download
 dependencies. If an unpacked archive has a top-level `wheels/` directory,
 `install.sh` selects it automatically.
-
-### Pre-manifest migration
-
-The extracted artifact also carries a migration entry point that runs before
-the managed package exists:
-
-```bash
-./migrate                 # default read-only plan
-./migrate apply           # back up and remove only recognized legacy leaves
-./install
-```
-
-The recognizer accepts only a clean Git-backed predecessor program tree,
-expected command links, the unmodified canonical skill, and known old
-Roundtable Codex plist shapes. Unknown, modified, symlinked, foreign-owned, or
-overexposed paths fail closed. `apply` records private byte-for-byte backups and
-never loads, unloads, or restarts a service. It uses read-only `launchctl print`
-only to prove the two known labels are stopped. It preserves the registry,
-runtime tree, project-local mailboxes, and every unlisted path.
-
-If migration has been applied but the managed installer has not yet replaced
-the paths, restore the predecessor with:
-
-```bash
-./migrate rollback
-```
-
-`apply` refuses to run inside Codex or while either recognized legacy Codex
-job is loaded. Stop those jobs in a coordinated maintenance window from
-Terminal.app, iTerm2, Ghostty, or another ordinary shell. If the migration
-reports those exact labels as loaded, the explicit operator step is:
-
-```bash
-launchctl bootout gui/$UID/com.roundtable.codex-wake
-launchctl bootout gui/$UID/com.roundtable.codex-app-server
-./migrate apply
-```
-
-The app-server bootout can disconnect sessions using that shared service,
-which is why neither migration nor normal setup performs it silently. The live
-development machine has not yet taken this cutover path.
 
 See [Release artifact process](release.md) for locked inputs, deterministic
 archive generation, checksums, and promotion gates.

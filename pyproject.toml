@@ -34,7 +34,6 @@ test = [
 
 [project.scripts]
 roundtable-smoke = "roundtable_packaging.smoke:main"
-roundtable-migrate = "roundtable_packaging.migrate:main"
 roundtable-setup = "roundtable_packaging.setup:main"
 roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
 

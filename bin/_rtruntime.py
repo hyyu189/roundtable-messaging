@@ -23,7 +23,10 @@ from typing import Any
 
 LEASE_SCHEMA = "roundtable.session-lease.v1"
 PROJECT_SCHEMA = "roundtable.runtime-project.v1"
+CODEX_LAUNCH_INTENT_SCHEMA = "roundtable.codex-launch-intent.v1"
+CODEX_LAUNCH_INTENT_NAME = "codex-launch-intent.json"
 DEFAULT_HEARTBEAT_TTL = 30.0
+DEFAULT_CODEX_LAUNCH_INTENT_TTL = 300.0
 BIND_REQUEST_LOCK_NAME = ".codex-bind-requests.lock"
 UNCHANGED = object()
 
@@ -866,6 +869,165 @@ def claim(
             }
             _atomic_json(paths.lease, record)
             return _token(record)
+
+
+def arm_codex_launch_intent(token: LeaseToken) -> Path:
+    """Publish the fenced Codex lease that the next root SessionStart may use.
+
+    Remote Codex hooks execute in the long-lived app-server environment, not
+    in the launcher client's tool-shell environment.  The launcher therefore
+    records its freshly claimed lease in private host runtime state.  A hook
+    can later map its documented ``cwd`` and native session id to this intent
+    without trusting inherited ``RT_SESSION_ID`` variables.
+    """
+
+    if token.harness != "codex":
+        raise RuntimeStateError(
+            f"cannot arm Codex launch intent for harness {token.harness!r}"
+        )
+    canonical = canonical_project(token.project_root)
+    paths = seat_paths(canonical, token.agent_id)
+    intent_path = paths.project_dir / CODEX_LAUNCH_INTENT_NAME
+    with _locked(paths.claim_lock):
+        with _locked(paths.state_lock, shared=True):
+            current = _token(
+                _load_fenced_record(
+                    paths,
+                    canonical,
+                    token.agent_id,
+                    token.session_id,
+                    token.revision,
+                )
+            )
+        payload = {
+            "schema": CODEX_LAUNCH_INTENT_SCHEMA,
+            "projectRoot": str(canonical),
+            "projectHash": project_hash(canonical),
+            "agentId": current.agent_id,
+            "roundtableSessionId": current.session_id,
+            "leaseRevision": current.revision,
+            "armedAt": utc_now(),
+            "activeNativeSessionId": None,
+            "lastSessionStartAt": None,
+        }
+        _atomic_json(intent_path, payload)
+    return intent_path
+
+
+def _validate_codex_launch_intent(
+    payload: dict[str, Any],
+    project: Path,
+) -> tuple[str, str, str, str | None, datetime]:
+    if payload.get("schema") != CODEX_LAUNCH_INTENT_SCHEMA:
+        raise RuntimeStateError("Codex launch intent schema is invalid")
+    if payload.get("projectRoot") != str(project):
+        raise RuntimeStateError("Codex launch intent project root does not match")
+    if payload.get("projectHash") != project_hash(project):
+        raise RuntimeStateError("Codex launch intent project hash does not match")
+    values = []
+    for name in ("agentId", "roundtableSessionId", "leaseRevision"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value or "\0" in value:
+            raise RuntimeStateError(f"Codex launch intent field {name} is invalid")
+        values.append(value)
+    active = payload.get("activeNativeSessionId")
+    if active is not None and (
+        not isinstance(active, str) or not active or "\0" in active
+    ):
+        raise RuntimeStateError(
+            "Codex launch intent field activeNativeSessionId is invalid"
+        )
+    armed_at = _parse_time(payload.get("armedAt"))
+    if armed_at is None:
+        raise RuntimeStateError("Codex launch intent field armedAt is invalid")
+    return values[0], values[1], values[2], active, armed_at
+
+
+def resolve_codex_launch_intent(
+    project: Path | str,
+    native_session_id: str,
+    source: str,
+    *,
+    initial_ttl: float = DEFAULT_CODEX_LAUNCH_INTENT_TTL,
+) -> LeaseToken | None:
+    """Resolve and advance the current Codex launch intent, or fail closed.
+
+    The first root ``startup``/``resume`` event must arrive shortly after the
+    launcher arms the intent.  Once claimed, later events must name the same
+    native session, except ``clear`` which is the documented lifecycle event
+    allowed to advance the native thread for the same fenced Roundtable lease.
+    Project claim locking makes two competing SessionStart hooks linearizable.
+    """
+
+    if (
+        not isinstance(native_session_id, str)
+        or not native_session_id
+        or "\0" in native_session_id
+    ):
+        raise RuntimeStateError("native Codex session ID is invalid")
+    if source not in {"startup", "resume", "clear"}:
+        raise RuntimeStateError(f"unsupported Codex SessionStart source: {source!r}")
+    try:
+        ttl = float(initial_ttl)
+    except (TypeError, ValueError) as error:
+        raise RuntimeStateError("Codex launch intent TTL is invalid") from error
+    if ttl <= 0:
+        raise RuntimeStateError("Codex launch intent TTL must be positive")
+
+    canonical = canonical_project(project)
+    lookup = seat_paths(canonical, "__codex-launch-intent__")
+    intent_path = lookup.project_dir / CODEX_LAUNCH_INTENT_NAME
+    if _path_info(intent_path) is None:
+        return None
+    _validate_read_path(lookup.runtime_root, directory=True)
+    _validate_read_path(lookup.project_dir, directory=True)
+    _validate_project_meta(lookup, canonical)
+    with _locked(lookup.claim_lock):
+        payload = _read_json(intent_path)
+        if payload is None:
+            return None
+        agent_id, session_id, revision, active, armed_at = (
+            _validate_codex_launch_intent(payload, canonical)
+        )
+        paths = seat_paths(canonical, agent_id)
+        if paths.project_dir != lookup.project_dir:
+            raise RuntimeStateError("Codex launch intent runtime path mismatch")
+        try:
+            with _locked(paths.state_lock, shared=True):
+                current = _token(
+                    _load_fenced_record(
+                        paths,
+                        canonical,
+                        agent_id,
+                        session_id,
+                        revision,
+                    )
+                )
+        except FenceRejected:
+            # A launcher that died before exec leaves a harmless stale intent.
+            # An unrelated native Codex session in the same cwd remains a no-op.
+            return None
+        if current.harness != "codex":
+            raise RuntimeStateError(
+                f"Codex launch intent points to harness {current.harness!r}"
+            )
+
+        if active is None:
+            if source not in {"startup", "resume"}:
+                return None
+            age = (datetime.now(timezone.utc) - armed_at).total_seconds()
+            if age < -5.0 or age > ttl:
+                return None
+        elif source != "clear" and active != native_session_id:
+            # A nested or unrelated root thread cannot steal an established
+            # launch intent merely because it shares the project cwd.
+            return None
+
+        if active != native_session_id:
+            payload["activeNativeSessionId"] = native_session_id
+        payload["lastSessionStartAt"] = utc_now()
+        _atomic_json(intent_path, payload)
+        return current
 
 
 def _normalize_fence(session_id: Any, revision: Any) -> tuple[str, str]:

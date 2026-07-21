@@ -1238,7 +1238,9 @@ def _prepare_codex(
         if previous is not None and raw is None:
             raise SetupError(f"managed Codex LaunchAgent drift: missing {path}")
         added = raw is None if previous is None else bool(previous["added"])
-        changed = raw is None or raw[0] != payload
+        content_changed = raw is None or raw[0] != payload
+        mode_changed = raw is not None and raw[1] != 0o600
+        changed = content_changed or mode_changed
         plists.append(
             {
                 "label": label,
@@ -1253,6 +1255,8 @@ def _prepare_codex(
                 "payload": payload,
                 "added": added,
                 "changed": changed,
+                "content_changed": content_changed,
+                "mode_changed": mode_changed,
                 "existing": previous is not None,
             }
         )
@@ -1300,7 +1304,10 @@ def _prepare_codex(
             "reload_marker": {
                 "path": marker_path,
                 "payload": marker_payload,
-                "changed": app_write["changed"],
+                # launchd need not reload when only the plist permissions are
+                # tightened.  The atomic rewrite below still normalizes the
+                # managed leaf before setup reports success.
+                "changed": app_write["content_changed"],
             },
             "existing": existing_record is not None,
         },
@@ -1752,10 +1759,10 @@ def _preflight_codex_runtime(
         not isinstance(marker, dict)
         or marker.get("path") != _codex_reload_marker_path(prefix)
         or marker.get("payload") != expected_marker
-        or marker.get("changed") is not app_write["changed"]
+        or marker.get("changed") is not app_write["content_changed"]
     ):
         raise SetupError("Codex reload marker changed between preflight and apply")
-    return True
+    return any(item["content_changed"] for item in changed_plists)
 
 
 def _remove_claude(home: Path, record: dict[str, Any]) -> None:
@@ -1994,8 +2001,12 @@ def _actions(
     operation: dict[str, Any] | None = None,
 ) -> list[str]:
     actions: list[str] = []
+    existing = bool((operation or {}).get("existing"))
+    config_operation = (operation or {}).get("config", operation or {})
     config = record.get("config")
-    if isinstance(config, dict):
+    if isinstance(config, dict) and (
+        not existing or bool(config_operation.get("changed"))
+    ):
         if any(item.get("added") for item in config.get("fragments", [])):
             actions.append(f"merge {config['path']}")
         elif config.get("enabled_added"):
@@ -2014,13 +2025,30 @@ def _actions(
     }
     for item in record.get("plists", []):
         planned = plist_operations.get(item["path"], {})
-        if planned.get("changed") and planned.get("existing"):
+        if planned.get("mode_changed") and not planned.get("content_changed"):
+            actions.append(f"secure {item['path']} permissions to 0600")
+        elif planned.get("changed") and planned.get("existing"):
             actions.append(f"update {item['path']} (reload deferred)")
-        elif item.get("added"):
+        elif planned.get("changed") and item.get("added"):
             actions.append(f"write {item['path']} (not loaded)")
         elif planned.get("changed"):
             actions.append(f"update {item['path']} (reload deferred)")
     return actions or ["no changes"]
+
+
+def _codex_needs_upgrade(
+    record: dict[str, Any],
+    previous: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    """Include metadata-only repairs that do not change manifest content."""
+
+    return bool(
+        record != previous
+        or operation["config"]["changed"]
+        or operation["reload_marker"]["changed"]
+        or any(item["changed"] for item in operation["plists"])
+    )
 
 
 def _plan(
@@ -2051,7 +2079,7 @@ def _plan(
                     ensure_runtime=False,
                     existing_record=owned[harness],
                 )
-                if record != owned[harness]:
+                if _codex_needs_upgrade(record, owned[harness], operation):
                     prepared[harness] = (record, operation)
                     actions = _actions(record, operation)
                     if actions == ["no changes"]:
@@ -2118,7 +2146,7 @@ def _status(
                 ensure_runtime=False,
                 existing_record=owned[harness],
             )
-            if record != owned[harness]:
+            if _codex_needs_upgrade(record, owned[harness], operation):
                 actions = _actions(record, operation)
                 if actions == ["no changes"]:
                     actions = ["record existing Codex integration state"]
@@ -2171,7 +2199,7 @@ def _apply(
                     ensure_runtime=False,
                     existing_record=owned[harness],
                 )
-                if record != owned[harness]:
+                if _codex_needs_upgrade(record, owned[harness], operation):
                     prepared[harness] = (record, operation)
                     continue
             results[harness] = {"state": "configured", "actions": ["no changes"]}

@@ -19,6 +19,7 @@ from _rtruntime import (
     RuntimeStateError,
     SeatAmbiguous,
     SeatOccupied,
+    arm_codex_launch_intent,
     claim,
     runtime_root,
 )
@@ -466,9 +467,17 @@ def launch(harness: str, argv: list[str]) -> int:
         # declined/deferred reload therefore cannot strand an occupied seat.
         # The final READY recheck and claim share the host repair lock, so a
         # concurrent reload cannot slip between them.
-        preflight_codex_services(
-            ready_action=lambda: claim_launch_seat(root, harness, agent_id)
-        )
+        def claim_and_arm_codex():
+            token = claim_launch_seat(root, harness, agent_id)
+            try:
+                arm_codex_launch_intent(token)
+            except (RuntimeStateError, OSError) as error:
+                raise SelectionError(
+                    f"rt-codex: could not arm native-thread binding: {error}"
+                ) from error
+            return token
+
+        preflight_codex_services(ready_action=claim_and_arm_codex)
     else:
         claim_launch_seat(root, harness, agent_id)
     command = [*COMMANDS[harness]]

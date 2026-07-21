@@ -21,7 +21,6 @@ from _rtlib import emit_registry_warnings, is_project_root, load_project_registr
 
 ALIASES = {
     "init": "roundtable-init",
-    "migrate": "roundtable-migrate",
     "setup": "roundtable-setup",
     "doctor": "rt-doctor",
     "projects": "rt-projects",
@@ -43,7 +42,6 @@ Run without a command in a terminal for project-first onboarding.
 commands:
   init       Create or safely set up a Roundtable project
   setup      Preview or explicitly manage harness integration
-  migrate    Preview, apply, or roll back a recognized legacy install
   doctor     Diagnose the current Roundtable project
   projects   List or manage registered projects
   smoke      Test the installed package

@@ -129,6 +129,11 @@ def test_no_argument_non_tty_fails_with_help_without_exec(fake_commands, tmp_pat
     assert calls == []
 
 
+def test_public_cli_has_no_pre_manifest_migration_surface():
+    assert "migrate" not in roundtable.ALIASES
+    assert "migrate" not in roundtable.HELP
+
+
 def test_anchored_project_goes_directly_to_configured_seat_selector(
     tmp_path, isolated_registry, fake_commands
 ):

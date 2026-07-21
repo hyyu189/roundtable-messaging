@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -35,6 +37,19 @@ def load_wake_module():
 wake = load_wake_module()
 
 
+def load_hook_module():
+    name = "rt_codex_auto_bind_hook"
+    loader = importlib.machinery.SourceFileLoader(name, str(HOOK))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+hook = load_hook_module()
+
+
 def write_project(path: Path) -> Path:
     project = path.resolve()
     state = project / ".roundtable"
@@ -56,6 +71,7 @@ def claim_environment(tmp_path: Path, project: Path) -> tuple[dict[str, str], ob
     os.environ["RT_RUNTIME_DIR"] = str(runtime)
     os.environ["RT_CODEX_RUNTIME_DIR"] = str(runtime)
     token = _rtruntime.claim(project, "codex", "codex")
+    _rtruntime.arm_codex_launch_intent(token)
     environment = os.environ.copy()
     environment.update(
         {
@@ -89,6 +105,12 @@ def run_hook(payload: dict, environment: dict[str, str]):
         env=environment,
         check=False,
     )
+
+
+def run_hook_in_process(payload: dict, environment: dict[str, str]) -> int:
+    stdin = type("HookInput", (), {})()
+    stdin.buffer = io.BytesIO(json.dumps(payload).encode())
+    return hook.run(stdin, environment)
 
 
 def selected_thread(project: Path, thread_id: str) -> dict:
@@ -155,6 +177,15 @@ def test_session_start_hook_queues_one_private_request(tmp_path):
     assert len(requests) == 1
     assert stat.S_IMODE(queue.stat().st_mode) == 0o700
     assert stat.S_IMODE(requests[0].stat().st_mode) == 0o600
+    intent = (
+        tmp_path
+        / "runtime"
+        / "projects"
+        / _rtruntime.project_hash(project)
+        / _rtruntime.CODEX_LAUNCH_INTENT_NAME
+    )
+    assert stat.S_IMODE(intent.stat().st_mode) == 0o600
+    assert stat.S_IMODE(intent.parent.stat().st_mode) == 0o700
     lock = tmp_path / "runtime" / _rtruntime.BIND_REQUEST_LOCK_NAME
     assert stat.S_IMODE(lock.stat().st_mode) == 0o600
     payload = json.loads(requests[0].read_text())
@@ -188,14 +219,80 @@ def test_session_start_hook_noops_for_irrelevant_input(
     assert not (tmp_path / "runtime" / "codex-bind-requests").exists()
 
 
-def test_session_start_hook_noops_without_complete_fence_environment(tmp_path):
+def test_session_start_hook_uses_runtime_intent_without_lease_environment(tmp_path):
     project = write_project(tmp_path / "project")
-    environment, _token = claim_environment(tmp_path, project)
-    environment.pop("RT_LEASE_REVISION")
+    environment, token = claim_environment(tmp_path, project)
+    for name in (
+        "RT_PROJECT_ROOT",
+        "RT_FROM",
+        "RT_SESSION_ID",
+        "RT_LEASE_REVISION",
+    ):
+        environment.pop(name, None)
 
     result = run_hook(hook_payload(project), environment)
 
     assert result.returncode == 0
+    request = next((tmp_path / "runtime" / "codex-bind-requests").glob("*.json"))
+    queued = json.loads(request.read_text())
+    assert queued["roundtableSessionId"] == token.session_id
+    assert queued["leaseRevision"] == token.revision
+
+
+def test_session_start_hook_noops_without_launcher_intent(tmp_path):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "RT_RUNTIME_DIR": str(runtime),
+            "RT_CODEX_RUNTIME_DIR": str(runtime),
+        }
+    )
+
+    result = run_hook(hook_payload(project), environment)
+
+    assert result.returncode == 0
+    assert not (runtime / "codex-bind-requests").exists()
+
+
+def test_session_start_hook_noops_for_expired_launcher_intent(tmp_path):
+    project = write_project(tmp_path / "project")
+    environment, _token = claim_environment(tmp_path, project)
+    intent = (
+        tmp_path
+        / "runtime"
+        / "projects"
+        / _rtruntime.project_hash(project)
+        / _rtruntime.CODEX_LAUNCH_INTENT_NAME
+    )
+    payload = json.loads(intent.read_text())
+    payload["armedAt"] = "2000-01-01T00:00:00Z"
+    intent.write_text(json.dumps(payload))
+    intent.chmod(0o600)
+
+    result = run_hook(hook_payload(project), environment)
+
+    assert result.returncode == 0
+    assert not (tmp_path / "runtime" / "codex-bind-requests").exists()
+
+
+def test_session_start_hook_noops_when_launcher_owner_died(
+    tmp_path,
+    monkeypatch,
+):
+    project = write_project(tmp_path / "project")
+    environment, token = claim_environment(tmp_path, project)
+    observed_pid_state = _rtruntime._pid_state
+    monkeypatch.setattr(
+        _rtruntime,
+        "_pid_state",
+        lambda pid: "dead" if pid == token.owner_pid else observed_pid_state(pid),
+    )
+
+    result = run_hook_in_process(hook_payload(project), environment)
+
+    assert result == 0
     assert not (tmp_path / "runtime" / "codex-bind-requests").exists()
 
 
@@ -338,6 +435,26 @@ def test_nested_codex_cannot_replace_first_launcher_request(
     assert not list(queue.glob(".*.tmp.*"))
 
 
+def test_later_startup_cannot_claim_an_established_launch_intent(tmp_path):
+    project = write_project(tmp_path / "project")
+    environment, _token = claim_environment(tmp_path, project)
+    queue = tmp_path / "runtime" / "codex-bind-requests"
+
+    assert run_hook(
+        hook_payload(project, "launcher-thread", "startup"), environment
+    ).returncode == 0
+    first = next(queue.glob("*.json"))
+    first_payload = json.loads(first.read_text())
+    first.unlink()
+
+    assert run_hook(
+        hook_payload(project, "unrelated-thread", "startup"), environment
+    ).returncode == 0
+
+    assert list(queue.glob("*.json")) == []
+    assert first_payload["threadId"] == "launcher-thread"
+
+
 def test_clear_publication_waits_for_shared_consume_guard(tmp_path):
     project = write_project(tmp_path / "project")
     environment, _token = claim_environment(tmp_path, project)
@@ -354,10 +471,7 @@ def test_clear_publication_waits_for_shared_consume_guard(tmp_path):
                 hook_payload(project, "thread-after-clear", "clear"),
                 environment,
             )
-            deadline = time.monotonic() + 5
-            while not list(queue.glob(".*.tmp.*")) and time.monotonic() < deadline:
-                time.sleep(0.01)
-            assert list(queue.glob(".*.tmp.*"))
+            time.sleep(0.1)
             assert not future.done()
             request = next(queue.glob("*.json"))
             assert json.loads(request.read_text())["threadId"] == "thread-before-clear"
@@ -404,6 +518,60 @@ def test_clear_event_coalesces_then_rebinds_same_launcher_lease(tmp_path):
     assert binding["threadId"] == "thread-before-clear"
     assert binding["roundtableSessionId"] == token.session_id
     assert binding["bindingRevision"] != first_revision
+
+
+def test_concurrent_clear_intent_and_queue_finish_on_same_thread(
+    tmp_path,
+    monkeypatch,
+):
+    project = write_project(tmp_path / "project")
+    environment, _token = claim_environment(tmp_path, project)
+    runtime = tmp_path / "runtime"
+    queue = runtime / "codex-bind-requests"
+    assert run_hook(
+        hook_payload(project, "launcher-thread", "startup"), environment
+    ).returncode == 0
+    next(queue.glob("*.json")).unlink()
+
+    entered_a = threading.Event()
+    release_a = threading.Event()
+    publish = hook._atomic_request_locked
+
+    def controlled_publish(path, payload):
+        if payload["threadId"] == "clear-a":
+            entered_a.set()
+            assert release_a.wait(5)
+        return publish(path, payload)
+
+    monkeypatch.setattr(hook, "_atomic_request_locked", controlled_publish)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            run_hook_in_process,
+            hook_payload(project, "clear-a", "clear"),
+            environment,
+        )
+        assert entered_a.wait(5)
+        second = executor.submit(
+            run_hook_in_process,
+            hook_payload(project, "clear-b", "clear"),
+            environment,
+        )
+        time.sleep(0.1)
+        assert not second.done()
+        release_a.set()
+        assert first.result(timeout=5) == 0
+        assert second.result(timeout=5) == 0
+
+    request = json.loads(next(queue.glob("*.json")).read_text())
+    intent_path = (
+        runtime
+        / "projects"
+        / _rtruntime.project_hash(project)
+        / _rtruntime.CODEX_LAUNCH_INTENT_NAME
+    )
+    intent = json.loads(intent_path.read_text())
+    assert request["threadId"] == "clear-b"
+    assert intent["activeNativeSessionId"] == "clear-b"
 
 
 def test_clear_replacing_request_during_drain_never_wakes_old_thread(

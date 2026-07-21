@@ -207,6 +207,7 @@ def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
 
     assert "roundtable_packaging/cli.py" in names
     assert "roundtable_packaging/setup.py" in names
+    assert "roundtable_packaging/migrate.py" not in names
     assert "_rtruntime.py" in names
     assert any(name.endswith(".data/scripts/roundtable") for name in names)
     assert any(name.endswith(".data/scripts/rt-say") for name in names)
@@ -233,7 +234,7 @@ def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
         )
         for name in names
     )
-    assert "roundtable-migrate = roundtable_packaging.migrate:main" in entry_points
+    assert "roundtable-migrate" not in entry_points
     assert "trusted SessionStart hook" in skill
     assert "diagnostic fallback only" in skill
     assert "rt-codex-daemon install --reload" not in skill

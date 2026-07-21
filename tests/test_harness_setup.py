@@ -605,6 +605,92 @@ def test_different_existing_codex_plist_is_never_overwritten(
     assert not (prefix / "harness-setup.json").exists()
 
 
+def test_exact_existing_codex_plists_are_adopted_with_private_modes(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    launch_agents = home / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    payloads = harness_setup._codex_payloads(
+        home,
+        prefix,
+        ensure_runtime=False,
+    )
+    paths: list[Path] = []
+    for label in harness_setup.CODEX_LABELS:
+        path = launch_agents / f"{label}.plist"
+        path.write_bytes(
+            plistlib.dumps(payloads[label], fmt=plistlib.FMT_XML, sort_keys=True)
+        )
+        path.chmod(0o644)
+        paths.append(path)
+
+    code, configured = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+
+    assert code == 0, configured
+    assert configured["writes"] is True
+    assert configured["restart_required"] is False
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths)
+    assert not harness_setup._codex_reload_marker_path(prefix).exists()
+
+    code, status = _run(
+        capsys, home, prefix, "status", "--harness", "codex"
+    )
+    assert code == 0
+    assert status["harnesses"]["codex"]["state"] == "configured"
+
+
+def test_owned_codex_plist_mode_drift_is_planned_and_repaired_without_reload(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    code, configured = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0, configured
+    marker = harness_setup._codex_reload_marker_path(prefix)
+    marker.unlink()
+    app_path = (
+        home
+        / "Library"
+        / "LaunchAgents"
+        / "com.roundtable.codex-app-server.plist"
+    )
+    original = app_path.read_bytes()
+    app_path.chmod(0o644)
+
+    code, planned = _run(
+        capsys, home, prefix, "plan", "--harness", "codex"
+    )
+    assert code == 0
+    assert planned["writes"] is False
+    assert planned["harnesses"]["codex"]["state"] == "upgrade_planned"
+    assert planned["harnesses"]["codex"]["actions"] == [
+        f"secure {app_path} permissions to 0600"
+    ]
+    assert stat.S_IMODE(app_path.stat().st_mode) == 0o644
+
+    code, repaired = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0, repaired
+    assert repaired["writes"] is True
+    assert repaired["restart_required"] is False
+    assert app_path.read_bytes() == original
+    assert stat.S_IMODE(app_path.stat().st_mode) == 0o600
+    assert not marker.exists()
+
+    code, repeated = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    assert repeated["writes"] is False
+
+
 def test_codex_hook_merge_and_remove_preserve_unrelated_groups(
     installation: tuple[Path, Path],
     capsys: pytest.CaptureFixture[str],

@@ -158,10 +158,8 @@ OUTER_STATIC_FILES = {
     "docs/provenance/source-commits.tsv",
     "docs/release.md",
     "install",
-    "migrate",
     "roundtable_packaging/__init__.py",
     "roundtable_packaging/cli.py",
-    "roundtable_packaging/migrate.py",
     "roundtable_packaging/setup.py",
     "scripts/install.sh",
     "scripts/uninstall.sh",
@@ -191,7 +189,6 @@ REQUIRED_PROJECT_PACKAGE_FILES = frozenset(
     {
         "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py",
-        "roundtable_packaging/migrate.py",
         "roundtable_packaging/setup.py",
         "roundtable_packaging/smoke.py",
     }
@@ -634,7 +631,6 @@ def _copy_release_bootstrap(source: Path, staging: Path) -> None:
         "docs/release.md": "docs/release.md",
         "roundtable_packaging/__init__.py": "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py": "roundtable_packaging/cli.py",
-        "roundtable_packaging/migrate.py": "roundtable_packaging/migrate.py",
         "roundtable_packaging/setup.py": "roundtable_packaging/setup.py",
         "scripts/install.sh": "scripts/install.sh",
         "scripts/uninstall.sh": "scripts/uninstall.sh",
@@ -661,13 +657,6 @@ def _copy_release_bootstrap(source: Path, staging: Path) -> None:
         (top_level + 'exec "$root/scripts/install.sh" "$@"\n').encode(),
         0o755,
     )
-    migrate = (
-        top_level
-        + 'bootstrap_python=${ROUNDTABLE_BOOTSTRAP_PYTHON:-python3}\n'
-        + 'PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" '
-        + 'exec "$bootstrap_python" -m roundtable_packaging.migrate "$@"\n'
-    )
-    _atomic_write(staging / "migrate", migrate.encode(), 0o755)
     _atomic_write(
         staging / "uninstall",
         (top_level + 'exec "$root/scripts/uninstall.sh" "$@"\n').encode(),

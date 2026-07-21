@@ -12,14 +12,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import stat
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _rtruntime import RuntimeStateError, bind_request_guard, runtime_root
+from _rtruntime import (
+    RuntimeStateError,
+    bind_request_guard,
+    resolve_codex_launch_intent,
+    runtime_root,
+)
 
 
 REQUEST_SCHEMA = "roundtable.codex-bind-request.v1"
@@ -27,7 +31,6 @@ REQUESTS_DIRNAME = "codex-bind-requests"
 SUPPORTED_SOURCES = frozenset({"startup", "resume", "clear"})
 MAX_INPUT_BYTES = 64 * 1024
 MAX_VALUE_BYTES = 4096
-AGENT_ID_RE = re.compile(r"^[a-z0-9#_-]+$")
 
 
 class HookError(RuntimeError):
@@ -125,8 +128,8 @@ def _validate_replace_target(path: Path) -> None:
         raise HookError(f"bind request exposes group/other permissions: {path}")
 
 
-def _atomic_request(path: Path, payload: dict) -> bool:
-    """Publish one complete request and return whether it changed queue state.
+def _atomic_request_locked(path: Path, payload: dict) -> bool:
+    """Publish one complete request while holding ``bind_request_guard``.
 
     A launcher TUI's SessionStart completes before that TUI can run a nested
     Codex process. Preserve that first ``startup``/``resume`` request for the
@@ -153,20 +156,19 @@ def _atomic_request(path: Path, payload: dict) -> bool:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        with bind_request_guard(path.parent.parent):
-            _validate_replace_target(path)
-            if source == "clear":
-                os.replace(temporary, path)
-                return True
-            try:
-                # Unlike os.replace(), link is an atomic no-clobber publication.
-                # The bridge sees either the old complete inode or this fully
-                # fsynced one, never a partially-written request.
-                os.link(temporary, path, follow_symlinks=False)
-            except FileExistsError:
-                _validate_replace_target(path)
-                return False
+        _validate_replace_target(path)
+        if source == "clear":
+            os.replace(temporary, path)
             return True
+        try:
+            # Unlike os.replace(), link is an atomic no-clobber publication.
+            # The bridge sees either the old complete inode or this fully
+            # fsynced one, never a partially-written request.
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            _validate_replace_target(path)
+            return False
+        return True
     except (OSError, RuntimeStateError) as error:
         if descriptor is not None:
             os.close(descriptor)
@@ -181,7 +183,10 @@ def _atomic_request(path: Path, payload: dict) -> bool:
             pass
 
 
-def request_from(payload: dict, environment: dict[str, str]) -> dict | None:
+def _request_context(
+    payload: dict,
+    environment: dict[str, str],
+) -> tuple[str, str, Path, Path] | None:
     if payload.get("hook_event_name") != "SessionStart":
         return None
     source = _safe_text(payload.get("source"), label="source")
@@ -189,62 +194,50 @@ def request_from(payload: dict, environment: dict[str, str]) -> dict | None:
         return None
 
     thread_id = _safe_text(payload.get("session_id"), label="session_id")
-    project = _canonical_existing_dir(
-        environment.get("RT_PROJECT_ROOT"), label="RT_PROJECT_ROOT"
-    )
     cwd = _canonical_existing_dir(payload.get("cwd"), label="cwd")
-    agent_id = _safe_text(
-        environment.get("RT_FROM"), label="RT_FROM", pattern=AGENT_ID_RE
-    )
-    roundtable_session_id = _safe_text(
-        environment.get("RT_SESSION_ID"), label="RT_SESSION_ID"
-    )
-    lease_revision = _safe_text(
-        environment.get("RT_LEASE_REVISION"), label="RT_LEASE_REVISION"
-    )
     configured_runtime = _safe_text(
         environment.get("RT_RUNTIME_DIR"), label="RT_RUNTIME_DIR"
     )
-    if not all(
-        (
-            thread_id,
-            project,
-            cwd,
-            agent_id,
-            roundtable_session_id,
-            lease_revision,
-            configured_runtime,
-        )
-    ):
+    if not all((thread_id, cwd, configured_runtime)):
         return None
-    if cwd != project or not (project / ".roundtable" / "agents.yaml").is_file():
+    if not (cwd / ".roundtable" / "agents.yaml").is_file():
         return None
 
-    # runtime_root() also rejects conflicting RT_RUNTIME_DIR and the legacy
-    # RT_CODEX_RUNTIME_DIR alias.  It is evaluated only after all launch-owned
-    # identity fields are present, so ordinary non-Roundtable Codex sessions
-    # remain a silent no-op.
     try:
         selected_runtime = runtime_root()
     except RuntimeStateError as error:
         raise HookError(str(error)) from error
     if not selected_runtime.is_absolute():
         raise HookError(f"runtime root is not absolute: {selected_runtime}")
+    return source, thread_id, cwd, selected_runtime
+
+
+def _request_from_context(context: tuple[str, str, Path, Path]) -> dict | None:
+    source, thread_id, cwd, _selected_runtime = context
+    # The app-server owns the runtime environment. Lease identity is resolved
+    # from a launcher-published private intent, never from tool-shell variables
+    # that hooks do not reliably inherit.
+    try:
+        lease = resolve_codex_launch_intent(cwd, thread_id, source)
+    except RuntimeStateError as error:
+        raise HookError(str(error)) from error
+    if lease is None:
+        return None
 
     return {
         "schema": REQUEST_SCHEMA,
         "hookEventName": "SessionStart",
         "source": source,
         "threadId": thread_id,
-        "projectRoot": str(project),
-        "agentId": agent_id,
-        "roundtableSessionId": roundtable_session_id,
-        "leaseRevision": lease_revision,
+        "projectRoot": str(lease.project_root),
+        "agentId": lease.agent_id,
+        "roundtableSessionId": lease.session_id,
+        "leaseRevision": lease.revision,
         "createdAt": utc_now(),
     }
 
 
-def request_path(payload: dict) -> Path:
+def request_path(payload: dict, *, root: Path | None = None) -> Path:
     identity = "\0".join(
         str(payload[name])
         for name in (
@@ -256,10 +249,10 @@ def request_path(payload: dict) -> Path:
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     try:
-        root = runtime_root()
+        selected = runtime_root() if root is None else root
     except RuntimeStateError as error:
         raise HookError(str(error)) from error
-    return root / REQUESTS_DIRNAME / f"{digest}.json"
+    return selected / REQUESTS_DIRNAME / f"{digest}.json"
 
 
 def run(stdin, environment: dict[str, str] | None = None) -> int:
@@ -272,10 +265,25 @@ def run(stdin, environment: dict[str, str] | None = None) -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
-    request = request_from(payload, dict(os.environ if environment is None else environment))
-    if request is None:
+    selected_environment = dict(os.environ if environment is None else environment)
+    context = _request_context(payload, selected_environment)
+    if context is None:
         return 0
-    _atomic_request(request_path(request), request)
+    selected_runtime = context[3]
+    try:
+        # Intent advancement and queue publication form one linearized action.
+        # Otherwise two concurrent ``clear`` hooks could publish in the reverse
+        # order from their intent updates and wake the older native thread.
+        with bind_request_guard(selected_runtime):
+            request = _request_from_context(context)
+            if request is None:
+                return 0
+            _atomic_request_locked(
+                request_path(request, root=selected_runtime),
+                request,
+            )
+    except RuntimeStateError as error:
+        raise HookError(str(error)) from error
     return 0
 
 

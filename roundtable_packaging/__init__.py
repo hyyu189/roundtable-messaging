@@ -23,7 +23,6 @@ MANAGED_ASSETS = (
 TOOLS = (
     "roundtable",
     "roundtable-init",
-    "roundtable-migrate",
     "roundtable-setup",
     "roundtable-smoke",
     "roundtable-uninstall",

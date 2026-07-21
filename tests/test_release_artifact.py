@@ -59,20 +59,27 @@ def test_outer_checksum_command_works_from_repo_root(tmp_path):
     assert f"{artifact.name}: OK" in process.stdout
 
 
-def test_release_workflow_exercises_read_only_artifact_migration():
+def test_release_workflow_exercises_isolated_artifact_setup():
     workflow = (ROOT / ".github" / "workflows" / "release-artifact.yml").read_text()
     release_doc = (ROOT / "docs" / "release.md").read_text()
 
     assert 'prefix="$setup_home/.roundtable"' in workflow
     assert 'link_dir="$setup_home/.local/bin"' in workflow
+    assert 'export HOME="$setup_home"' in workflow
     assert 'export CODEX_HOME="$setup_home/.codex"' in workflow
-    assert "unset ROUNDTABLE_RUNTIME_ROOT" in workflow
-    assert "./migrate --home" in workflow
+    assert 'export RT_RUNTIME_DIR="$prefix/.runtime"' in workflow
+    assert 'export RT_CODEX_RUNTIME_DIR="$RT_RUNTIME_DIR"' in workflow
+    assert "ROUNDTABLE_RUNTIME_ROOT" not in workflow
+    assert "./migrate" not in workflow
     assert 'test ! -e "$prefix"' in workflow
     assert 'export PATH="$link_dir:$PATH"' in workflow
     assert 'HOME="$setup_home" roundtable --help' in workflow
-    assert "/tmp/roundtable-release-home/.roundtable" in release_doc
-    assert "/tmp/roundtable-release-home/.local/bin" in release_doc
+    assert "export HOME=/tmp/roundtable-release-home" in release_doc
+    assert 'export CODEX_HOME="$HOME/.codex"' in release_doc
+    assert 'export RT_RUNTIME_DIR="$HOME/.roundtable/.runtime"' in release_doc
+    assert 'export RT_CODEX_RUNTIME_DIR="$RT_RUNTIME_DIR"' in release_doc
+    assert 'prefix="$HOME/.roundtable"' in release_doc
+    assert 'link_dir="$HOME/.local/bin"' in release_doc
     assert "/tmp/roundtable-release-smoke" not in release_doc
 
 
@@ -272,15 +279,15 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
         "docs/provenance/source-commits.tsv",
         "docs/release.md",
         "install",
-        "migrate",
         "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py",
-        "roundtable_packaging/migrate.py",
         "roundtable_packaging/setup.py",
         "scripts/install.sh",
         "scripts/uninstall.sh",
         "uninstall",
     }.issubset(relative)
+    assert "migrate" not in relative
+    assert "roundtable_packaging/migrate.py" not in relative
     assert any(
         name.startswith("wheels/roundtable_messaging-0.1.0-")
         and name.endswith("-py3-none-any.whl")
