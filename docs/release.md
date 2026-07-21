@@ -186,3 +186,18 @@ answered `RC7_B_OK`. The live terminal observation establishes the second
 wake; the durable records establish both deliveries, replies, acknowledgements,
 and final archive state. This is development-host RC7 evidence, not an RC8
 artifact, clean-account, or terminal-matrix support claim.
+
+On 2026-07-21, artifact RC8/0.1.5 from commit
+`b520cb5e3ead7f41eb5d51bcbbdd86afc1fa2419` (archive SHA-256
+`6660a5ff2f8ff87c6f02eed2dc1e672a55a2335ac510f039bb8c24ce0627ebc5`)
+passed both the isolated install/setup/status/smoke/remove/uninstall exercise
+and a real Claude Code `2.1.217` development-host test. A fresh anchored bare
+Claude chat armed before any user prompt. Message
+`20260721T214245Z-codex-to-claude-68440` woke it without a permission prompt,
+was acknowledged, and received reply `20260721T214304Z-claude-to-codex-69599`
+with `RC8_A_OK`. After the Stop hook re-armed the watcher, message
+`20260721T214356Z-codex-to-claude-70880` produced a second independent wake,
+was acknowledged, and received reply `20260721T214414Z-claude-to-codex-71681`
+with `RC8_B_OK`. The second fenced inbox run also reported that it archived one
+quiet acknowledgement left by the first cycle. This proves the packaged
+development-host path, not a clean-account or terminal-matrix support claim.

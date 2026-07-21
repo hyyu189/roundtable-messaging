@@ -12,7 +12,7 @@ real vendor session can wake.
 
 | Harness | Packaged and automated | Still required before support promotion |
 | --- | --- | --- |
-| Claude Code | Global skill link; owned asynchronous SessionStart/Stop watchers; absolute lease-fenced mail permissions; plan/apply/status/remove tests | RC8 artifact and clean-account real send-to-wake-to-drain/ack |
+| Claude Code | Global skill link; owned asynchronous SessionStart/Stop watchers; absolute lease-fenced mail permissions; plan/apply/status/remove tests; two sequential installed-RC8 development-host wake generations | Clean-account real send-to-wake-to-drain/ack repeat |
 | Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests; two sequential RC7 development-host wake generations | RC8 artifact and clean-account plugin/wake repeat |
 | Codex | Shared executable resolver; global skill link; owned SessionStart auto-bind hook; owned app-server and wake plist generation; fail-closed service preflight tests; development-host cutover and thread/lease identity spike | Clean-account repeat and real send-to-wake-to-drain/ack |
 

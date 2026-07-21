@@ -85,6 +85,55 @@ def write_wake_state(path: Path, bindings: dict | None = None) -> Path:
     return path
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/bin/python /managed/rt-wait-inbox claude 45",
+        "/usr/bin/python /managed/rt-wait-inbox --claude-hook",
+        "/usr/bin/python /managed/rt-wait-inbox --claude-stop-hook",
+    ],
+)
+def test_doctor_accepts_supported_tripwire_command_shapes(
+    monkeypatch,
+    command,
+):
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=command + "\n",
+        ),
+    )
+
+    assert doctor.tripwire_process(123, "claude") == (True, command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/managed/rt-wait-inbox",
+        "/managed/rt-wait-inbox hermes",
+        "/managed/not-rt-wait-inbox claude",
+        "/bin/sh -c 'echo rt-wait-inbox claude'",
+    ],
+)
+def test_doctor_rejects_unrelated_tripwire_command_shapes(
+    monkeypatch,
+    command,
+):
+    monkeypatch.setattr(
+        doctor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=command + "\n",
+        ),
+    )
+
+    assert doctor.tripwire_process(123, "claude") == (False, command)
+
+
 def write_bridge_heartbeat(
     runtime: Path,
     socket_path: Path,

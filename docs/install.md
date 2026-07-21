@@ -11,9 +11,10 @@ clean-home installation, repeated-install, conflict, command, harness-setup,
 core-smoke, and uninstall tests. RC5's development-host Codex SessionStart
 thread/lease identity and automatic binding spike also passed; an installed
 RC7 Hermes TUI passed two sequential real wake generations on that host. The
-artifact remains a release candidate until RC8 artifact repetition,
-clean-account tests, the remaining credentialed harness paths, and the terminal
-UX matrix pass the promotion gates.
+installed RC8 artifact passed two sequential zero-touch Claude wake generations
+there, including Stop re-arm and quiet-ack cleanup. The artifact remains a
+release candidate until clean-account tests, the remaining credentialed
+harness paths, and the terminal UX matrix pass the promotion gates.
 
 To preview the managed installer without touching a live installation, use
 isolated paths:

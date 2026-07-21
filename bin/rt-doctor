@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -641,8 +642,24 @@ def tripwire_process(pid: int, agent: str) -> tuple[bool, str]:
     except OSError as error:
         return False, str(error)
     command = proc.stdout.strip()
-    expected = f"rt-wait-inbox {agent}"
-    return proc.returncode == 0 and expected in command, command or "process unavailable"
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = []
+    waiter_indexes = [
+        index
+        for index, part in enumerate(parts)
+        if Path(part).name == "rt-wait-inbox"
+    ]
+    matches = False
+    if len(waiter_indexes) == 1:
+        arguments = parts[waiter_indexes[0] + 1 :]
+        matches = bool(
+            arguments
+            and arguments[0]
+            in {agent, "--claude-hook", "--claude-stop-hook"}
+        )
+    return proc.returncode == 0 and matches, command or "process unavailable"
 
 
 def configured_instances(project: Path) -> list[tuple[str, str]]:
