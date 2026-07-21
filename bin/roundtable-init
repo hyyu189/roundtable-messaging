@@ -437,11 +437,8 @@ def main():
     print(f"registered {project_dir}")
     print("next:")
     print(f"  cd {project_dir}")
-    print("  # launch a dedicated project session:")
-    print("  rt-claude  # or rt-hermes / rt-codex")
-    print("  # in a fresh Codex thread, arm native maildir wake once:")
-    print(f"  rt-codex-wake bind {project_dir}")
-    print("  rt-doctor")
+    print("  roundtable  # choose and launch a configured harness seat")
+    print("  roundtable doctor")
 
 
 if __name__ == "__main__":

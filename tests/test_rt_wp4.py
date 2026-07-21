@@ -334,11 +334,26 @@ def test_launcher_menu_allows_explicit_unanchored_start(tmp_path, monkeypatch):
     stderr = io.StringIO()
 
     selected = _rtlauncher.choose_launch_cwd(
-        "codex", cwd=tmp_path, stdin=TTYInput("3\n"), stderr=stderr
+        "hermes", cwd=tmp_path, stdin=TTYInput("3\n"), stderr=stderr
     )
 
     assert selected is None
     assert "advisory: starting without a Roundtable project anchor" in stderr.getvalue()
+
+
+def test_launcher_menu_hides_unanchored_start_for_codex(tmp_path, monkeypatch):
+    registry = write_registry(tmp_path / "projects.yaml", [])
+    monkeypatch.setenv("RT_PROJECTS_FILE", str(registry))
+    stderr = io.StringIO()
+
+    with pytest.raises(_rtlauncher.SelectionError, match="selection out of range"):
+        _rtlauncher.choose_launch_cwd(
+            "codex", cwd=tmp_path, stdin=TTYInput("3\n"), stderr=stderr
+        )
+
+    output = stderr.getvalue()
+    assert "Start without a project anchor" not in output
+    assert "requires a project anchor" in output
 
 
 def test_launcher_menu_can_safely_set_up_the_current_folder(
@@ -443,6 +458,11 @@ def test_launcher_exec_preserves_harness_contract(
     monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
     fake_binary = tmp_path / harness
     monkeypatch.setattr(_rtlauncher, "harness_bin", lambda _harness: fake_binary)
+    monkeypatch.setattr(
+        _rtlauncher,
+        "preflight_codex_services",
+        lambda *, ready_action=None: ready_action() if ready_action else None,
+    )
 
     with pytest.raises(ExecCalled):
         _rtlauncher.launch(harness, argv)

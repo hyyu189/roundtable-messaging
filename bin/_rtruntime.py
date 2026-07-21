@@ -24,6 +24,7 @@ from typing import Any
 LEASE_SCHEMA = "roundtable.session-lease.v1"
 PROJECT_SCHEMA = "roundtable.runtime-project.v1"
 DEFAULT_HEARTBEAT_TTL = 30.0
+BIND_REQUEST_LOCK_NAME = ".codex-bind-requests.lock"
 UNCHANGED = object()
 
 
@@ -161,7 +162,7 @@ def runtime_root() -> Path:
 def canonical_project(project: Path | str) -> Path:
     try:
         return Path(project).expanduser().resolve()
-    except OSError as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise RuntimeStateError(f"cannot resolve project root {project}: {error}") from error
 
 
@@ -323,6 +324,50 @@ def _locked(path: Path, *, shared: bool = False):
     finally:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextmanager
+def bind_request_guard(root: Path | str | None = None):
+    """Serialize Codex bind-request publication with conditional consumption.
+
+    The hook and wake bridge are separate processes.  They must share this
+    lock so a request cannot be replaced between the bridge's inode check and
+    unlink.  The lock lives outside the request queue and is never removed.
+    """
+    selected = runtime_root() if root is None else _absolute_runtime_path(
+        root,
+        "bind request runtime root",
+    )
+    with _locked(selected / BIND_REQUEST_LOCK_NAME):
+        yield
+
+
+@contextmanager
+def _existing_shared_lock(path: Path):
+    """Take a read lock without creating or chmodding runtime state."""
+
+    _validate_read_path(path, directory=False)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeStateError(f"cannot open runtime lock {path}: {error}") from error
+    handle = os.fdopen(descriptor, "r")
+    try:
+        opened = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_mode & 0o077
+        ):
+            raise RuntimeStateError(f"runtime lock changed while opening: {path}")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -656,6 +701,94 @@ def harness_lease_records(
     ]
 
 
+def inspect_host_harness_seats(
+    harness: str,
+    heartbeat_ttl: float = DEFAULT_HEARTBEAT_TTL,
+) -> list[SeatInspection]:
+    """Inspect every host-local seat for one harness without trusting a registry.
+
+    The project registry is user-facing discovery state and can be incomplete.
+    Service maintenance therefore walks the private runtime root itself.  Any
+    malformed, symlinked, foreign-owned, or overexposed runtime component raises
+    ``RuntimeStateError`` so callers can fail closed before disrupting a shared
+    harness service.
+    """
+
+    selected_harness = _validate_harness(harness)
+    root = runtime_root()
+    _validate_read_path(root, directory=True)
+    if _path_info(root) is None:
+        return []
+
+    projects_dir = root / "projects"
+    _validate_read_path(projects_dir, directory=True)
+    if _path_info(projects_dir) is None:
+        return []
+    try:
+        project_directories = sorted(projects_dir.iterdir())
+    except OSError as error:
+        raise RuntimeStateError(
+            f"cannot list runtime projects in {projects_dir}: {error}"
+        ) from error
+
+    inspections: list[SeatInspection] = []
+    for project_dir in project_directories:
+        _validate_read_path(project_dir, directory=True)
+        meta_path = project_dir / "project.json"
+        meta = _read_json(meta_path)
+        if meta is None:
+            raise RuntimeStateError(
+                f"runtime project metadata is missing: {meta_path}"
+            )
+        project_root = meta.get("projectRoot")
+        digest = meta.get("projectHash")
+        if (
+            meta.get("schema") != PROJECT_SCHEMA
+            or not isinstance(project_root, str)
+            or not project_root
+            or not isinstance(digest, str)
+            or not digest
+        ):
+            raise RuntimeStateError(
+                f"runtime project metadata is invalid: {meta_path}"
+            )
+        canonical = canonical_project(project_root)
+        if (
+            str(canonical) != project_root
+            or project_hash(canonical) != digest
+            or project_dir.name != digest
+        ):
+            raise RuntimeStateError(
+                f"runtime project metadata mismatch at {meta_path}"
+            )
+
+        paths = seat_paths(canonical, f"__inspect-{selected_harness}__", root=root)
+        if paths.project_dir != project_dir:
+            raise RuntimeStateError(
+                f"runtime project directory mismatch: {project_dir}"
+            )
+        _validate_project_meta(paths, canonical)
+        if _path_info(paths.agents_dir) is None:
+            continue
+        _validate_read_path(paths.agents_dir, directory=True)
+        if _path_info(paths.claim_lock) is None:
+            raise RuntimeStateError(
+                f"runtime project claim lock is missing: {paths.claim_lock}"
+            )
+        with _existing_shared_lock(paths.claim_lock):
+            records = _read_agent_records(paths, canonical)
+        for record in records:
+            if record.get("harness") == selected_harness:
+                inspections.append(
+                    _inspection_from_record(
+                        record,
+                        canonical,
+                        heartbeat_ttl=float(heartbeat_ttl),
+                    )
+                )
+    return inspections
+
+
 def claim(
     project: Path | str,
     agent_id: str,
@@ -679,6 +812,7 @@ def claim(
         )
     paths = seat_paths(canonical, agent_id)
     _ensure_private_dir(paths.runtime_root)
+    _ensure_private_dir(paths.runtime_root / "projects")
     _ensure_private_dir(paths.project_dir)
     _ensure_private_dir(paths.agents_dir)
     _ensure_private_dir(paths.agent_dir)
@@ -832,6 +966,7 @@ def legacy_harness_guard(
     selected_harness = _validate_harness(harness)
     paths = seat_paths(canonical, f"__legacy-{selected_harness}__")
     _ensure_private_dir(paths.runtime_root)
+    _ensure_private_dir(paths.runtime_root / "projects")
     _ensure_private_dir(paths.project_dir)
     _ensure_private_dir(paths.agents_dir)
 

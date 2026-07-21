@@ -1798,7 +1798,7 @@ def test_rt_refresh_without_caller_or_stored_binding_fails_without_state(tmp_pat
     assert not (state / "runtime.json").exists()
 
 
-def test_roundtable_init_next_steps_use_native_launch_and_codex_binding(tmp_path):
+def test_roundtable_init_next_steps_use_unified_entry_without_manual_binding(tmp_path):
     parent = tmp_path / "parent"
     parent.mkdir()
 
@@ -1812,9 +1812,9 @@ def test_roundtable_init_next_steps_use_native_launch_and_codex_binding(tmp_path
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "rt-claude  # or rt-hermes / rt-codex" in proc.stdout
-    assert f"rt-codex-wake bind {parent / 'sample'}" in proc.stdout
-    assert "rt-doctor" in proc.stdout
+    assert "roundtable  # choose and launch a configured harness seat" in proc.stdout
+    assert "roundtable doctor" in proc.stdout
+    assert "rt-codex-wake bind" not in proc.stdout
     assert "rt-refresh" not in proc.stdout
     assert "rt-watch" not in proc.stdout
 

@@ -226,13 +226,17 @@ is claimed; neither should fork the core transport.
 The release candidate now implements the host-local fenced lease, unified
 launcher selector, no-Git project initialization, dry-run-first harness setup,
 owned global skill links, Claude lifecycle hooks, the Hermes lifecycle plugin,
-and Codex plist generation. Automated tests exercise those config changes and
-their symmetric removal from an installed release artifact.
+Codex SessionStart auto-bind, and owned Codex service definitions. Automated
+tests exercise those config changes and their symmetric removal from an
+installed release artifact.
 
-Codex setup stops at writing plist definitions. Loading or reloading them is an
-explicit, coordinated operation because it may restart the app-server serving
-the current Codex session. A fresh Codex thread also must prove its project
-identity with `rt-codex-wake bind <project-root>`.
+Codex setup writes but does not load service definitions. The unified launcher
+then performs a fail-closed preflight: cold services and a stopped wake bridge
+can be repaired automatically, while a shared app-server reload is offered
+only outside Codex and only when no active or ambiguous Codex lease exists. A
+fresh trusted SessionStart hook queues the native thread identity; the bridge
+validates it against the exact project cwd and fenced launcher lease. Manual
+`rt-codex-wake bind` remains a diagnostic fallback.
 
 The remaining P0 promotion work is:
 

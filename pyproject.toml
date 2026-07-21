@@ -7,7 +7,7 @@ name = "roundtable-messaging"
 version = "0.1.0"
 description = "Durable local maildir coordination for coding agents"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 authors = [
   { name = "Roundtable contributors" },
@@ -34,6 +34,7 @@ test = [
 
 [project.scripts]
 roundtable-smoke = "roundtable_packaging.smoke:main"
+roundtable-migrate = "roundtable_packaging.migrate:main"
 roundtable-setup = "roundtable_packaging.setup:main"
 roundtable-uninstall = "roundtable_packaging.cli:uninstall_main"
 
@@ -52,6 +53,7 @@ script-files = [
   "bin/rt-claude",
   "bin/rt-codex",
   "bin/rt-codex-daemon",
+  "bin/rt-codex-session-start",
   "bin/rt-codex-wake",
   "bin/rt-doctor",
   "bin/rt-hermes",

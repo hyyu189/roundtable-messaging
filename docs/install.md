@@ -8,12 +8,15 @@ manifest and stops before overwriting an unrelated or locally modified path.
 
 The source-install path and extracted offline artifact pass automated
 clean-home installation, repeated-install, conflict, command, harness-setup,
-core-smoke, and uninstall tests. The artifact remains a release candidate until
-real credentialed harness wake tests and the terminal UX matrix pass the
-promotion gates.
+legacy-migration, core-smoke, and uninstall tests. The artifact remains a
+release candidate until the current machine is cut over, the Codex
+SessionStart identity spike passes, and real credentialed harness wake tests
+plus the terminal UX matrix pass the promotion gates.
 
-Do not run the default command over an active pre-manifest `~/.roundtable`
-installation. Preview it in isolated paths instead:
+Do not run the installer over an active pre-manifest `~/.roundtable`
+installation. Use the artifact's conservative migration flow described below,
+or preview the managed installer in isolated paths without touching the live
+installation:
 
 ```bash
 mamba run -n general ./scripts/install.sh \
@@ -42,6 +45,8 @@ Harness onboarding is a second ownership layer. After
   files owned by onboarding;
 - `~/.roundtable/backups/harness-setup/`: private backups of existing config
   files before a managed merge;
+- an owned Codex SessionStart fragment in `~/.codex/hooks.json`, when Codex is
+  selected;
 - `~/.claude/skills/roundtable`, `~/.hermes/skills/roundtable`, and/or
   `~/.codex/skills/roundtable`: selected harnesses' global discovery links to
   the one canonical installed skill.
@@ -54,7 +59,49 @@ Stable wrappers export one absolute host-local runtime root. Set
 `RT_CODEX_RUNTIME_DIR` remains a compatibility alias. If both are present they
 must name the same path, otherwise the command fails before launching a
 harness. The installer and Codex LaunchAgents create this root with user-only
-permissions.
+permissions. Keep a chosen override stable across setup and launch; changing it
+requires an ownership-safe setup upgrade before Codex starts.
+
+A single static custom `CODEX_HOME` is also supported when it is absolute,
+owned, and below the selected user home. Codex setup puts the hook and global
+skill link there and uses the matching app-server socket. Per-launch switching
+between multiple auth homes remains outside the P0 lifecycle contract.
+
+## New-user artifact journey
+
+The host must already have CPython 3.11 through 3.14. The archive bundles the
+Roundtable wheel and every Python package dependency, but not the interpreter;
+stock macOS alone does not guarantee this prerequisite. If `python3` is not a
+supported interpreter, set
+`ROUNDTABLE_BOOTSTRAP_PYTHON=/absolute/path/to/python3`.
+
+Then extract the release archive and run its installer. No source checkout,
+build, or network dependency download is part of this path:
+
+```bash
+tar -xzf roundtable-messaging-<version>-macos.tar.gz
+cd roundtable-messaging-<version>
+./install
+export PATH="$HOME/.local/bin:$PATH"  # once per shell; persist it in your shell profile
+roundtable
+```
+
+`roundtable` is the ordinary product entry. It selects or creates a project
+folder, lists only seats whose harness executable is available (and marks
+configured-but-missing harnesses unavailable), previews missing one-time
+integration for the chosen harness, and asks before applying any owned
+configuration. Git is optional and a project may be a non-code folder.
+
+The equivalent standalone controls are intentionally explicit:
+
+```bash
+roundtable setup          # read-only preview
+roundtable setup apply    # expert/scriptable apply
+roundtable setup status
+```
+
+Running `roundtable setup` without `apply` never writes configuration, creates
+runtime state, or invokes `launchctl`.
 
 ## Source install
 
@@ -86,9 +133,12 @@ daemon. Its isolated test environment loads no optional terminal adapter.
 This core smoke deliberately does not use credentials, launch a real harness,
 load a macOS service, or bind a Codex thread.
 
-## Host onboarding
+## Host onboarding details
 
-Run setup with no subcommand first:
+The normal `roundtable` flow invokes the same planner for only the harness the
+user selected. It displays the plan and requests confirmation before applying
+it. To inspect all detected harnesses without launching one, run setup with no
+subcommand:
 
 ```bash
 roundtable-setup
@@ -100,7 +150,7 @@ write configuration, or invoke `launchctl`. `apply` and `status` also never
 load or unload a service. Harnesses can be selected explicitly and repeatedly:
 
 ```bash
-roundtable-setup \
+roundtable setup \
   --harness claude \
   --harness hermes \
   --harness codex
@@ -109,8 +159,11 @@ roundtable-setup \
 After reviewing the plan:
 
 ```bash
-roundtable-setup apply
-roundtable-setup status
+roundtable setup apply \
+  --harness claude \
+  --harness hermes \
+  --harness codex
+roundtable setup status
 ```
 
 `apply` completes every collision and ownership check before its first
@@ -121,26 +174,38 @@ is idempotent. It performs these harness-specific actions:
 | --- | --- |
 | Claude | Merges a SessionStart inbox wake hook and Stop drain gate into `~/.claude/settings.json`; links the global Roundtable skill |
 | Hermes | Adds one marked `roundtable` plugin entry to `~/.hermes/config.yaml`; links the packaged plugin and global skill |
-| Codex | Writes the app-server and wake-bridge plist files under `~/Library/LaunchAgents`; links the global skill |
+| Codex | Merges one SessionStart auto-bind hook into `~/.codex/hooks.json`; writes the app-server and wake-bridge plist files under `~/Library/LaunchAgents`; links the global skill |
 
 Setup never installs Claude, Hermes, or Codex itself and never copies
 credentials. It configures only harnesses already detected, unless
 `--harness` is supplied explicitly.
 
-Codex is intentionally a two-step operation. `roundtable-setup apply` writes
-the plist files and creates the private runtime root, but never calls
-`launchctl`; writing a service definition cannot silently restart the Codex
-session performing the installation. From a different terminal or after
-coordinating a safe restart, load or reload both services and verify them:
+Codex may require a one-time `/hooks` review before it trusts the installed
+user-level SessionStart hook. That user decision cannot be automated and
+Roundtable never bypasses it.
 
-```bash
-rt-codex-daemon install --reload
-rt-codex-wake install --reload
-rt-doctor
-```
+Setup writes service definitions but still never calls `launchctl`. The normal
+Codex launcher performs a targeted service preflight afterward. When setup
+writes a new app-server plist, it also writes a private, digest-bound pending
+reload marker under `<prefix>/.runtime`; this prevents a still-responsive
+same-version daemon from being mistaken for the newly configured service:
 
-Do not run those reload commands inside the Codex thread whose app-server may
-be restarted.
+- `ready`: launch silently;
+- `cold`: start an unambiguously absent or stopped app-server;
+- `bridge_down`: restart only the wake bridge after validating the app-server;
+- `reload_required_idle`: explain the drift and ask before a coordinated
+  service-pair reload;
+- `reload_deferred_busy`: refuse the reload because a Codex caller, active
+  lease, unhealthy live lease, or ambiguous lease may be disrupted;
+- `setup_required`, `unsupported`, or `unsafe`: fail closed without launching.
+
+The preflight serializes repairs with a host lock, serializes its
+marker/plist/manifest snapshot with the setup lock, and re-checks state after
+acquiring both. A marked cold service is activated from the exact new plist and
+the marker is then cleared; a responsive shared daemon still requires the
+normal coordinated-reload decision. The low-level `rt-codex-daemon` and
+`rt-codex-wake` commands remain recovery tools for expert diagnosis; they are
+not steps in the normal onboarding journey.
 
 ## Project onboarding
 
@@ -189,15 +254,33 @@ rt-hermes
 rt-codex
 ```
 
+Roundtable Codex requires an initialized/registered project anchor. The anchor
+is what lets the launcher claim a fenced seat under the host service lock and
+lets SessionStart bind the correct native thread. The unanchored launcher
+choice remains available for Claude and Hermes; use native `codex` directly
+when no Roundtable project or messaging is wanted.
+
 Claude's installed hooks and the Hermes plugin handle their native inbox wake
-lifecycle. A fresh Codex thread still needs one explicit, cwd-verified binding:
+lifecycle. A fresh Codex thread normally binds without user input. The trusted
+SessionStart hook writes an atomic request containing the native session ID,
+cwd, and fenced Roundtable launcher identity, then returns without making an
+app-server RPC. The wake bridge later validates the exact thread ID, exact cwd,
+interactive source, root-thread status, and current lease before committing the
+binding.
+
+If diagnostics show that auto-bind was blocked or the hook has not yet been
+trusted, manual binding remains available as a fallback:
 
 ```bash
 rt-codex-wake bind /absolute/path/to/project
 ```
 
-The real send-to-wake-to-drain/ack path remains a release promotion gate even
-though the configuration cycle is automated and tested.
+Manual bind is not part of the normal user journey. The current machine has not
+yet run the live spike proving that Codex's hook `session_id` equals the
+app-server thread ID and that the injected Roundtable environment reaches the
+hook. That spike and the real send-to-wake-to-drain/ack path remain release
+promotion gates even though the configuration and queueing paths are automated
+and tested.
 
 ## Offline release install
 
@@ -212,24 +295,64 @@ Release mode uses `--no-index --only-binary` and does not download
 dependencies. If an unpacked archive has a top-level `wheels/` directory,
 `install.sh` selects it automatically.
 
+### Pre-manifest migration
+
+The extracted artifact also carries a migration entry point that runs before
+the managed package exists:
+
+```bash
+./migrate                 # default read-only plan
+./migrate apply           # back up and remove only recognized legacy leaves
+./install
+```
+
+The recognizer accepts only a clean Git-backed predecessor program tree,
+expected command links, the unmodified canonical skill, and known old
+Roundtable Codex plist shapes. Unknown, modified, symlinked, foreign-owned, or
+overexposed paths fail closed. `apply` records private byte-for-byte backups and
+never loads, unloads, or restarts a service. It uses read-only `launchctl print`
+only to prove the two known labels are stopped. It preserves the registry,
+runtime tree, project-local mailboxes, and every unlisted path.
+
+If migration has been applied but the managed installer has not yet replaced
+the paths, restore the predecessor with:
+
+```bash
+./migrate rollback
+```
+
+`apply` refuses to run inside Codex or while either recognized legacy Codex
+job is loaded. Stop those jobs in a coordinated maintenance window from
+Terminal.app, iTerm2, Ghostty, or another ordinary shell. If the migration
+reports those exact labels as loaded, the explicit operator step is:
+
+```bash
+launchctl bootout gui/$UID/com.roundtable.codex-wake
+launchctl bootout gui/$UID/com.roundtable.codex-app-server
+./migrate apply
+```
+
+The app-server bootout can disconnect sessions using that shared service,
+which is why neither migration nor normal setup performs it silently. The live
+development machine has not yet taken this cutover path.
+
 See [Release artifact process](release.md) for locked inputs, deterministic
 archive generation, checksums, and promotion gates.
 
 ## Upgrade gate
 
 Installing a new version atomically advances `~/.roundtable/current`; stable
-wrappers and owned LaunchAgent definitions use that path. A running Codex
-app-server does not change executable in place. After coordinating a safe
-session restart, reload both owned services and run diagnostics:
+wrappers and owned LaunchAgent definitions use that path. A repeated
+`roundtable setup apply` may update only plists and hook fragments whose old
+digests are proven by the setup manifest; foreign drift still fails closed. A
+running Codex app-server does not change executable in place.
 
-```bash
-rt-codex-daemon install --reload
-rt-codex-wake install --reload
-rt-doctor
-```
-
-Do not perform that reload from the Codex thread whose app-server may be
-restarted.
+On the next `roundtable` Codex launch, the service preflight compares the
+selected CLI, running app-server, socket, wake bridge heartbeat, current plist
+payloads, and every host-local Codex lease. It offers a coordinated reload only
+when that snapshot is idle and asks before disruption. When any consumer may
+still be live, it defers the reload and tells the user to close or resolve those
+sessions first. `rt-doctor` remains the read-only diagnostic view.
 
 ## Uninstall
 

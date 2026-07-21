@@ -99,6 +99,7 @@ def write_bridge_heartbeat(
             {
                 "schema": "roundtable.codex-wake-heartbeat.v1",
                 "pid": 123,
+                "bridgeBuildFingerprint": doctor.wake_bridge_build_fingerprint(),
                 "heartbeatAt": now,
                 "lastRpcOkAt": (
                     now if last_rpc_ok_at is None else last_rpc_ok_at

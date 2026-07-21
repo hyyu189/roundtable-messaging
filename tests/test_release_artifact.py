@@ -59,6 +59,15 @@ def test_outer_checksum_command_works_from_repo_root(tmp_path):
     assert f"{artifact.name}: OK" in process.stdout
 
 
+def test_release_workflow_exercises_read_only_artifact_migration():
+    workflow = (ROOT / ".github" / "workflows" / "release-artifact.yml").read_text()
+
+    assert "./migrate --home" in workflow
+    assert 'test ! -e "$prefix"' in workflow
+    assert 'export PATH="$link_dir:$PATH"' in workflow
+    assert 'HOME="$setup_home" roundtable --help' in workflow
+
+
 @pytest.fixture(scope="module")
 def release_repo(tmp_path_factory) -> Path:
     parent = tmp_path_factory.mktemp("release-repo")
@@ -255,8 +264,10 @@ def test_release_archive_is_deterministic_allowlisted_and_runtime_free(
         "docs/provenance/source-commits.tsv",
         "docs/release.md",
         "install",
+        "migrate",
         "roundtable_packaging/__init__.py",
         "roundtable_packaging/cli.py",
+        "roundtable_packaging/migrate.py",
         "roundtable_packaging/setup.py",
         "scripts/install.sh",
         "scripts/uninstall.sh",

@@ -5,17 +5,27 @@ the name “Roundtable” or every historical utility began during Build Week.
 
 ## Chronology
 
-### Before the submission period: keyboard-based prototype
+### Before the submission period: public cmux-centric v1 predecessor
 
-The private development repository contained a v1 implementation before Build
-Week. The last pre-period source baseline used for this audit is:
+The earlier implementation is publicly preserved, unchanged, as
+[`hyyu189/h2o`](https://github.com/hyyu189/h2o). The exact public snapshot used
+for this audit is:
 
-- `dc6f1e61d3fdf8c6b88c34b8af62bebd58be077f`
-- authored 2026-06-29 16:56:21 PDT
+- public commit `50683056c896bdb1ae2f74f6ac0740106b43bd36`;
+- MIT-licensed;
+- no Git tag or GitHub Release at the time of this audit.
 
-That version coupled delivery to terminal topology and keyboard-oriented wake
-behavior. Any baseline code imported here exists only to make the later rewrite
-and its tests understandable; it is not counted as Build Week output.
+That snapshot records a sync from the private development history at
+`dc6f1e61d3fdf8c6b88c34b8af62bebd58be077f` and earlier commits. The public
+snapshot therefore corroborates the pre-period baseline; it does not turn the
+pre-period work into Build Week output. v1 coupled delivery to cmux topology,
+surface identity, and keyboard-oriented wake behavior. It had a materially
+different user and runtime architecture from Messaging v2.
+
+The h2o repository will remain an unchanged historical predecessor rather than
+being overwritten by this release. Any applicable v1 material retained in the
+new implementation keeps its MIT notice in `NOTICE`; this repository as a
+whole is distributed under Apache License 2.0.
 
 ### Submission period: Messaging v2 rewrite
 
@@ -42,6 +52,10 @@ commit covers sanitization, packaging, installation and removal, current Codex
 compatibility, standalone validation, cmux decoupling, portable tests,
 documentation, release artifacts, and the judge demo. This phase is led and
 implemented through GPT-5.6 in Codex.
+
+The release narrative treats the public h2o snapshot as predecessor evidence,
+not as a release of this repository and not as work newly performed during the
+submission period.
 
 ## Contributor boundary
 

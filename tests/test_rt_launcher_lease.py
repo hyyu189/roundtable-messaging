@@ -233,6 +233,7 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
     )
     fake_binary = tmp_path / "codex"
     observed = {}
+    launch_order = []
     user_override = 'shell_environment_policy.set={MY_EXISTING_VALUE="keep"}'
     user_argv = ["-c", user_override, "--model", "gpt-5.6"]
     custom_runtime = (tmp_path / "custom-runtime").resolve()
@@ -250,8 +251,21 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
     )
     monkeypatch.setattr(
         _rtlauncher,
+        "preflight_codex_services",
+        lambda *, ready_action: (
+            launch_order.append("preflight"),
+            ready_action(),
+        ),
+    )
+
+    def claim_after_preflight(root, agent_id, harness):
+        launch_order.append("claim")
+        return lease(root, agent_id, revision=11)
+
+    monkeypatch.setattr(
+        _rtlauncher,
         "claim",
-        lambda root, agent_id, harness: lease(root, agent_id, revision=11),
+        claim_after_preflight,
     )
 
     def fake_execv(program, command):
@@ -293,6 +307,29 @@ def test_codex_propagates_claimed_seat_to_remote_tool_environment(
         "RT_RUNTIME_DIR": str(custom_runtime),
         "RT_CODEX_RUNTIME_DIR": str(custom_runtime),
     }
+    assert launch_order == ["preflight", "claim"]
+
+
+def test_unanchored_codex_fails_before_preflight_or_exec(tmp_path, monkeypatch):
+    clear_lease_environment(monkeypatch)
+    calls = []
+    monkeypatch.setattr(_rtlauncher, "choose_launch_cwd", lambda _harness: None)
+    monkeypatch.setattr(_rtlauncher, "project_at_or_above", lambda _cwd: None)
+    monkeypatch.setattr(
+        _rtlauncher,
+        "preflight_codex_services",
+        lambda **_kwargs: calls.append("preflight"),
+    )
+    monkeypatch.setattr(
+        _rtlauncher.os,
+        "execv",
+        lambda *_args: calls.append("exec"),
+    )
+
+    with pytest.raises(_rtlauncher.SelectionError, match="requires a Roundtable project"):
+        _rtlauncher.launch("codex", [])
+
+    assert calls == []
 
 
 def test_codex_injects_reserved_overrides_before_double_dash(monkeypatch):

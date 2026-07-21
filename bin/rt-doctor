@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import io
 import json
+import math
 import os
 import stat
 import subprocess
@@ -18,15 +22,28 @@ from _rtcodex import (
     RUNTIME_DIR,
     WAKE_LABEL,
     codex_version,
+    daemon_managed_codex_paths,
     daemon_version,
     launchd_loaded,
     pid_is_running,
     probe_handshake,
     validated_releases_text,
     version_is_validated,
+    wake_bridge_build_fingerprint,
 )
 from _rtlib import load_agents_doc, load_project_registry, projects_registry_path
 from _rtruntime import RuntimeStateError, harness_lease_records, inspect_seat
+
+
+BIND_REQUEST_SCHEMA = "roundtable.codex-bind-request.v1"
+BIND_REQUESTS_DIRNAME = "codex-bind-requests"
+BIND_REQUEST_MAX_BYTES = 64 * 1024
+BIND_REQUEST_SOURCES = frozenset({"startup", "resume", "clear"})
+DEFAULT_BIND_REQUEST_MAX_AGE = 30.0
+SAFE_CODEX_LAUNCH_FIX = (
+    "run `roundtable codex` from a normal terminal; approve a coordinated "
+    "reload only if Roundtable offers one"
+)
 
 
 def render_version(version) -> str:
@@ -64,7 +81,7 @@ def socket_check(path: Path) -> tuple[bool, str]:
 def daemon_fix(socket_path: Path) -> str:
     if socket_path != DEFAULT_SOCKET:
         return f"~/.roundtable/bin/rt-doctor --socket {DEFAULT_SOCKET}"
-    return "~/.roundtable/bin/rt-codex-daemon ensure"
+    return SAFE_CODEX_LAUNCH_FIX
 
 
 def socket_fix(socket_path: Path, detail: str) -> str:
@@ -75,18 +92,435 @@ def socket_fix(socket_path: Path, detail: str) -> str:
     if socket_path != DEFAULT_SOCKET:
         return f"~/.roundtable/bin/rt-doctor --socket {DEFAULT_SOCKET}"
     if "No such file" in detail:
-        return "~/.roundtable/bin/rt-codex-daemon ensure"
-    return f"inspect and replace unsafe socket path {socket_path}, then run rt-codex-daemon ensure"
+        return SAFE_CODEX_LAUNCH_FIX
+    return f"inspect the unsafe socket path {socket_path}, then {SAFE_CODEX_LAUNCH_FIX}"
 
 
-def parse_timestamp(value: str | None) -> datetime | None:
-    if not value:
+def parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _codex_setup_status(prefix: Path, home: Path) -> tuple[int, dict]:
+    """Run the ownership authority's read-only status command in-process."""
+    from roundtable_packaging import setup as harness_setup
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = harness_setup.main(
+            [
+                "status",
+                "--harness",
+                "codex",
+                "--prefix",
+                str(prefix),
+                "--home",
+                str(home),
+                "--json",
+            ]
+        )
+    try:
+        result = json.loads(stdout.getvalue())
+    except (TypeError, json.JSONDecodeError) as error:
+        detail = stderr.getvalue().strip() or stdout.getvalue().strip() or "no output"
+        raise ValueError(f"invalid roundtable-setup status output: {detail}") from error
+    if not isinstance(result, dict):
+        raise ValueError("roundtable-setup status did not return an object")
+    return code, result
+
+
+def report_codex_setup(
+    report: Report,
+    prefix: Path | None,
+    home: Path,
+) -> None:
+    """Report setup ownership without changing hooks, plists, or services."""
+    if prefix is None:
+        report.item(
+            "WARN",
+            "codex-setup",
+            "installation prefix unavailable; setup ownership was not checked",
+            "run the installed rt-doctor wrapper or pass --prefix <install-prefix>",
+        )
+        return
+    try:
+        code, result = _codex_setup_status(prefix, home)
+    except (ImportError, OSError, ValueError) as error:
+        report.item(
+            "FAIL",
+            "codex-setup",
+            f"cannot inspect Codex setup ownership: {error}",
+            "roundtable setup, then roundtable setup apply --harness codex",
+        )
+        return
+    harnesses = result.get("harnesses")
+    detail = harnesses.get("codex") if isinstance(harnesses, dict) else None
+    state = detail.get("state") if isinstance(detail, dict) else None
+    if code == 0 and result.get("ok") is True and state == "configured":
+        report.item(
+            "OK",
+            "codex-setup",
+            "LaunchAgents, skill link, and SessionStart hook match the recorded ownership",
+        )
+        return
+    if code == 0 and result.get("ok") is True and state == "upgrade_required":
+        actions = detail.get("actions") if isinstance(detail, dict) else None
+        rendered = "; ".join(str(item) for item in (actions or []))
+        report.item(
+            "FAIL",
+            "codex-setup",
+            "Codex setup upgrade is required" + (f": {rendered}" if rendered else ""),
+            "roundtable setup, then roundtable setup apply --harness codex",
+        )
+        return
+    if code == 0 and result.get("ok") is True and state == "not_configured":
+        report.item(
+            "WARN",
+            "codex-setup",
+            "Codex is not configured by this Roundtable installation",
+            "run `roundtable setup` only if this Roundtable uses a Codex seat",
+        )
+        return
+    explanation = str(result.get("error") or f"unexpected setup state {state!r}")
+    report.item(
+        "FAIL",
+        "codex-setup",
+        explanation,
+        "roundtable setup, then roundtable setup apply --harness codex",
+    )
+
+
+def _request_summary(path: Path, now: datetime) -> tuple[float, str]:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("entry is not a regular file")
+    if info.st_uid != os.getuid():
+        raise ValueError(f"owner uid {info.st_uid} != {os.getuid()}")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        raise ValueError(f"unsafe mode {mode:04o}")
+    if info.st_size > BIND_REQUEST_MAX_BYTES:
+        raise ValueError(f"size {info.st_size} exceeds {BIND_REQUEST_MAX_BYTES} bytes")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_mode & 0o077
+                or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+            ):
+                raise ValueError("entry changed or became unsafe while being inspected")
+            raw = handle.read(BIND_REQUEST_MAX_BYTES + 1)
+        if len(raw) > BIND_REQUEST_MAX_BYTES:
+            raise ValueError(f"size exceeds {BIND_REQUEST_MAX_BYTES} bytes")
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("payload is not an object")
+    if payload.get("schema") != BIND_REQUEST_SCHEMA:
+        raise ValueError("schema is missing or invalid")
+    if payload.get("hookEventName") != "SessionStart":
+        raise ValueError("hook event is not SessionStart")
+    if payload.get("source") not in BIND_REQUEST_SOURCES:
+        raise ValueError("SessionStart source is unsupported")
+    required = (
+        "projectRoot",
+        "agentId",
+        "roundtableSessionId",
+        "leaseRevision",
+        "threadId",
+    )
+    if any(
+        not isinstance(payload.get(name), str) or not payload[name] or "\0" in payload[name]
+        for name in required
+    ):
+        raise ValueError("one or more identity fields are missing or invalid")
+    identity = "\0".join(
+        payload[name]
+        for name in (
+            "projectRoot",
+            "agentId",
+            "roundtableSessionId",
+            "leaseRevision",
+        )
+    )
+    expected_name = f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()}.json"
+    if path.name != expected_name:
+        raise ValueError("filename does not match the fenced lease identity")
+    created_at = parse_timestamp(payload.get("createdAt"))
+    if created_at is None:
+        raise ValueError("createdAt is missing or invalid")
+    age = (now - created_at.astimezone(timezone.utc)).total_seconds()
+    if age < -5:
+        raise ValueError(f"createdAt is {-age:.1f}s in the future")
+    project = Path(payload["projectRoot"]).name or payload["projectRoot"]
+    return max(0.0, age), f"{path.name} project={project} source={payload['source']}"
+
+
+def report_bind_request_queue(
+    report: Report,
+    runtime_dir: Path,
+    max_age: float,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Inspect auto-bind requests without accepting, rejecting, or deleting them."""
+    queue = runtime_dir.expanduser().absolute() / BIND_REQUESTS_DIRNAME
+    try:
+        info = queue.lstat()
+    except FileNotFoundError:
+        report.item("OK", "auto-bind-queue", "no pending SessionStart requests")
+        return
+    except OSError as error:
+        report.item(
+            "FAIL",
+            "auto-bind-queue",
+            f"cannot inspect {queue}: {error}",
+            "repair the private runtime directory, then rerun rt-doctor",
+        )
+        return
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or mode & 0o077
+    ):
+        report.item(
+            "FAIL",
+            "auto-bind-queue",
+            f"unsafe request directory {queue} owner={info.st_uid} mode={mode:04o}",
+            f"inspect {queue}; do not remove entries until their ownership is understood",
+        )
+        return
+    try:
+        entries = sorted(queue.iterdir())
+    except OSError as error:
+        report.item(
+            "FAIL",
+            "auto-bind-queue",
+            f"cannot list {queue}: {error}",
+            "repair the private runtime directory, then rerun rt-doctor",
+        )
+        return
+    if not entries:
+        report.item("OK", "auto-bind-queue", "no pending SessionStart requests")
+        return
+
+    observed = now or datetime.now(timezone.utc)
+    fresh: list[str] = []
+    stale: list[str] = []
+    invalid: list[str] = []
+    transient: list[str] = []
+    for path in entries:
+        if path.name.startswith("."):
+            try:
+                hidden_info = path.lstat()
+            except OSError as error:
+                invalid.append(f"{path.name}: {error}")
+                continue
+            hidden_mode = stat.S_IMODE(hidden_info.st_mode)
+            if (
+                stat.S_ISLNK(hidden_info.st_mode)
+                or not stat.S_ISREG(hidden_info.st_mode)
+                or hidden_info.st_uid != os.getuid()
+                or hidden_mode & 0o077
+            ):
+                invalid.append(f"{path.name}: unsafe atomic temporary entry")
+                continue
+            age = max(0.0, observed.timestamp() - hidden_info.st_mtime)
+            target = stale if age > max_age else transient
+            target.append(f"{path.name} age={age:.1f}s")
+            continue
+        try:
+            age, summary = _request_summary(path, observed)
+        except (OSError, ValueError) as error:
+            invalid.append(f"{path.name}: {error}")
+            continue
+        target = stale if age > max_age else fresh
+        target.append(f"{summary} age={age:.1f}s")
+
+    if invalid:
+        sample = "; ".join(invalid[:3])
+        if len(invalid) > 3:
+            sample += f"; +{len(invalid) - 3} more"
+        report.item(
+            "FAIL",
+            "auto-bind-queue",
+            f"{len(invalid)} unsafe or malformed request entry(s): {sample}",
+            f"inspect {queue}; rt-doctor intentionally left every entry untouched",
+        )
+    if stale:
+        sample = "; ".join(stale[:3])
+        if len(stale) > 3:
+            sample += f"; +{len(stale) - 3} more"
+        report.item(
+            "FAIL",
+            "auto-bind-queue",
+            f"{len(stale)} request or temporary entry(s) older than {max_age:.1f}s: {sample}",
+            "repair the wake bridge, then rerun rt-doctor; the bridge will safely accept or reject requests",
+        )
+    if fresh:
+        report.item(
+            "WARN",
+            "auto-bind-queue",
+            f"{len(fresh)} fresh request(s) awaiting bridge validation: "
+            + "; ".join(fresh[:3]),
+            f"wait up to {max_age:.1f}s and rerun rt-doctor",
+        )
+    if transient:
+        report.item(
+            "WARN",
+            "auto-bind-queue",
+            f"{len(transient)} fresh atomic temporary entry(s): "
+            + "; ".join(transient[:3]),
+            f"rerun rt-doctor if still present after {max_age:.1f}s",
+        )
+
+
+def _configured_codex_projects(registry_path: Path) -> list[Path]:
+    entries, _warnings = load_project_registry(registry_path)
+    projects: list[Path] = []
+    for entry in entries:
+        project = entry["root"]
+        try:
+            configured = configured_instances(project)
+        except (OSError, UnicodeError, ValueError, SystemExit):
+            continue
+        if any(harness_family(harness) == "codex" for _agent, harness in configured):
+            projects.append(project)
+    return projects
+
+
+def report_hook_trust(
+    report: Report,
+    registry_path: Path,
+    socket_path: Path,
+    rpc_ok: bool,
+) -> None:
+    """Mirror the bridge's read-only hooks/list trust gate for Codex projects."""
+    projects = _configured_codex_projects(registry_path)
+    if not projects:
+        report.item("OK", "hook-trust", "no configured Codex projects to check")
+        return
+    if not rpc_ok:
+        report.item(
+            "WARN",
+            "hook-trust",
+            f"unchecked for {len(projects)} Codex project(s) because RPC is unavailable",
+            daemon_fix(socket_path),
+        )
+        return
+    client = None
+    try:
+        client = AppServerClient(socket_path)
+        result = client.request("hooks/list", {"cwds": [str(path) for path in projects]})
+        if not isinstance(result, dict):
+            raise ValueError("hooks/list returned a non-object response")
+        data = result.get("data")
+        if not isinstance(data, list):
+            raise ValueError("hooks/list returned invalid data")
+        for project in projects:
+            matches = []
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                value = entry.get("cwd")
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    cwd = Path(value).expanduser().resolve()
+                except OSError:
+                    continue
+                if cwd == project:
+                    matches.append(entry)
+            if len(matches) != 1:
+                report.item(
+                    "FAIL",
+                    "hook-trust",
+                    f"project={project} hooks/list returned {len(matches)} matching entries",
+                    f"launch Codex from {project}, run /hooks, then rerun rt-doctor",
+                )
+                continue
+            entry = matches[0]
+            errors = entry.get("errors")
+            hooks = entry.get("hooks")
+            if not isinstance(errors, list) or not isinstance(hooks, list):
+                report.item(
+                    "FAIL",
+                    "hook-trust",
+                    f"project={project} hooks/list response is malformed",
+                    f"launch Codex from {project}, run /hooks, then rerun rt-doctor",
+                )
+                continue
+            if errors:
+                report.item(
+                    "FAIL",
+                    "hook-trust",
+                    f"project={project} has {len(errors)} hook discovery error(s)",
+                    f"launch Codex from {project}, run /hooks, then rerun rt-doctor",
+                )
+                continue
+            blockers = []
+            unknown = []
+            enabled_count = 0
+            for hook in hooks:
+                if not isinstance(hook, dict) or not hook.get("enabled"):
+                    continue
+                enabled_count += 1
+                trust = hook.get("trustStatus")
+                key = hook.get("key") or "unknown"
+                if trust not in {"managed", "trusted", "untrusted", "modified"}:
+                    unknown.append(f"{key}={trust!r}")
+                elif trust in {"untrusted", "modified"}:
+                    blockers.append(f"{key}={trust}")
+            if unknown:
+                report.item(
+                    "FAIL",
+                    "hook-trust",
+                    f"project={project} has unknown enabled hook trust state: "
+                    + ", ".join(unknown[:3]),
+                    "upgrade or validate Codex protocol support before enabling wake",
+                )
+            elif blockers:
+                report.item(
+                    "FAIL",
+                    "hook-trust",
+                    f"project={project} wake is blocked pending hook review: "
+                    + ", ".join(blockers[:3]),
+                    f"launch Codex from {project}, run /hooks, review the enabled hooks, then rerun rt-doctor",
+                )
+            else:
+                report.item(
+                    "OK",
+                    "hook-trust",
+                    f"project={project} has {enabled_count} enabled hook(s), all managed or trusted",
+                )
+    except (OSError, TimeoutError, ValueError, RuntimeError) as error:
+        report.item(
+            "FAIL",
+            "hook-trust",
+            f"hooks/list failed: {error}",
+            daemon_fix(socket_path),
+        )
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
 
 
 def bridge_check(
@@ -113,6 +547,18 @@ def bridge_check(
         return False, f"heartbeat pid {heartbeat.get('pid')} != live pid {pid}"
     if heartbeat.get("schema") != "roundtable.codex-wake-heartbeat.v1":
         return False, "heartbeat schema is missing or invalid"
+    try:
+        expected_build = wake_bridge_build_fingerprint()
+    except (OSError, RuntimeError) as error:
+        return False, f"cannot fingerprint the installed wake bridge: {error}"
+    reported_build = heartbeat.get("bridgeBuildFingerprint")
+    if reported_build != expected_build:
+        rendered = reported_build if isinstance(reported_build, str) else "missing"
+        return (
+            False,
+            "wake bridge build fingerprint is stale or invalid: "
+            f"reported={rendered} expected={expected_build}",
+        )
     reported_socket = heartbeat.get("socketPath")
     if not isinstance(reported_socket, str) or not reported_socket:
         return False, "heartbeat socketPath is missing or invalid"
@@ -841,120 +1287,197 @@ def main() -> int:
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--runtime-dir", type=Path, default=RUNTIME_DIR)
     parser.add_argument("--bridge-max-age", type=float, default=15.0)
+    parser.add_argument(
+        "--bind-request-max-age",
+        type=float,
+        default=DEFAULT_BIND_REQUEST_MAX_AGE,
+        help="diagnostic stale threshold in seconds; requests are never deleted",
+    )
     parser.add_argument("--registry", type=Path, default=projects_registry_path())
     parser.add_argument("--state-file", type=Path)
+    parser.add_argument("--prefix", type=Path)
+    parser.add_argument("--home", type=Path)
     args = parser.parse_args()
+    if not math.isfinite(args.bind_request_max_age) or args.bind_request_max_age <= 0:
+        parser.error("--bind-request-max-age must be a finite value greater than zero")
     report = Report()
 
-    cli_version, cli_output = codex_version()
-    daemon, daemon_output = daemon_version(args.socket)
-    daemon_socket_matches = bool(
-        daemon
-        and Path(daemon.get("socketPath") or "").expanduser() == args.socket.expanduser()
+    configured_prefix = (
+        args.prefix
+        if args.prefix is not None
+        else os.environ.get("ROUNDTABLE_INSTALL_PREFIX") or None
     )
-    if daemon and daemon.get("status") == "running" and daemon_socket_matches:
-        report.item(
-            "OK",
-            "daemon",
-            f"running app-server={daemon.get('appServerVersion')} socket={daemon.get('socketPath')}",
-        )
-    else:
-        if daemon and daemon.get("status") == "running" and not daemon_socket_matches:
-            daemon_output = (
-                f"reported socket {daemon.get('socketPath')} != requested {args.socket}"
-            )
-        report.item(
-            "FAIL",
-            "daemon",
-            daemon_output or "daemon is not running",
-            daemon_fix(args.socket),
-        )
-
-    socket_ok, socket_detail = socket_check(args.socket)
-    report.item(
-        "OK" if socket_ok else "FAIL",
-        "socket",
-        socket_detail,
-        "none"
-        if socket_ok
-        else socket_fix(args.socket, socket_detail),
+    prefix = (
+        Path(configured_prefix).expanduser().absolute()
+        if configured_prefix is not None
+        else None
     )
+    home = (args.home or Path.home()).expanduser().absolute()
+    report_codex_setup(report, prefix, home)
 
-    rpc_ok, rpc_detail = probe_handshake(args.socket)
-    report.item(
-        "OK" if rpc_ok else "FAIL",
-        "rpc",
-        rpc_detail,
-        "none"
-        if rpc_ok
-        else daemon_fix(args.socket),
-    )
+    resolver_error = None
+    try:
+        cli_version, cli_output = codex_version()
+    except (OSError, RuntimeError) as error:
+        cli_version, cli_output = None, ""
+        resolver_error = str(error)
 
+    daemon = None
+    daemon_output = ""
+    rpc_ok = False
     version_supported = False
-    if cli_version is None:
+    if resolver_error is not None:
         report.item(
-            "FAIL",
-            "version",
-            f"could not parse CLI version: {cli_output}",
-            f"install a validated Codex release ({validated_releases_text()})",
+            "WARN",
+            "codex-cli",
+            f"Codex resolver unavailable: {resolver_error}",
+            "install Codex only if this Roundtable uses a Codex seat",
         )
+        for name, detail in (
+            ("daemon", "skipped because no Codex executable is available"),
+            ("socket", "skipped because no Codex executable is available"),
+            ("rpc", "skipped because no Codex executable is available"),
+            ("version", "skipped because no Codex executable is available"),
+            ("bridge", "skipped because no Codex executable is available"),
+        ):
+            report.item("SKIP", name, detail)
     else:
-        daemon_cli_version = (daemon or {}).get("cliVersion")
-        app_server_version = (daemon or {}).get("appServerVersion")
-        rendered_cli = render_version(cli_version)
-        if daemon and daemon_cli_version != rendered_cli:
-            report.item(
-                "FAIL",
-                "version",
-                f"selected CLI {rendered_cli} != daemon CLI {daemon_cli_version}",
-                "~/.roundtable/bin/rt-codex-daemon install --reload",
-            )
-        elif daemon and app_server_version != rendered_cli:
-            report.item(
-                "FAIL",
-                "version",
-                f"CLI {rendered_cli} != app-server {app_server_version}",
-                "~/.roundtable/bin/rt-codex-daemon install --reload",
-            )
-        elif version_is_validated(cli_version):
-            version_supported = True
+        try:
+            daemon, daemon_output = daemon_version(args.socket)
+        except (OSError, RuntimeError) as error:
+            daemon_output = f"cannot inspect app-server daemon: {error}"
+        daemon_socket_matches = bool(
+            daemon
+            and Path(daemon.get("socketPath") or "").expanduser()
+            == args.socket.expanduser()
+        )
+        daemon_identity_detail = None
+        if daemon and daemon.get("status") == "running" and daemon_socket_matches:
+            try:
+                selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
+                if managed_codex != selected_codex:
+                    daemon_identity_detail = (
+                        "selected CLI/daemon managed Codex path mismatch: "
+                        f"selected={selected_codex} daemon={managed_codex}"
+                    )
+            except (OSError, RuntimeError) as error:
+                daemon_identity_detail = str(error)
+        if (
+            daemon
+            and daemon.get("status") == "running"
+            and daemon_socket_matches
+            and daemon_identity_detail is None
+        ):
             report.item(
                 "OK",
-                "version",
-                f"{rendered_cli} is an explicitly validated release "
-                f"({validated_releases_text()})",
+                "daemon",
+                f"running app-server={daemon.get('appServerVersion')} "
+                f"socket={daemon.get('socketPath')} "
+                f"managed-codex={daemon.get('managedCodexPath')}",
             )
         else:
+            if daemon_identity_detail is not None:
+                daemon_output = daemon_identity_detail
+            elif daemon and daemon.get("status") == "running" and not daemon_socket_matches:
+                daemon_output = (
+                    f"reported socket {daemon.get('socketPath')} != requested {args.socket}"
+                )
+            report.item(
+                "FAIL",
+                "daemon",
+                daemon_output or "daemon is not running",
+                daemon_fix(args.socket),
+            )
+
+        socket_ok, socket_detail = socket_check(args.socket)
+        report.item(
+            "OK" if socket_ok else "FAIL",
+            "socket",
+            socket_detail,
+            "none" if socket_ok else socket_fix(args.socket, socket_detail),
+        )
+
+        try:
+            rpc_ok, rpc_detail = probe_handshake(args.socket)
+        except (OSError, RuntimeError) as error:
+            rpc_ok, rpc_detail = False, str(error)
+        report.item(
+            "OK" if rpc_ok else "FAIL",
+            "rpc",
+            rpc_detail,
+            "none" if rpc_ok else daemon_fix(args.socket),
+        )
+
+        if cli_version is None:
             report.item(
                 "FAIL",
                 "version",
-                f"{rendered_cli} is not an explicitly validated release; "
-                "bridge wake disabled",
-                f"install or validate one of: {validated_releases_text()}",
+                f"could not parse CLI version: {cli_output}",
+                f"install a validated Codex release ({validated_releases_text()})",
             )
+        else:
+            daemon_cli_version = (daemon or {}).get("cliVersion")
+            app_server_version = (daemon or {}).get("appServerVersion")
+            rendered_cli = render_version(cli_version)
+            if daemon and daemon_cli_version != rendered_cli:
+                report.item(
+                    "FAIL",
+                    "version",
+                    f"selected CLI {rendered_cli} != daemon CLI {daemon_cli_version}",
+                    SAFE_CODEX_LAUNCH_FIX,
+                )
+            elif daemon and app_server_version != rendered_cli:
+                report.item(
+                    "FAIL",
+                    "version",
+                    f"CLI {rendered_cli} != app-server {app_server_version}",
+                    SAFE_CODEX_LAUNCH_FIX,
+                )
+            elif version_is_validated(cli_version):
+                version_supported = True
+                report.item(
+                    "OK",
+                    "version",
+                    f"{rendered_cli} is an explicitly validated release "
+                    f"({validated_releases_text()})",
+                )
+            else:
+                report.item(
+                    "FAIL",
+                    "version",
+                    f"{rendered_cli} is not an explicitly validated release; "
+                    "bridge wake disabled",
+                    f"install or validate one of: {validated_releases_text()}",
+                )
 
-    bridge_ok, bridge_detail = bridge_check(
+        bridge_ok, bridge_detail = bridge_check(
+            args.runtime_dir,
+            args.bridge_max_age,
+            args.socket,
+        )
+        if bridge_ok:
+            bridge_level = "OK"
+            bridge_fix = "none"
+        elif not version_supported:
+            bridge_level = "FAIL"
+            bridge_fix = f"install or validate one of: {validated_releases_text()}"
+        else:
+            bridge_level = "FAIL"
+            try:
+                launchd_loaded(WAKE_LABEL)
+            except (OSError, RuntimeError) as error:
+                bridge_detail += f"; launchd inspection failed: {error}"
+            bridge_fix = SAFE_CODEX_LAUNCH_FIX
+        report.item(
+            bridge_level,
+            "bridge",
+            bridge_detail,
+            bridge_fix,
+        )
+    report_bind_request_queue(
+        report,
         args.runtime_dir,
-        args.bridge_max_age,
-        args.socket,
-    )
-    if bridge_ok:
-        bridge_level = "OK"
-        bridge_fix = "none"
-    elif not version_supported:
-        bridge_level = "FAIL"
-        bridge_fix = f"install or validate one of: {validated_releases_text()}"
-    elif launchd_loaded(WAKE_LABEL):
-        bridge_level = "FAIL"
-        bridge_fix = "launchctl kickstart -k gui/$(id -u)/com.roundtable.codex-wake"
-    else:
-        bridge_level = "FAIL"
-        bridge_fix = "~/.roundtable/bin/rt-codex-wake install"
-    report.item(
-        bridge_level,
-        "bridge",
-        bridge_detail,
-        bridge_fix,
+        args.bind_request_max_age,
     )
     state_file = args.state_file or args.runtime_dir / "rt-codex-wake-state.json"
     previous_runtime = os.environ.get("RT_RUNTIME_DIR")
@@ -966,6 +1489,7 @@ def main() -> int:
         project_health_checks(
             report, args.registry, state_file, args.socket, rpc_ok
         )
+        report_hook_trust(report, args.registry, args.socket, rpc_ok)
     finally:
         if previous_runtime is None:
             os.environ.pop("RT_RUNTIME_DIR", None)

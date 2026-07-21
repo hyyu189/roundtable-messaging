@@ -38,9 +38,12 @@ CODEX_LABELS = (
     "com.roundtable.codex-app-server",
     "com.roundtable.codex-wake",
 )
+CODEX_RELOAD_MARKER_SCHEMA = "roundtable.codex-app-server-reload-required.v1"
+CODEX_RELOAD_MARKER_NAME = "codex-app-server-reload-required.json"
 # rt-wait-inbox can back off as far as 240 minutes. Claude Code otherwise
 # applies a ten-minute default timeout to async command hooks.
 CLAUDE_HOOK_TIMEOUT_SECONDS = 15_000
+CODEX_HOOK_TIMEOUT_SECONDS = 5
 
 
 class SetupError(RuntimeError):
@@ -652,6 +655,55 @@ def _manifest_path(prefix: Path) -> Path:
     return prefix / "harness-setup.json"
 
 
+def _codex_reload_marker_path(prefix: Path) -> Path:
+    return prefix / ".runtime" / CODEX_RELOAD_MARKER_NAME
+
+
+def _codex_reload_marker_value(
+    prefix: Path,
+    app_plist_path: Path,
+    app_plist_digest: str,
+) -> dict[str, str]:
+    return {
+        "schema": CODEX_RELOAD_MARKER_SCHEMA,
+        "prefix": str(prefix),
+        "label": "com.roundtable.codex-app-server",
+        "appPlistPath": str(app_plist_path),
+        "appPlistDigest": app_plist_digest,
+    }
+
+
+def _validate_codex_reload_marker(
+    prefix: Path,
+    app_plist_path: Path,
+    app_plist_digest: str,
+) -> None:
+    """Fail closed on a present marker not owned by this exact app plist."""
+
+    path = _codex_reload_marker_path(prefix)
+    _validate_owned_chain(prefix, path.parent)
+    raw = _read_regular(path)
+    if raw is None:
+        return
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise SetupError(f"unsafe Codex reload marker mode {mode:04o}: {path}")
+    try:
+        value = json.loads(raw[0])
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SetupError(f"invalid Codex reload marker at {path}: {error}") from error
+    expected = _codex_reload_marker_value(
+        prefix,
+        app_plist_path,
+        app_plist_digest,
+    )
+    if value != expected:
+        raise SetupError(
+            "Codex reload marker does not match the managed app-server plist: "
+            f"{path}"
+        )
+
+
 def _load_manifest(prefix: Path, home: Path) -> dict[str, Any] | None:
     path = _manifest_path(prefix)
     raw = _read_regular(path)
@@ -710,7 +762,79 @@ def _claude_groups(prefix: Path) -> dict[str, dict[str, Any]]:
     }
 
 
+def _codex_groups(prefix: Path) -> dict[str, dict[str, Any]]:
+    """Return the one lifecycle hook Roundtable owns in Codex.
+
+    The hook only records a fenced bind request.  The wake bridge performs the
+    app-server identity validation later, outside the SessionStart callback.
+    """
+
+    return {
+        "SessionStart": {
+            "matcher": "startup|resume|clear",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": str(prefix / "bin" / "rt-codex-session-start"),
+                    "timeout": CODEX_HOOK_TIMEOUT_SECONDS,
+                }
+            ],
+        }
+    }
+
+
+def _uses_ambient_harness_paths(home: Path) -> bool:
+    configured_home = os.environ.get("HOME")
+    return configured_home is not None and _absolute(configured_home) == home
+
+
+def _selected_codex_home(home: Path) -> Path:
+    configured = (
+        os.environ.get("CODEX_HOME")
+        if _uses_ambient_harness_paths(home)
+        else None
+    )
+    selected = _absolute(configured) if configured else home / ".codex"
+    try:
+        selected.relative_to(home)
+    except ValueError as error:
+        raise SetupError(
+            f"CODEX_HOME must stay under the selected home {home}: {selected}"
+        ) from error
+    return selected
+
+
+def _selected_runtime(home: Path, prefix: Path) -> Path:
+    if not _uses_ambient_harness_paths(home):
+        return prefix / ".runtime"
+    generic = os.environ.get("RT_RUNTIME_DIR")
+    legacy = os.environ.get("RT_CODEX_RUNTIME_DIR")
+
+    def selected(value: str | None, label: str) -> Path | None:
+        if not value:
+            return None
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            raise SetupError(f"{label} must resolve to an absolute path: {value!r}")
+        return Path(os.path.normpath(str(candidate)))
+
+    generic_path = selected(generic, "RT_RUNTIME_DIR")
+    legacy_path = selected(legacy, "RT_CODEX_RUNTIME_DIR")
+    if (
+        generic_path is not None
+        and legacy_path is not None
+        and generic_path != legacy_path
+    ):
+        raise SetupError(
+            "RT_RUNTIME_DIR and RT_CODEX_RUNTIME_DIR select different runtime "
+            f"roots: {generic_path} != {legacy_path}"
+        )
+    return generic_path or legacy_path or prefix / ".runtime"
+
+
 def _skill_path(home: Path, harness: str) -> Path:
+    if harness == "codex":
+        return _selected_codex_home(home) / "skills" / "roundtable"
     return home / f".{harness}" / "skills" / "roundtable"
 
 
@@ -766,6 +890,15 @@ def _validate_source(target: Path, description: str) -> None:
         raise SetupError(f"{description} is missing at {target}") from error
     if not resolved.is_dir():
         raise SetupError(f"{description} is not a directory: {target}")
+
+
+def _validate_executable(target: Path, description: str) -> None:
+    try:
+        resolved = target.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise SetupError(f"{description} is missing at {target}") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SetupError(f"{description} is not executable: {target}")
 
 
 def _prepare_claude(home: Path, prefix: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -911,8 +1044,8 @@ def _codex_context(home: Path, prefix: Path) -> Iterator[Any]:
         "CODEX_HOME",
     )
     saved_environment = {name: os.environ.get(name) for name in env_names}
-    runtime = prefix / ".runtime"
-    codex_home = home / ".codex"
+    runtime = _selected_runtime(home, prefix)
+    codex_home = _selected_codex_home(home)
     socket = codex_home / "app-server-control" / "app-server-control.sock"
     try:
         os.environ.update(
@@ -966,7 +1099,11 @@ def _codex_payloads(
     *,
     ensure_runtime: bool,
 ) -> dict[str, dict[str, Any]]:
-    socket = home / ".codex" / "app-server-control" / "app-server-control.sock"
+    socket = (
+        _selected_codex_home(home)
+        / "app-server-control"
+        / "app-server-control.sock"
+    )
     try:
         with _codex_context(home, prefix) as module:
             return {
@@ -997,16 +1134,95 @@ def _require_validated_codex_release(home: Path, prefix: Path) -> None:
         raise SetupError(f"cannot validate Codex CLI release: {error}") from error
 
 
+def _prepare_codex_config(
+    home: Path,
+    prefix: Path,
+    existing_record: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = _selected_codex_home(home) / "hooks.json"
+    _validate_user_chain(home, path)
+    before, raw, mode = _load_json_config(path)
+
+    if existing_record is not None and isinstance(
+        existing_record.get("config"), dict
+    ):
+        # The owned fragment was validated against the current file before
+        # preparation.  Keep its original creation/ownership metadata.
+        return copy.deepcopy(existing_record["config"]), {
+            "path": path,
+            "before": raw,
+            "after": raw,
+            "mode": mode,
+            "changed": False,
+            "backup_label": "codex-hooks.json",
+        }
+
+    after = copy.deepcopy(before)
+    hooks_added = "hooks" not in after
+    if hooks_added:
+        after["hooks"] = {}
+    hooks = after.get("hooks")
+    if not isinstance(hooks, dict):
+        raise SetupError(f"Codex hooks must be an object: {path}")
+
+    event = "SessionStart"
+    event_added = event not in hooks
+    if event_added:
+        hooks[event] = []
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        raise SetupError(f"Codex hook event {event} must be a list: {path}")
+    group = _codex_groups(prefix)[event]
+    count = groups.count(group)
+    if count > 1:
+        raise SetupError(
+            f"Codex hook event {event} contains duplicate Roundtable "
+            f"fragments: {path}"
+        )
+    added = count == 0
+    if added:
+        groups.append(copy.deepcopy(group))
+
+    config = {
+        "path": str(path),
+        "created": raw is None,
+        "backup": None,
+        "hooks_container_added": hooks_added,
+        "event_containers_added": {event: event_added},
+        "fragments": [
+            {
+                "event": event,
+                "group": group,
+                "added": added,
+            }
+        ],
+    }
+    return config, {
+        "path": path,
+        "before": raw,
+        "after": _json_bytes(after),
+        "mode": mode,
+        "changed": after != before,
+        "backup_label": "codex-hooks.json",
+    }
+
+
 def _prepare_codex(
     home: Path,
     prefix: Path,
     *,
     ensure_runtime: bool,
+    existing_record: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     launch_agents = home / "Library" / "LaunchAgents"
     _validate_user_chain(home, launch_agents)
     _require_validated_codex_release(home, prefix)
     payloads = _codex_payloads(home, prefix, ensure_runtime=ensure_runtime)
+    existing_by_label = {
+        item.get("label"): item
+        for item in (existing_record or {}).get("plists", [])
+        if isinstance(item, dict)
+    }
     plists: list[dict[str, Any]] = []
     writes: list[dict[str, Any]] = []
     for label in CODEX_LABELS:
@@ -1014,11 +1230,15 @@ def _prepare_codex(
         _validate_user_chain(home, path)
         payload = plistlib.dumps(payloads[label], fmt=plistlib.FMT_XML, sort_keys=True)
         raw = _read_regular(path)
-        if raw is not None and raw[0] != payload:
+        previous = existing_by_label.get(label)
+        if previous is None and raw is not None and raw[0] != payload:
             raise SetupError(
                 f"refusing to replace non-owned Codex LaunchAgent plist: {path}"
             )
-        added = raw is None
+        if previous is not None and raw is None:
+            raise SetupError(f"managed Codex LaunchAgent drift: missing {path}")
+        added = raw is None if previous is None else bool(previous["added"])
+        changed = raw is None or raw[0] != payload
         plists.append(
             {
                 "label": label,
@@ -1032,14 +1252,58 @@ def _prepare_codex(
                 "path": path,
                 "payload": payload,
                 "added": added,
+                "changed": changed,
+                "existing": previous is not None,
             }
         )
+    app_record = next(
+        item
+        for item in plists
+        if item["label"] == "com.roundtable.codex-app-server"
+    )
+    app_write = next(
+        item
+        for item in writes
+        if Path(item["path"]).stem == "com.roundtable.codex-app-server"
+    )
+    marker_path = _codex_reload_marker_path(prefix)
+    if existing_record is None and _lexists(marker_path):
+        raise SetupError(
+            f"refusing unowned Codex reload marker at {marker_path}"
+        )
+    marker_payload = _json_bytes(
+        _codex_reload_marker_value(
+            prefix,
+            Path(app_record["path"]),
+            app_record["digest"],
+        )
+    )
+    config, config_operation = _prepare_codex_config(
+        home,
+        prefix,
+        existing_record,
+    )
+    skill = (
+        copy.deepcopy(existing_record["skill"])
+        if existing_record is not None
+        else _link_plan(home, _skill_path(home, "codex"), _skill_target(prefix))
+    )
     return (
         {
+            "config": config,
             "plists": plists,
-            "skill": _link_plan(home, _skill_path(home, "codex"), _skill_target(prefix)),
+            "skill": skill,
         },
-        {"plists": writes},
+        {
+            "config": config_operation,
+            "plists": writes,
+            "reload_marker": {
+                "path": marker_path,
+                "payload": marker_payload,
+                "changed": app_write["changed"],
+            },
+            "existing": existing_record is not None,
+        },
     )
 
 
@@ -1239,6 +1503,54 @@ def _validate_codex(
         raw = _read_regular(path)
         if raw is None or _digest(raw[0]) != item["digest"]:
             raise SetupError(f"managed Codex LaunchAgent drift at {path}")
+    app_record = by_label["com.roundtable.codex-app-server"]
+    _validate_codex_reload_marker(
+        prefix,
+        Path(app_record["path"]),
+        app_record["digest"],
+    )
+    config = record.get("config")
+    if config is not None:
+        expected_path = _selected_codex_home(home) / "hooks.json"
+        if not isinstance(config, dict) or config.get("path") != str(expected_path):
+            raise SetupError("invalid Codex hook configuration ownership record")
+        if (
+            not isinstance(config.get("created"), bool)
+            or not isinstance(config.get("hooks_container_added"), bool)
+            or not isinstance(config.get("event_containers_added"), dict)
+        ):
+            raise SetupError("invalid Codex hook configuration ownership metadata")
+        value, _raw, _mode = _load_json_config(expected_path)
+        hooks = value.get("hooks")
+        fragments = config.get("fragments")
+        if not isinstance(fragments, list) or len(fragments) != 1:
+            raise SetupError("invalid Codex hook fragment ownership record")
+        expected_groups = _codex_groups(prefix)
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                raise SetupError("invalid Codex hook fragment ownership record")
+            event = fragment.get("event")
+            group = fragment.get("group")
+            added = fragment.get("added")
+            if (
+                event not in expected_groups
+                or group != expected_groups[event]
+                or not isinstance(added, bool)
+                or not isinstance(
+                    config["event_containers_added"].get(event),
+                    bool,
+                )
+            ):
+                raise SetupError("invalid Codex hook fragment ownership")
+            if added_only and not added:
+                continue
+            groups = hooks.get(event) if isinstance(hooks, dict) else None
+            count = groups.count(group) if isinstance(groups, list) else 0
+            if count != 1:
+                raise SetupError(
+                    f"managed Codex {event} hook drift: expected exactly one "
+                    "owned fragment"
+                )
     skill = record.get("skill")
     if not isinstance(skill, dict):
         raise SetupError("invalid Codex skill ownership record")
@@ -1306,15 +1618,22 @@ def _apply_prepared(
 ) -> None:
     if harness in ("claude", "hermes"):
         _apply_config(home, prefix, record, operation)
+    elif harness == "codex":
+        _apply_config(home, prefix, record, operation["config"])
     if harness == "hermes":
         _apply_link(home, record["plugin"])
     if harness == "codex":
-        added_plists = [item for item in operation["plists"] if item["added"]]
-        for item in added_plists:
+        marker = operation["reload_marker"]
+        if marker["changed"]:
+            _ensure_private_dir(Path(marker["path"]).parent)
+            _atomic_write(Path(marker["path"]), marker["payload"], 0o600)
+        changed_plists = [item for item in operation["plists"] if item["changed"]]
+        for item in changed_plists:
             path: Path = item["path"]
             _ensure_user_dir(home, path.parent)
             _atomic_write(path, item["payload"], 0o600)
-    _apply_link(home, record["skill"])
+    if not (harness == "codex" and operation.get("existing")):
+        _apply_link(home, record["skill"])
 
 
 def _apply_mutation_paths(
@@ -1323,20 +1642,28 @@ def _apply_mutation_paths(
 ) -> list[Path]:
     paths: list[Path] = []
     for harness, (record, operation) in prepared.items():
-        if harness in ("claude", "hermes") and operation["changed"]:
-            paths.append(operation["path"])
-            before = operation["before"]
+        config_operation = (
+            operation.get("config") if harness == "codex" else operation
+        )
+        if harness in ("claude", "hermes", "codex") and config_operation["changed"]:
+            paths.append(config_operation["path"])
+            before = config_operation["before"]
             if before is not None:
                 paths.append(
-                    _backup_path(prefix, operation["backup_label"], before)
+                    _backup_path(prefix, config_operation["backup_label"], before)
                 )
         if harness == "hermes" and record["plugin"]["added"]:
             paths.append(Path(record["plugin"]["path"]))
         if harness == "codex":
+            marker = operation["reload_marker"]
+            if marker["changed"]:
+                paths.append(Path(marker["path"]))
             paths.extend(
-                item["path"] for item in operation["plists"] if item["added"]
+                item["path"] for item in operation["plists"] if item["changed"]
             )
-        if record["skill"]["added"]:
+        if record["skill"]["added"] and not (
+            harness == "codex" and operation.get("existing")
+        ):
             paths.append(Path(record["skill"]["path"]))
     if prepared:
         paths.append(_manifest_path(prefix))
@@ -1357,9 +1684,16 @@ def _remove_mutation_paths(
             paths.append(Path(record["config"]["path"]))
         elif harness == "hermes" and record["config"]["enabled_added"]:
             paths.append(Path(record["config"]["path"]))
+        elif harness == "codex" and isinstance(record.get("config"), dict) and any(
+            fragment.get("added")
+            for fragment in record["config"].get("fragments", [])
+            if isinstance(fragment, dict)
+        ):
+            paths.append(Path(record["config"]["path"]))
         if harness == "hermes" and record["plugin"]["added"]:
             paths.append(Path(record["plugin"]["path"]))
         if harness == "codex":
+            paths.append(_codex_reload_marker_path(prefix))
             paths.extend(
                 Path(item["path"]) for item in record["plists"] if item["added"]
             )
@@ -1386,8 +1720,8 @@ def _preflight_codex_runtime(
 ) -> bool:
     """Create/check Codex runtime payloads before any user config is changed."""
 
-    added_plists = [item for item in operation["plists"] if item["added"]]
-    if not added_plists:
+    changed_plists = [item for item in operation["plists"] if item["changed"]]
+    if not changed_plists:
         return False
     live_payloads = _codex_payloads(home, prefix, ensure_runtime=True)
     for item in operation["plists"]:
@@ -1401,6 +1735,26 @@ def _preflight_codex_runtime(
                 f"Codex LaunchAgent payload changed between preflight and "
                 f"apply: {item['path']}"
             )
+    app_write = next(
+        item
+        for item in operation["plists"]
+        if Path(item["path"]).stem == "com.roundtable.codex-app-server"
+    )
+    expected_marker = _json_bytes(
+        _codex_reload_marker_value(
+            prefix,
+            Path(app_write["path"]),
+            _digest(app_write["payload"]),
+        )
+    )
+    marker = operation.get("reload_marker")
+    if (
+        not isinstance(marker, dict)
+        or marker.get("path") != _codex_reload_marker_path(prefix)
+        or marker.get("payload") != expected_marker
+        or marker.get("changed") is not app_write["changed"]
+    ):
+        raise SetupError("Codex reload marker changed between preflight and apply")
     return True
 
 
@@ -1449,6 +1803,32 @@ def _remove_hermes(home: Path, record: dict[str, Any]) -> None:
 
 
 def _remove_codex(record: dict[str, Any]) -> None:
+    config = record.get("config")
+    if isinstance(config, dict):
+        path = Path(config["path"])
+        added_fragments = [
+            fragment
+            for fragment in config["fragments"]
+            if fragment["added"]
+        ]
+        if added_fragments:
+            value, _raw, mode = _load_json_config(path)
+            hooks = value.get("hooks")
+            assert isinstance(hooks, dict)
+            for fragment in added_fragments:
+                groups = hooks[fragment["event"]]
+                groups.remove(fragment["group"])
+                if (
+                    config["event_containers_added"].get(fragment["event"])
+                    and not groups
+                ):
+                    hooks.pop(fragment["event"])
+            if config["hooks_container_added"] and not hooks:
+                value.pop("hooks")
+            if config["created"] and value == {}:
+                path.unlink()
+            else:
+                _atomic_write(path, _json_bytes(value), mode)
     for item in record["plists"]:
         if item["added"]:
             Path(item["path"]).unlink()
@@ -1567,7 +1947,10 @@ def _detect_harnesses(home: Path) -> list[str]:
     paths = {
         "claude": (home / ".claude", home / ".local" / "bin" / "claude"),
         "hermes": (home / ".hermes", home / ".local" / "bin" / "hermes"),
-        "codex": (home / ".codex", home / ".npm-global" / "bin" / "codex"),
+        "codex": (
+            _selected_codex_home(home),
+            home / ".npm-global" / "bin" / "codex",
+        ),
     }
     selected: list[str] = []
     for harness in HARNESSES:
@@ -1599,9 +1982,17 @@ def _source_preflight(prefix: Path, harnesses: list[str]) -> None:
             _hermes_plugin_target(prefix),
             "installed Hermes Roundtable integration",
         )
+    if "codex" in harnesses:
+        _validate_executable(
+            prefix / "bin" / "rt-codex-session-start",
+            "installed Roundtable Codex SessionStart hook",
+        )
 
 
-def _actions(record: dict[str, Any]) -> list[str]:
+def _actions(
+    record: dict[str, Any],
+    operation: dict[str, Any] | None = None,
+) -> list[str]:
     actions: list[str] = []
     config = record.get("config")
     if isinstance(config, dict):
@@ -1611,11 +2002,24 @@ def _actions(record: dict[str, Any]) -> list[str]:
             actions.append(f"merge {config['path']}")
     for key in ("plugin", "skill"):
         item = record.get(key)
-        if isinstance(item, dict) and item.get("added"):
+        if (
+            isinstance(item, dict)
+            and item.get("added")
+            and not (key == "skill" and (operation or {}).get("existing"))
+        ):
             actions.append(f"link {item['path']}")
+    plist_operations = {
+        str(item["path"]): item
+        for item in (operation or {}).get("plists", [])
+    }
     for item in record.get("plists", []):
-        if item.get("added"):
+        planned = plist_operations.get(item["path"], {})
+        if planned.get("changed") and planned.get("existing"):
+            actions.append(f"update {item['path']} (reload deferred)")
+        elif item.get("added"):
             actions.append(f"write {item['path']} (not loaded)")
+        elif planned.get("changed"):
+            actions.append(f"update {item['path']} (reload deferred)")
     return actions or ["no changes"]
 
 
@@ -1640,6 +2044,23 @@ def _plan(
                 owned[harness],
                 added_only=False,
             )
+            if harness == "codex":
+                record, operation = _prepare_codex(
+                    home,
+                    prefix,
+                    ensure_runtime=False,
+                    existing_record=owned[harness],
+                )
+                if record != owned[harness]:
+                    prepared[harness] = (record, operation)
+                    actions = _actions(record, operation)
+                    if actions == ["no changes"]:
+                        actions = ["record existing Codex integration state"]
+                    results[harness] = {
+                        "state": "upgrade_planned",
+                        "actions": actions,
+                    }
+                    continue
             results[harness] = {"state": "configured", "actions": ["no changes"]}
             continue
         record, operation = _prepare(
@@ -1649,7 +2070,10 @@ def _plan(
             ensure_runtime=False,
         )
         prepared[harness] = (record, operation)
-        results[harness] = {"state": "planned", "actions": _actions(record)}
+        results[harness] = {
+            "state": "planned",
+            "actions": _actions(record, operation),
+        }
     _preflight_mutation_paths(
         home,
         prefix,
@@ -1673,6 +2097,7 @@ def _status(
     harnesses: list[str],
     manifest: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    _source_preflight(prefix, harnesses)
     results: dict[str, Any] = {}
     owned = manifest["harnesses"] if manifest else {}
     for harness in harnesses:
@@ -1686,6 +2111,22 @@ def _status(
             owned[harness],
             added_only=False,
         )
+        if harness == "codex":
+            record, operation = _prepare_codex(
+                home,
+                prefix,
+                ensure_runtime=False,
+                existing_record=owned[harness],
+            )
+            if record != owned[harness]:
+                actions = _actions(record, operation)
+                if actions == ["no changes"]:
+                    actions = ["record existing Codex integration state"]
+                results[harness] = {
+                    "state": "upgrade_required",
+                    "actions": actions,
+                }
+                continue
         results[harness] = {"state": "configured"}
     return {
         "ok": True,
@@ -1723,6 +2164,16 @@ def _apply(
                 owned[harness],
                 added_only=False,
             )
+            if harness == "codex":
+                record, operation = _prepare_codex(
+                    home,
+                    prefix,
+                    ensure_runtime=False,
+                    existing_record=owned[harness],
+                )
+                if record != owned[harness]:
+                    prepared[harness] = (record, operation)
+                    continue
             results[harness] = {"state": "configured", "actions": ["no changes"]}
             continue
         prepared[harness] = _prepare(
@@ -1749,7 +2200,9 @@ def _apply(
             if harness not in prepared:
                 continue
             record, operation = prepared[harness]
-            actions = _actions(record)
+            actions = _actions(record, operation)
+            if actions == ["no changes"] and harness in owned:
+                actions = ["record existing Codex integration state"]
             _apply_prepared(harness, home, prefix, record, operation)
             owned[harness] = record
             results[harness] = {"state": "configured", "actions": actions}
@@ -1827,6 +2280,11 @@ def _remove(
             launchctl_invoked, external_changed = _unload_codex_jobs(owned["codex"])
         for harness in selected_owned:
             _remove_record(harness, home, owned[harness])
+            if harness == "codex":
+                marker_path = _codex_reload_marker_path(prefix)
+                if _lexists(marker_path):
+                    _inspect_owned(marker_path, kind="file")
+                    marker_path.unlink()
             del owned[harness]
 
         manifest_path = _manifest_path(prefix)
@@ -1915,7 +2373,10 @@ def _render(result: dict[str, Any], *, as_json: bool) -> None:
     if result["command"] == "plan":
         print("  dry run only; run `roundtable-setup apply` to make these changes")
     if result.get("restart_required"):
-        print("  Codex LaunchAgents were written but not loaded; a restart is required")
+        print(
+            "  Codex service activation/reload is deferred to the next "
+            "Roundtable Codex launch; Roundtable may ask before a shared reload"
+        )
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -18,3 +18,12 @@ Roundtable Messaging v2 is directed and maintained by Ocean (Haiyang Yu).
 
 AI contribution labels describe the development process; the Git history and
 license remain the authoritative legal records.
+
+## Earlier public predecessor
+
+The cmux-centric v1 predecessor remains available, unchanged, in
+[`hyyu189/h2o`](https://github.com/hyyu189/h2o) at public snapshot
+`50683056c896bdb1ae2f74f6ac0740106b43bd36`. It is MIT-licensed and predates
+the Build Week Messaging v2 rewrite. Its existence and contributors are not
+presented as new Build Week work; see `PROVENANCE.md` and `NOTICE` for the
+development and license boundaries.

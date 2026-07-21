@@ -72,6 +72,11 @@ def fake_commands(monkeypatch, tmp_path):
         return command_dir / name
 
     monkeypatch.setattr(roundtable, "sibling", resolve)
+    monkeypatch.setattr(
+        roundtable,
+        "harness_bin",
+        lambda harness: command_dir / harness,
+    )
     return command_dir
 
 
@@ -301,6 +306,16 @@ def test_home_is_never_offered_as_the_current_project(
     assert "Create a new folder" in stderr.getvalue()
 
 
+def test_existing_folder_selector_reports_symlink_loop_without_traceback(
+    tmp_path,
+) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to("loop", target_is_directory=True)
+
+    with pytest.raises(roundtable.OnboardingError, match="cannot resolve project folder"):
+        roundtable.canonical_existing_folder("loop/child", tmp_path)
+
+
 def test_zero_is_not_accepted_as_a_menu_selection(
     tmp_path, isolated_registry, fake_commands
 ):
@@ -359,3 +374,223 @@ def test_registered_project_can_be_selected_without_reinitializing(
 
     assert result == 0
     assert init_calls == []
+
+
+def test_installed_onboarding_previews_and_applies_selected_harness_once(
+    tmp_path, isolated_registry, fake_commands
+):
+    project = write_project(tmp_path / "project")
+    prefix = tmp_path / "installed"
+    prefix.mkdir()
+    calls = []
+
+    def fake_setup(command, **kwargs):
+        calls.append((command, kwargs))
+        subcommand = command[1]
+        payload = {
+            "ok": True,
+            "command": subcommand,
+            "harnesses": {
+                "codex": {
+                    "state": "not_configured" if subcommand == "status" else "planned",
+                    "actions": ["merge ~/.codex/hooks.json"],
+                }
+            },
+        }
+        if subcommand == "apply":
+            payload["harnesses"]["codex"]["state"] = "configured"
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    stderr = io.StringIO()
+    environment = {"ROUNDTABLE_INSTALL_PREFIX": str(prefix)}
+    exec_calls = []
+    result = roundtable.main(
+        [],
+        cwd=project,
+        home=tmp_path / "home",
+        stdin=TTYInput("1\ny\n"),
+        stderr=stderr,
+        environ=environment,
+        setup_runner=fake_setup,
+        exec_runner=lambda path, argv: exec_calls.append((path, argv)) or 0,
+        chdir_runner=lambda _: None,
+    )
+
+    assert result == 0
+    assert [command[1] for command, _kwargs in calls] == [
+        "status",
+        "plan",
+        "apply",
+    ]
+    assert all(kwargs["check"] is False for _command, kwargs in calls)
+    assert "One-time codex integration setup" in stderr.getvalue()
+    assert "Roundtable never bypasses hook trust" in stderr.getvalue()
+    assert len(exec_calls) == 1
+
+
+def test_installed_onboarding_decline_does_not_launch(
+    tmp_path, isolated_registry, fake_commands
+):
+    project = write_project(tmp_path / "project")
+    prefix = tmp_path / "installed"
+    prefix.mkdir()
+    calls = []
+
+    def fake_setup(command, **_kwargs):
+        calls.append(command[1])
+        state = "not_configured" if command[1] == "status" else "planned"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "harnesses": {
+                        "codex": {"state": state, "actions": ["merge hook"]}
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    stderr = io.StringIO()
+    result = roundtable.main(
+        [],
+        cwd=project,
+        home=tmp_path / "home",
+        stdin=TTYInput("1\nn\n"),
+        stderr=stderr,
+        environ={"ROUNDTABLE_INSTALL_PREFIX": str(prefix)},
+        setup_runner=fake_setup,
+        exec_runner=lambda *_: pytest.fail("launcher must not run after setup decline"),
+        chdir_runner=lambda _: None,
+    )
+
+    assert result == 2
+    assert calls == ["status", "plan"]
+    assert "nothing was launched" in stderr.getvalue()
+
+
+def test_installed_direct_harness_command_runs_setup_before_launch(
+    tmp_path, isolated_registry, fake_commands
+):
+    prefix = tmp_path / "installed"
+    prefix.mkdir()
+    calls = []
+
+    def fake_setup(command, **_kwargs):
+        calls.append(command[1])
+        state = "configured" if command[1] in {"status", "apply"} else "planned"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "harnesses": {
+                        "codex": {
+                            "state": state,
+                            "actions": ["no changes"],
+                        }
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    exec_calls = []
+    result = roundtable.main(
+        ["codex", "--example"],
+        cwd=tmp_path,
+        home=tmp_path / "home",
+        stdin=TTYInput(""),
+        stderr=io.StringIO(),
+        environ={"ROUNDTABLE_INSTALL_PREFIX": str(prefix)},
+        setup_runner=fake_setup,
+        exec_runner=lambda path, argv: exec_calls.append((path, argv)) or 0,
+    )
+
+    assert result == 0
+    assert calls == ["status"]
+    expected = fake_commands / "rt-codex"
+    assert exec_calls == [(str(expected), [str(expected), "--example"])]
+
+
+def test_selector_marks_configured_but_missing_harness_unavailable(
+    tmp_path, isolated_registry, fake_commands, monkeypatch
+):
+    project = write_project(
+        tmp_path / "project",
+        {
+            "claude": ("claude-code", ["claude"]),
+            "codex": ("codex", ["codex"]),
+        },
+    )
+
+    def resolve(harness):
+        if harness == "claude":
+            raise roundtable.SelectionError("rt-claude: executable not found")
+        return fake_commands / harness
+
+    monkeypatch.setattr(roundtable, "harness_bin", resolve)
+    stderr = io.StringIO()
+    selected = roundtable.choose_seat(
+        project,
+        stdin=TTYInput("1\n"),
+        stderr=stderr,
+    )
+
+    assert selected == ("codex", "codex")
+    assert "unavailable: claude" in stderr.getvalue()
+    assert "1) codex" in stderr.getvalue()
+
+
+def test_direct_missing_harness_fails_before_setup(
+    tmp_path, isolated_registry, fake_commands, monkeypatch
+):
+    monkeypatch.setattr(
+        roundtable,
+        "harness_bin",
+        lambda _harness: (_ for _ in ()).throw(
+            roundtable.SelectionError("rt-claude: executable not found")
+        ),
+    )
+    setup_calls = []
+    stderr = io.StringIO()
+
+    result = roundtable.main(
+        ["claude"],
+        cwd=tmp_path,
+        home=tmp_path / "home",
+        stdin=TTYInput(""),
+        stderr=stderr,
+        environ={"ROUNDTABLE_INSTALL_PREFIX": str(tmp_path / "prefix")},
+        setup_runner=lambda *args, **kwargs: setup_calls.append((args, kwargs)),
+        exec_runner=lambda *_: pytest.fail("missing harness must not launch"),
+    )
+
+    assert result == 2
+    assert setup_calls == []
+    assert "executable not found" in stderr.getvalue()
+
+
+def test_first_project_onboarding_explains_non_git_topology(
+    tmp_path, isolated_registry, fake_commands
+):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    stderr = io.StringIO()
+
+    result = roundtable.main(
+        [],
+        cwd=folder,
+        home=tmp_path / "home",
+        stdin=TTYInput("0\n"),
+        stderr=stderr,
+        environ={},
+        exec_runner=lambda *_: 0,
+        chdir_runner=lambda _: None,
+    )
+
+    assert result == 2
+    output = stderr.getvalue()
+    assert "[durable mailboxes]" in output
+    assert "Git is optional" in output

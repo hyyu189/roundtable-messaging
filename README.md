@@ -5,11 +5,11 @@ durable per-project mailboxes as the delivery fact source and wakes supported
 harnesses through native mechanisms instead of injecting keystrokes.
 
 > Build status: the source installer and deterministic offline release archive
-> pass automated clean-home install, setup, core smoke, and uninstall tests.
-> The result is a release candidate, not yet a public support claim: real
-> credentialed harness wake tests and the mainstream terminal matrix remain
-> promotion gates. Do not replace an active pre-manifest installation without a
-> planned migration.
+> pass automated clean-home install, setup, migration, core smoke, and uninstall
+> tests. The result is a release candidate, not yet a public support claim: the
+> current machine has not been cut over to this candidate, the Codex
+> SessionStart identity spike has not run, and real credentialed harness wake
+> tests plus the mainstream terminal matrix remain promotion gates.
 
 ## Why it exists
 
@@ -34,6 +34,11 @@ The submitted Messaging v2 architecture and deliverable were built during the
 prototype. The repository keeps the earlier baseline only where it is required
 to make the rewrite reviewable.
 
+The public, MIT-licensed cmux-centric v1 snapshot remains unchanged at
+[`hyyu189/h2o`](https://github.com/hyyu189/h2o), commit
+`50683056c896bdb1ae2f74f6ac0740106b43bd36`. It is predecessor evidence, not
+Build Week output and not the repository being released here.
+
 - [Development and attribution boundary](PROVENANCE.md)
 - [Contributor roles](CREDITS.md)
 - [Source commit ledger](docs/provenance/source-commits.tsv)
@@ -52,10 +57,11 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 
 | Surface | Status |
 | --- | --- |
+| Installer runtime | Requires an existing CPython 3.11–3.14; the archive bundles all Python package dependencies, not the interpreter |
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
-| npm Codex CLI `0.144.6` | Exact-release protocol smoke passed; clean daemon reload and full wake E2E remain a release gate |
+| npm Codex CLI `0.144.6` | Exact-release protocol smoke and automated service/auto-bind coverage pass; live hook identity, coordinated cutover, and full wake E2E remain release gates |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
 | tmux and cross-host SSH | Not yet supported |
@@ -75,57 +81,136 @@ The Build Week P0 release is complete only when it provides:
 Same-host tmux support is P1. Cross-host transport, Linux service management,
 and multi-auth switching are roadmap items.
 
+## Install the release candidate
+
+The judge and new-user path begins with the release artifact, not a source
+checkout or rebuild. It requires an existing CPython 3.11 through 3.14; the
+archive is offline for package dependencies but does not bundle CPython. The
+installer explains how to select a supported interpreter if `python3` is not
+the right one:
+
+```bash
+tar -xzf roundtable-messaging-<version>-macos.tar.gz
+cd roundtable-messaging-<version>
+./install
+export PATH="$HOME/.local/bin:$PATH"  # once per shell; persist it in your shell profile
+roundtable
+```
+
+`roundtable` is the normal entry point. It chooses or creates a project folder
+(Git is optional), asks which installed and configured Claude, Codex, or Hermes
+seat to launch, and performs any missing one-time harness setup only after
+showing the owned changes and receiving confirmation. A Roundtable project may
+be any ordinary folder, including a non-code folder.
+
+Roundtable-managed Codex launches require that project anchor. This lets the
+launcher publish a fenced host-service lease and auto-bind the native thread
+without a reload race. Claude and Hermes may still use the explicit
+unanchored option; users who want unanchored Codex can run native `codex`
+directly, outside Roundtable messaging.
+
+If this Mac already has the recognized pre-manifest Roundtable layout, do not
+install over it. Use the migration tool in the extracted artifact first:
+
+```bash
+./migrate                 # read-only plan
+./migrate apply           # backup and remove only recognized legacy program paths
+./install
+```
+
+Migration preserves project registries, host runtime state, and all
+project-local mailboxes. `apply` refuses to run from inside Codex or while a
+recognized legacy Codex service is loaded; service shutdown and the one-time
+cutover must be coordinated from a normal terminal. It only queries the two
+known service labels with read-only `launchctl print`; it never loads, unloads,
+or restarts them. The current development machine has not yet performed this
+cutover. If `apply` has completed but `./install` has not yet replaced those
+paths, `./migrate rollback` restores the legacy layout.
+
+## Setup and day-to-day use
+
+For normal users, the first `roundtable` launch is the onboarding flow. The
+standalone setup commands are review and expert controls:
+
+```bash
+roundtable setup          # preview only; never writes configuration
+roundtable setup apply    # explicit expert/scriptable apply
+roundtable setup status
+```
+
+For Codex, setup installs an owned SessionStart hook and two owned macOS
+LaunchAgent definitions. On first use, Codex may require one `/hooks` review of
+the user-level hook. Roundtable does not bypass that trust decision.
+
+After trust is granted, a new Codex thread normally binds automatically: the
+SessionStart hook atomically queues the native session identity, and the wake
+bridge validates its exact project cwd and current fenced launcher lease before
+recording the binding. The callback does not re-enter the app-server while the
+thread is starting. Manual binding remains a troubleshooting fallback, not a
+normal onboarding step:
+
+```bash
+rt-codex-wake bind /absolute/path/to/project
+```
+
+The Codex launcher also performs a targeted service preflight and claims the
+project seat inside the same host lock as its final readiness check. A ready
+pair is silent; an unambiguous cold daemon or stopped
+wake bridge is repaired automatically. If the app-server definition or version
+requires a coordinated reload, Roundtable offers it only when no active or
+ambiguous Codex lease exists and the caller is not already inside Codex, then
+asks before proceeding. Busy, unsupported, foreign, or unsafe states fail
+closed with diagnostics. This replaces the old normal-user ritual of manually
+running daemon and wake reload commands. The low-level commands remain expert
+recovery tools.
+
+The most common day-to-day commands are:
+
+```text
+roundtable                         project-first onboarding and launch
+roundtable setup                  read-only harness integration preview
+roundtable doctor                 diagnose setup, leases, and wake services
+roundtable migrate                preview recognized legacy installation state
+rt-say AGENT KIND "MESSAGE"       deliver durable mail
+rt-inbox                          inspect waiting mail
+rt-ack ID                         acknowledge a message
+```
+
+All participants in one Roundtable currently run on the same host. The durable
+mailbox core does not require cmux and uses the same path in Terminal.app,
+iTerm2, Ghostty, or another normal terminal; cmux supplies optional topology and
+workspace affordances only. tmux lifecycle integration and cross-host SSH
+transport are not P0 features.
+
+The remaining Codex promotion gate is a real post-cutover spike proving that
+the trusted hook's `session_id` is the same native thread ID read through the
+app-server and that the launcher environment survives into the hook, followed
+by credentialed send-to-wake-to-drain/ack E2E. Until that passes, automatic
+binding is release-candidate behavior rather than a public support claim.
+
 ## Development install
 
 The current source tree can be installed into a versioned private environment.
-Package installation and harness onboarding are intentionally separate:
+This is for development and verification; the public judge path above uses the
+artifact:
 
 ```bash
 mamba run -n general ./scripts/install.sh
-roundtable-setup
-roundtable-setup apply
+roundtable
 ```
 
-The first `roundtable-setup` is a read-only preview. `apply` configures only
-detected harnesses, or an explicit selection such as
+`roundtable setup` remains a read-only preview. `roundtable setup apply`
+configures only detected harnesses, or an explicit selection such as
 `--harness claude --harness hermes --harness codex`. It merges owned hook or
 plugin fragments, records backups and ownership, and links the installed
 Roundtable skill into each selected harness's global skill directory. A normal
 user does not copy or pull the skill into every project.
-
-Codex setup writes two LaunchAgent plist files but deliberately does not load
-them. Coordinate a safe restart outside the Codex session whose app-server may
-be restarted:
-
-```bash
-rt-codex-daemon install --reload
-rt-codex-wake install --reload
-rt-doctor
-```
-
-Then use the unified entry point. It first finds or safely creates the project
-anchor, then asks which configured harness seat to launch:
-
-```bash
-roundtable
-```
 
 The menu can adopt the current non-Git directory without replacing user files,
 select a registered project, choose another existing folder, or create a new
 one. Git is always opt-in. Scriptable users can use `roundtable init`,
 `roundtable claude`, `roundtable hermes`, or `roundtable codex`; the underlying
 `roundtable-init` and `rt-*` commands remain available.
-
-The most common day-to-day commands are:
-
-```text
-roundtable                         project-first interactive entry
-rt-claude / rt-hermes / rt-codex  launch a project-anchored harness
-rt-say AGENT KIND "MESSAGE"       deliver durable mail
-rt-inbox                          inspect waiting mail
-rt-ack ID                         acknowledge a message
-rt-doctor                         diagnose setup, leases, and wake services
-```
 
 Stable commands are linked under `~/.local/bin`. Installation fails closed
 when an existing path is not owned by its managed manifest. Remove harness
@@ -150,4 +235,5 @@ offline release mode, upgrade gates, and precise removal behavior.
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) and
-[NOTICE](NOTICE).
+[NOTICE](NOTICE). Applicable material retained from the MIT-licensed h2o
+predecessor keeps its full MIT notice there.

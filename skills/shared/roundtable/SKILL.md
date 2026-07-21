@@ -6,10 +6,10 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 6.1.0
+version: 7.0.0
 author: Roundtable contributors
 license: MIT
-platforms: [linux, macos]
+platforms: [macos]
 ---
 
 # Roundtable
@@ -33,22 +33,23 @@ Package installation provides one canonical Roundtable skill. Onboarding links
 that installed copy into each selected harness's global skill directory; do not
 ask a vibe-coding user to clone, pull, or copy this skill per project.
 
+For normal users, launch `roundtable`: it previews any missing integration for
+the selected harness and asks once before applying owned changes. The
+standalone setup commands are expert/scriptable controls:
+
 ```bash
-roundtable-setup          # read-only plan
-roundtable-setup apply    # owned hooks, plugin/skill links, Codex plists
-roundtable-setup status
+roundtable setup          # read-only plan
+roundtable setup apply    # owned hooks, plugin/skill links, Codex plists
+roundtable setup status
 ```
 
 Setup configures detected harnesses. Repeat `--harness` to make the selection
 explicit. It never installs a harness or moves credentials. Codex plist files
-are written but not loaded; service reload is a separate, human-coordinated
-operation outside any Codex session whose app-server may restart:
-
-```bash
-rt-codex-daemon install --reload
-rt-codex-wake install --reload
-rt-doctor
-```
+are written but not loaded by setup. On the next project-anchored
+`roundtable codex` launch, a service preflight starts a cold service or stopped
+wake bridge automatically. It offers a coordinated app-server reload only from
+outside Codex and only when no active or ambiguous Codex seat exists. Never
+instruct an ordinary user to run the low-level daemon/wake reload commands.
 
 For removal, never orphan a loaded Codex job. Ask the human to run this from a
 normal terminal outside Codex:
@@ -71,10 +72,11 @@ roundtable-init new-project          # no Git by default
 roundtable-init new-git-project --git
 ```
 
-## Tools (on PATH via ~/.roundtable/bin/)
+## Tools (normally linked on PATH via ~/.local/bin/)
 
 | Tool | Purpose |
 |------|---------|
+| `roundtable` | Recommended project-first onboarding, harness selection, and launch. |
 | `roundtable-setup [plan\|apply\|status\|remove]` | Own host-level harness onboarding; the default is a no-write plan. |
 | `roundtable-init --here` / `roundtable-init NAME` | Adopt the current directory or create and register a project; add `--git` only when wanted. |
 | `rt-claude` / `rt-hermes` / `rt-codex` | Claim a fenced project seat and launch the real harness executable. |
@@ -90,9 +92,11 @@ one, set `ROUNDTABLE_PROJECT_DIR` or `RT_FALLBACK_PROJECT`.
 
 Launch dedicated sessions with `rt-codex`, `rt-claude`, or `rt-hermes`. When
 called outside a project on a TTY they offer registered projects, project
-creation, or an explicit unanchored launch; non-TTY unanchored calls exit 2.
-All three launchers select a real harness executable instead of a generated
-cmux PATH shim and export the unique configured `RT_FROM` identity. A
+creation, or (for Claude/Hermes) an explicit unanchored launch. Roundtable
+Codex requires a project anchor; native `codex` remains available for sessions
+that do not need Roundtable messaging. Non-TTY unanchored calls exit 2. All
+three launchers select a real harness executable instead of a generated cmux
+PATH shim and export the unique configured `RT_FROM` identity. A
 multi-instance project must set `RT_FROM` explicitly. `rt-codex` additionally
 injects the `--remote` flag and fenced session environment that its native wake
 bridge requires. Direct vendor launch commands do not establish the complete
@@ -123,10 +127,13 @@ Hermes session start and injects a user-visible Roundtable notice when mail
 lands. It is inert outside a complete Roundtable launcher lease and shuts down
 its watcher with the Hermes session.
 
-**Arming (Codex)** — launch with `rt-codex`, then self-register in the first
-turn with `rt-codex-wake bind <project-root>`. The wake bridge then delivers
-maildir wakes with zero keyboard. A Codex session that was never bound has no
-waker; its mail still waits like any offline agent's.
+**Arming (Codex)** — launch through project-anchored `roundtable codex` (or
+`rt-codex`). The trusted SessionStart hook atomically queues the native thread
+identity; the wake bridge validates its exact project cwd and fenced launcher
+lease before binding. On first use Codex may ask the human to review the hook
+with `/hooks`; never bypass that trust decision. Manual
+`rt-codex-wake bind <project-root>` is a diagnostic fallback only. An unbound
+session has no waker, but its mail still waits durably like any offline agent's.
 
 `rt-wait-inbox` remains an implementation and diagnostic tool. Never kill it
 by process name: another project can have the same executable name. P0 watcher
@@ -166,11 +173,14 @@ waker; never re-send by keyboard reflex.
 
 ## Multi-instance
 
-A harness can run more than one instance per project. Define them under
-`instances:` in `agents.yaml` and address each by its `id` (verbatim); a
-single instance reuses the base name (`codex`). Mail addressing needs only
-the name; cmux launch metadata (cwd anchor, title) matters for the diagnostic
-`rt-resolve` view and for legacy tooling, not for delivery:
+A project can define more than one addressable instance ID under `instances:`
+in `agents.yaml`; a single instance normally reuses the base name (`codex`).
+Build Week P0 permits only one active seat per harness in a project, so a
+second simultaneous Claude, Codex, or Hermes launch is rejected instead of
+guessing. An inactive prior seat does not conflict: a fresh launch gets a new
+fenced session lease. Mail addressing needs only the instance ID; cmux launch
+metadata (cwd anchor, title) matters for the diagnostic `rt-resolve` view and
+legacy tooling, not for delivery:
 
 ```yaml
 instances:

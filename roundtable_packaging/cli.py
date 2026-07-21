@@ -777,6 +777,7 @@ def install_main(argv: list[str] | None = None) -> int:
         _atomic_write(_manifest_path(prefix), _json_bytes(manifest), 0o600)
         print(f"installed Roundtable {VERSION} at {prefix}")
         print(f"commands linked in {link_dir}")
+        print(f"run now: {link_dir / 'roundtable'}")
         if str(link_dir) not in os.environ.get("PATH", "").split(os.pathsep):
             print(f"add to PATH: export PATH={shlex.quote(str(link_dir))}:$PATH")
         return 0

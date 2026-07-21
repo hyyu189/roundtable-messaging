@@ -21,9 +21,17 @@ import stat
 import struct
 import subprocess
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
-from _rtruntime import RuntimeStateError, runtime_root
+from _rtruntime import (
+    RuntimeStateError,
+    inspect_host_harness_seats,
+    runtime_root,
+)
 
 
 class CodexRuntimeError(RuntimeError):
@@ -58,6 +66,37 @@ DEFAULT_SOCKET = (CODEX_HOME / "app-server-control" / "app-server-control.sock")
 APP_SERVER_LABEL = "com.roundtable.codex-app-server"
 WAKE_LABEL = "com.roundtable.codex-wake"
 VALIDATED_CODEX_RELEASES = frozenset({(0, 144, 6)})
+WAKE_BRIDGE_BUILD_COMPONENTS = (
+    "bin/rt-codex-wake",
+    "bin/_rtcodex.py",
+    "bin/_rtruntime.py",
+    "bin/_rtlib.py",
+)
+CODEX_RELOAD_MARKER_SCHEMA = "roundtable.codex-app-server-reload-required.v1"
+CODEX_RELOAD_MARKER_NAME = "codex-app-server-reload-required.json"
+CODEX_RELOAD_MARKER_MAX_BYTES = 16 * 1024
+
+SERVICE_READY = "ready"
+SERVICE_COLD = "cold"
+SERVICE_BRIDGE_DOWN = "bridge_down"
+SERVICE_RELOAD_REQUIRED_IDLE = "reload_required_idle"
+SERVICE_RELOAD_DEFERRED_BUSY = "reload_deferred_busy"
+SERVICE_UNSUPPORTED = "unsupported"
+SERVICE_UNSAFE = "unsafe"
+SERVICE_SETUP_REQUIRED = "setup_required"
+
+
+@dataclass(frozen=True)
+class CodexServiceStatus:
+    """One conservative snapshot of the host-wide Codex service pair."""
+
+    state: str
+    detail: str
+    cli_version: tuple[int, int, int] | None = None
+    daemon: dict | None = None
+    app_plist: str = "unknown"
+    wake_plist: str = "unknown"
+    bridge_detail: str = "not checked"
 
 
 def ensure_private_runtime_dir(path: Path | None = None) -> Path:
@@ -264,24 +303,28 @@ def _write_plist(path: Path, payload: dict) -> bool:
     return True
 
 
-def launchd_loaded(label: str) -> bool:
-    proc = subprocess.run(
-        [launchctl_bin(), "print", f"{launch_domain()}/{label}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return proc.returncode == 0
-
-
-def launchd_running(label: str) -> bool:
+def _launchd_print(label: str) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(
         [launchctl_bin(), "print", f"{launch_domain()}/{label}"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
+    if proc.returncode not in {0, 113}:
+        detail = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+        raise CodexRuntimeError(
+            f"launchctl print failed for {label}: {detail}"
+        )
+    return proc
+
+
+def launchd_loaded(label: str) -> bool:
+    return _launchd_print(label).returncode == 0
+
+
+def launchd_running(label: str) -> bool:
+    proc = _launchd_print(label)
     return proc.returncode == 0 and "state = running" in proc.stdout
 
 
@@ -335,6 +378,915 @@ def kickstart(label: str, *, force: bool = True) -> None:
         raise CodexRuntimeError(
             f"launchctl kickstart failed for {label}: {proc.stderr.strip()}"
         )
+
+
+def _secure_path_info(
+    path: Path,
+    *,
+    kind: str,
+    private: bool = True,
+) -> os.stat_result | None:
+    """Inspect a service-owned leaf without following a symlink."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot inspect service path {path}: {error}") from error
+    if stat.S_ISLNK(info.st_mode):
+        raise CodexRuntimeError(f"service path is a symlink: {path}")
+    expected = {
+        "directory": stat.S_ISDIR,
+        "file": stat.S_ISREG,
+        "socket": stat.S_ISSOCK,
+    }.get(kind)
+    if expected is None or not expected(info.st_mode):
+        raise CodexRuntimeError(f"service path is not a {kind}: {path}")
+    if info.st_uid != os.getuid():
+        raise CodexRuntimeError(
+            f"service path owner uid {info.st_uid} != {os.getuid()}: {path}"
+        )
+    if private and info.st_mode & 0o077:
+        raise CodexRuntimeError(
+            f"service path exposes group/other permissions: {path}"
+        )
+    return info
+
+
+def wake_bridge_build_fingerprint(root: Path | None = None) -> str:
+    """Fingerprint the exact code loaded by one wake-bridge process.
+
+    ``SOURCE_ROOT`` resolves the installed ``current`` symlink at interpreter
+    startup.  A running bridge therefore keeps the fingerprint of the version
+    it actually imported, while a later launcher computes the fingerprint from
+    the newly selected install.  Hash every local module used by the bridge so
+    dependency-only changes cannot masquerade as the current build.
+    """
+
+    selected_root = Path(root if root is not None else SOURCE_ROOT).expanduser()
+    if not selected_root.is_absolute():
+        raise CodexRuntimeError(
+            f"wake bridge source root must be absolute: {selected_root}"
+        )
+    digest = hashlib.sha256()
+    for relative in WAKE_BRIDGE_BUILD_COMPONENTS:
+        path = selected_root / relative
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise CodexRuntimeError(
+                f"cannot inspect wake bridge build component {path}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise CodexRuntimeError(
+                f"wake bridge build component is not a regular file: {path}"
+            )
+        if info.st_uid != os.getuid():
+            raise CodexRuntimeError(
+                f"wake bridge build component owner uid {info.st_uid} != "
+                f"{os.getuid()}: {path}"
+            )
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise CodexRuntimeError(
+                f"cannot read wake bridge build component {path}: {error}"
+            ) from error
+        encoded_name = relative.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _validate_service_paths(socket_path: Path) -> None:
+    runtime_info = _secure_path_info(RUNTIME_DIR, kind="directory")
+    if runtime_info is not None:
+        projects = RUNTIME_DIR / "projects"
+        if projects.exists() or projects.is_symlink():
+            _secure_path_info(projects, kind="directory")
+    socket_parent = socket_path.parent
+    if socket_parent.exists() or socket_parent.is_symlink():
+        _secure_path_info(socket_parent, kind="directory")
+    if socket_path.exists() or socket_path.is_symlink():
+        _secure_path_info(socket_path, kind="socket")
+    for label in (APP_SERVER_LABEL, WAKE_LABEL):
+        path = launch_agent_path(label)
+        if path.exists() or path.is_symlink():
+            _secure_path_info(path, kind="file")
+
+
+def _setup_manifest() -> dict | None:
+    """Load the install-scoped ownership record used for safe plist upgrades."""
+
+    if not INSTALL_PREFIX:
+        return None
+    prefix = Path(INSTALL_PREFIX).expanduser().absolute()
+    path = prefix / "harness-setup.json"
+    if not (path.exists() or path.is_symlink()):
+        return None
+    _secure_path_info(path, kind="file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CodexRuntimeError(f"invalid harness setup manifest {path}: {error}") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "roundtable.harness-setup.v1"
+        or value.get("prefix") != str(prefix)
+        or value.get("home") != str(Path.home())
+        or not isinstance(value.get("harnesses"), dict)
+    ):
+        raise CodexRuntimeError(f"unsafe harness setup manifest scope or schema: {path}")
+    return value
+
+
+def codex_reload_marker_path(prefix: Path | None = None) -> Path:
+    """Return the install-scoped durable app-server reload marker path."""
+
+    selected = prefix
+    if selected is None:
+        if not INSTALL_PREFIX:
+            raise CodexRuntimeError(
+                "Codex reload marker is unavailable without an install prefix"
+            )
+        selected = Path(INSTALL_PREFIX)
+    root = Path(selected).expanduser().absolute()
+    return root / ".runtime" / CODEX_RELOAD_MARKER_NAME
+
+
+def codex_reload_marker_payload(
+    app_payload: dict,
+    *,
+    prefix: Path | None = None,
+) -> dict[str, str]:
+    """Bind one pending reload to the exact managed app-server plist."""
+
+    marker_path = codex_reload_marker_path(prefix)
+    root = marker_path.parent.parent
+    content = plistlib.dumps(app_payload, fmt=plistlib.FMT_XML, sort_keys=True)
+    return {
+        "schema": CODEX_RELOAD_MARKER_SCHEMA,
+        "prefix": str(root),
+        "label": APP_SERVER_LABEL,
+        "appPlistPath": str(launch_agent_path(APP_SERVER_LABEL)),
+        "appPlistDigest": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _read_codex_reload_marker(
+    app_payload: dict,
+) -> tuple[Path, dict[str, str]] | None:
+    """Read and authenticate the pending reload marker without mutating it."""
+
+    if not INSTALL_PREFIX:
+        return None
+    path = codex_reload_marker_path()
+    prefix = path.parent.parent
+    prefix_info = _secure_path_info(prefix, kind="directory", private=False)
+    if prefix_info is None:
+        raise CodexRuntimeError(f"Roundtable install prefix is missing: {prefix}")
+    runtime_info = _secure_path_info(path.parent, kind="directory")
+    if runtime_info is None:
+        return None
+    if not (path.exists() or path.is_symlink()):
+        return None
+    try:
+        before = _secure_path_info(path, kind="file")
+    except CodexRuntimeError as error:
+        raise CodexRuntimeError(
+            f"unsafe Codex reload marker {path}: {error}"
+        ) from error
+    assert before is not None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_mode & 0o077
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise CodexRuntimeError(
+                    f"Codex reload marker changed or became unsafe: {path}"
+                )
+            raw = handle.read(CODEX_RELOAD_MARKER_MAX_BYTES + 1)
+    except CodexRuntimeError:
+        raise
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot read Codex reload marker {path}: {error}") from error
+    if len(raw) > CODEX_RELOAD_MARKER_MAX_BYTES:
+        raise CodexRuntimeError(
+            f"Codex reload marker exceeds {CODEX_RELOAD_MARKER_MAX_BYTES} bytes: {path}"
+        )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise CodexRuntimeError(f"invalid Codex reload marker {path}: {error}") from error
+    expected = codex_reload_marker_payload(app_payload)
+    if value != expected:
+        raise CodexRuntimeError(
+            "Codex reload marker does not match the current managed app-server "
+            f"plist: {path}"
+        )
+    return path, expected
+
+
+def codex_reload_required(app_payload: dict) -> bool:
+    """Return whether setup durably recorded a pending app-server reload."""
+
+    return _read_codex_reload_marker(app_payload) is not None
+
+
+def clear_codex_reload_marker(app_payload: dict) -> bool:
+    """Clear an authenticated marker after the exact app-server is loaded.
+
+    Callers must hold both the host service repair lock and the install setup
+    lock so a concurrent setup cannot replace the plist/marker between the
+    successful load and this unlink.
+    """
+
+    observed = _read_codex_reload_marker(app_payload)
+    if observed is None:
+        return False
+    path, _value = observed
+    current = _secure_path_info(path, kind="file")
+    if current is None:
+        raise CodexRuntimeError(f"Codex reload marker disappeared before clear: {path}")
+    try:
+        path.unlink()
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory = os.open(path.parent, flags)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot clear Codex reload marker {path}: {error}") from error
+    return True
+
+
+def _manifest_owns_plist(
+    manifest: dict | None,
+    label: str,
+    path: Path,
+    content: bytes,
+) -> bool:
+    if manifest is None:
+        return False
+    codex = manifest.get("harnesses", {}).get("codex")
+    if not isinstance(codex, dict) or not isinstance(codex.get("plists"), list):
+        return False
+    digest = hashlib.sha256(content).hexdigest()
+    matches = [
+        item
+        for item in codex["plists"]
+        if isinstance(item, dict) and item.get("label") == label
+    ]
+    if len(matches) != 1:
+        return False
+    item = matches[0]
+    return item.get("path") == str(path) and item.get("digest") == digest
+
+
+def _manifest_owns_current_codex_hook(manifest: dict | None) -> bool:
+    """Recognize the complete SessionStart ownership record from setup.
+
+    This intentionally validates metadata rather than editing or even reading
+    the user's hook file.  The public ``roundtable`` entry performs the full
+    ownership-safe config validation; the low-level installed launcher only
+    needs to reject pre-hook manifests and send the user through that flow.
+    """
+
+    if not INSTALL_PREFIX or manifest is None:
+        return False
+    codex = manifest.get("harnesses", {}).get("codex")
+    if not isinstance(codex, dict):
+        return False
+    config = codex.get("config")
+    if not isinstance(config, dict):
+        return False
+    prefix = Path(INSTALL_PREFIX).expanduser().absolute()
+    expected_group = {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+            {
+                "type": "command",
+                "command": str(prefix / "bin" / "rt-codex-session-start"),
+                "timeout": 5,
+            }
+        ],
+    }
+    fragments = config.get("fragments")
+    events = config.get("event_containers_added")
+    if (
+        config.get("path") != str(CODEX_HOME / "hooks.json")
+        or not isinstance(config.get("created"), bool)
+        or not isinstance(config.get("hooks_container_added"), bool)
+        or not isinstance(events, dict)
+        or not isinstance(events.get("SessionStart"), bool)
+        or not isinstance(fragments, list)
+        or len(fragments) != 1
+    ):
+        return False
+    fragment = fragments[0]
+    return bool(
+        isinstance(fragment, dict)
+        and fragment.get("event") == "SessionStart"
+        and fragment.get("group") == expected_group
+        and isinstance(fragment.get("added"), bool)
+    )
+
+
+def _plist_state(
+    label: str,
+    expected: dict,
+    manifest: dict | None,
+) -> str:
+    path = launch_agent_path(label)
+    if not (path.exists() or path.is_symlink()):
+        return "missing"
+    _secure_path_info(path, kind="file")
+    try:
+        content = path.read_bytes()
+        current = plistlib.loads(content)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise CodexRuntimeError(f"invalid LaunchAgent plist {path}: {error}") from error
+    if not isinstance(current, dict) or current.get("Label") != label:
+        raise CodexRuntimeError(f"LaunchAgent plist has foreign label at {path}")
+    if current == expected:
+        # Installed launchers may operate on a plist only after the explicit
+        # setup flow has adopted it into the install-scoped ownership record.
+        # Source-tree developer runs have no install manifest and retain their
+        # existing explicit setup workflow.
+        if INSTALL_PREFIX and not _manifest_owns_plist(
+            manifest, label, path, content
+        ):
+            return "unowned_current"
+        return "current"
+    if _manifest_owns_plist(manifest, label, path, content):
+        return "owned_drift"
+    raise CodexRuntimeError(
+        f"LaunchAgent plist differs from Roundtable and is not proven owned: {path}"
+    )
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def wake_bridge_health(
+    socket_path: Path = DEFAULT_SOCKET,
+    *,
+    max_age: float = 15.0,
+) -> tuple[bool, str]:
+    """Validate launchd state plus the bridge PID/RPC heartbeat."""
+
+    if not launchd_running(WAKE_LABEL):
+        return False, "wake LaunchAgent is not running"
+    pid_path = RUNTIME_DIR / "rt-codex-wake.pid"
+    heartbeat_path = RUNTIME_DIR / "rt-codex-wake-heartbeat.json"
+    if not (pid_path.exists() or pid_path.is_symlink()):
+        return False, f"missing bridge pid file {pid_path}"
+    if not (heartbeat_path.exists() or heartbeat_path.is_symlink()):
+        return False, f"missing bridge heartbeat {heartbeat_path}"
+    _secure_path_info(pid_path, kind="file")
+    _secure_path_info(heartbeat_path, kind="file")
+    alive, detail = pid_is_running(pid_path, "rt-codex-wake")
+    if not alive:
+        return False, detail
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        return False, f"invalid bridge heartbeat: {error}"
+    if not isinstance(heartbeat, dict):
+        return False, "bridge heartbeat is not an object"
+    if heartbeat.get("schema") != "roundtable.codex-wake-heartbeat.v1":
+        return False, "bridge heartbeat schema is missing or invalid"
+    expected_build = wake_bridge_build_fingerprint()
+    reported_build = heartbeat.get("bridgeBuildFingerprint")
+    if reported_build != expected_build:
+        rendered = reported_build if isinstance(reported_build, str) else "missing"
+        return (
+            False,
+            "wake bridge build fingerprint is stale or invalid: "
+            f"reported={rendered} expected={expected_build}",
+        )
+    if heartbeat.get("pid") != pid:
+        return False, f"bridge heartbeat pid {heartbeat.get('pid')} != live pid {pid}"
+    reported_socket = heartbeat.get("socketPath")
+    if not isinstance(reported_socket, str) or not reported_socket:
+        return False, "bridge heartbeat socketPath is missing or invalid"
+    if Path(reported_socket).expanduser().absolute() != socket_path.expanduser().absolute():
+        return False, f"bridge heartbeat socket {reported_socket} != {socket_path}"
+    last_error = heartbeat.get("lastError")
+    if last_error not in (None, ""):
+        if not isinstance(last_error, str):
+            return False, "bridge heartbeat lastError is invalid"
+        return False, f"bridge reports error: {last_error}"
+    now = datetime.now(timezone.utc)
+    heartbeat_at = _parse_timestamp(heartbeat.get("heartbeatAt"))
+    last_rpc_ok = _parse_timestamp(heartbeat.get("lastRpcOkAt"))
+    if heartbeat_at is None:
+        return False, "bridge heartbeat timestamp is missing or invalid"
+    if last_rpc_ok is None:
+        return False, "last successful bridge RPC timestamp is missing or invalid"
+    heartbeat_age = max(0.0, (now - heartbeat_at).total_seconds())
+    rpc_age = max(0.0, (now - last_rpc_ok).total_seconds())
+    if heartbeat_age > max_age:
+        return False, f"bridge heartbeat is stale ({heartbeat_age:.1f}s > {max_age:.1f}s)"
+    if rpc_age > max_age:
+        return False, f"last successful bridge RPC is stale ({rpc_age:.1f}s > {max_age:.1f}s)"
+    return True, f"{detail}, heartbeat age={heartbeat_age:.1f}s, last RPC age={rpc_age:.1f}s"
+
+
+def _reload_status(
+    detail: str,
+    *,
+    cli_version: tuple[int, int, int],
+    daemon: dict | None,
+    app_plist: str,
+    wake_plist: str,
+) -> CodexServiceStatus:
+    blockers: list[str] = []
+    if os.environ.get("CODEX_THREAD_ID"):
+        blockers.append("the caller is itself a Codex thread")
+    try:
+        inspections = inspect_host_harness_seats("codex")
+    except RuntimeStateError as error:
+        blockers.append(f"host Codex lease state is ambiguous: {error}")
+    else:
+        for inspection in inspections:
+            if inspection.status not in {
+                "active_healthy",
+                "active_unhealthy",
+                "ambiguous",
+            }:
+                continue
+            token = inspection.token
+            identity = (
+                f"{token.agent_id}@{token.project_root}"
+                if token is not None
+                else "unknown Codex seat"
+            )
+            blockers.append(f"{identity} is {inspection.status}: {inspection.detail}")
+    state = SERVICE_RELOAD_DEFERRED_BUSY if blockers else SERVICE_RELOAD_REQUIRED_IDLE
+    rendered = detail
+    if blockers:
+        rendered += "; reload deferred: " + " | ".join(blockers)
+    return CodexServiceStatus(
+        state,
+        rendered,
+        cli_version,
+        daemon,
+        app_plist,
+        wake_plist,
+    )
+
+
+def inspect_codex_services(
+    socket_path: Path = DEFAULT_SOCKET,
+    *,
+    bridge_max_age: float = 15.0,
+) -> CodexServiceStatus:
+    """Classify the service pair without mutating files or launchd state."""
+
+    try:
+        require_default_socket(socket_path)
+        _validate_service_paths(socket_path)
+        manifest = _setup_manifest()
+        hook_owned = (
+            not bool(INSTALL_PREFIX)
+            or _manifest_owns_current_codex_hook(manifest)
+        )
+        expected_app = app_server_plist(socket_path, ensure_runtime=False)
+        expected_wake = wake_plist(socket_path, ensure_runtime=False)
+        app_state = _plist_state(APP_SERVER_LABEL, expected_app, manifest)
+        wake_state = _plist_state(WAKE_LABEL, expected_wake, manifest)
+        reload_pending = codex_reload_required(expected_app)
+        cli_version, output = codex_version()
+        if cli_version is None:
+            return CodexServiceStatus(
+                SERVICE_UNSUPPORTED,
+                f"could not parse Codex version: {output}",
+                app_plist=app_state,
+                wake_plist=wake_state,
+            )
+        if not version_is_validated(cli_version):
+            rendered = ".".join(str(part) for part in cli_version)
+            return CodexServiceStatus(
+                SERVICE_UNSUPPORTED,
+                f"Codex {rendered} is not validated (validated: {validated_releases_text()})",
+                cli_version,
+                app_plist=app_state,
+                wake_plist=wake_state,
+            )
+    except UnsupportedVersion as error:
+        return CodexServiceStatus(SERVICE_UNSUPPORTED, str(error))
+    except (CodexRuntimeError, RuntimeStateError, OSError) as error:
+        return CodexServiceStatus(SERVICE_UNSAFE, str(error))
+
+    # Service repair must never create an ownership gap or make the setup
+    # manifest stale.  The public ``roundtable`` entry runs ownership-safe
+    # setup before this preflight; direct/internal rt-codex callers get a
+    # closed, actionable failure instead of an unmanaged plist rewrite.
+    if (
+        not hook_owned
+        or app_state in {"missing", "owned_drift", "unowned_current"}
+        or wake_state in {
+            "missing",
+            "owned_drift",
+            "unowned_current",
+        }
+    ):
+        reasons = []
+        if not hook_owned:
+            reasons.append("Codex SessionStart hook ownership is missing or outdated")
+        if app_state != "current":
+            reasons.append(f"app-server plist is {app_state}")
+        if wake_state != "current":
+            reasons.append(f"wake plist is {wake_state}")
+        return CodexServiceStatus(
+            SERVICE_SETUP_REQUIRED,
+            "; ".join(reasons)
+            + "; run `roundtable setup apply --harness codex` before launch",
+            cli_version,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+
+    ok, handshake_detail, handshake_error = probe_handshake_detailed(
+        socket_path, timeout=1.0
+    )
+    if not ok:
+        try:
+            app_loaded = launchd_loaded(APP_SERVER_LABEL)
+        except (CodexRuntimeError, OSError) as error:
+            return CodexServiceStatus(
+                SERVICE_UNSAFE,
+                f"cannot inspect app-server LaunchAgent: {error}",
+                cli_version,
+                app_plist=app_state,
+                wake_plist=wake_state,
+            )
+        if app_loaded:
+            return _reload_status(
+                f"loaded app-server is unavailable: {handshake_detail}",
+                cli_version=cli_version,
+                daemon=None,
+                app_plist=app_state,
+                wake_plist=wake_state,
+            )
+        if repairable_probe_failure(socket_path, handshake_error):
+            return CodexServiceStatus(
+                SERVICE_COLD,
+                handshake_detail,
+                cli_version,
+                app_plist=app_state,
+                wake_plist=wake_state,
+            )
+        return CodexServiceStatus(
+            SERVICE_UNSAFE,
+            f"non-liveness app-server failure: {handshake_detail}",
+            cli_version,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+
+    daemon, daemon_detail = daemon_version(socket_path)
+    if not daemon or daemon.get("status") != "running":
+        return CodexServiceStatus(
+            SERVICE_UNSAFE,
+            f"responsive app-server could not be version-validated: {daemon_detail}",
+            cli_version=cli_version,
+            daemon=daemon,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+    expected_socket = str(socket_path)
+    if daemon.get("socketPath") != expected_socket:
+        return CodexServiceStatus(
+            SERVICE_UNSAFE,
+            f"daemon socket mismatch: {daemon.get('socketPath')!r} != {expected_socket!r}",
+            cli_version,
+            daemon,
+            app_state,
+            wake_state,
+        )
+    try:
+        selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
+    except CodexRuntimeError as error:
+        return CodexServiceStatus(
+            SERVICE_UNSAFE,
+            str(error),
+            cli_version,
+            daemon,
+            app_state,
+            wake_state,
+        )
+    if managed_codex != selected_codex:
+        return _reload_status(
+            "selected CLI/daemon managed Codex path mismatch: "
+            f"selected={selected_codex} daemon={managed_codex}",
+            cli_version=cli_version,
+            daemon=daemon,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+    rendered_cli = ".".join(str(part) for part in cli_version)
+    if (
+        daemon.get("cliVersion") != rendered_cli
+        or daemon.get("appServerVersion") != rendered_cli
+    ):
+        return _reload_status(
+            "Codex CLI/app-server version mismatch: "
+            f"selected={rendered_cli} daemon-cli={daemon.get('cliVersion')} "
+            f"app-server={daemon.get('appServerVersion')}",
+            cli_version=cli_version,
+            daemon=daemon,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+    if reload_pending:
+        return _reload_status(
+            "setup recorded a pending reload for the current app-server plist",
+            cli_version=cli_version,
+            daemon=daemon,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
+    try:
+        bridge_ok, bridge_detail = wake_bridge_health(
+            socket_path, max_age=bridge_max_age
+        )
+    except (CodexRuntimeError, OSError) as error:
+        return CodexServiceStatus(
+            SERVICE_UNSAFE,
+            str(error),
+            cli_version,
+            daemon,
+            app_state,
+            wake_state,
+        )
+    if not bridge_ok:
+        return CodexServiceStatus(
+            SERVICE_BRIDGE_DOWN,
+            bridge_detail,
+            cli_version,
+            daemon,
+            app_state,
+            wake_state,
+            bridge_detail,
+        )
+    return CodexServiceStatus(
+        SERVICE_READY,
+        "Codex app-server and wake bridge are ready",
+        cli_version,
+        daemon,
+        app_state,
+        wake_state,
+        bridge_detail,
+    )
+
+
+@contextmanager
+def codex_service_repair_lock(timeout: float = 10.0):
+    """Serialize host service repairs and reject an unsafe existing lock."""
+
+    if RUNTIME_DIR.exists() or RUNTIME_DIR.is_symlink():
+        _secure_path_info(RUNTIME_DIR, kind="directory")
+    else:
+        ensure_private_runtime_dir()
+    path = RUNTIME_DIR / "codex-service-repair.lock"
+    if path.exists() or path.is_symlink():
+        _secure_path_info(path, kind="file")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise CodexRuntimeError(f"cannot open Codex service repair lock {path}: {error}") from error
+    handle = os.fdopen(descriptor, "r+")
+    deadline = time.monotonic() + timeout
+    try:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise CodexRuntimeError(f"unsafe Codex service repair lock: {path}")
+        if info.st_mode & 0o077:
+            raise CodexRuntimeError(
+                f"Codex service repair lock exposes group/other permissions: {path}"
+            )
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CodexRuntimeError(
+                        "timed out waiting for Codex service repair lock"
+                    )
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+@contextmanager
+def codex_setup_state_lock(timeout: float = 10.0):
+    """Serialize installed preflight reads with setup marker/plist mutations."""
+
+    if not INSTALL_PREFIX:
+        yield
+        return
+    path = codex_reload_marker_path().parent / "harness-setup.lock"
+    runtime_info = _secure_path_info(path.parent, kind="directory")
+    if runtime_info is None:
+        raise CodexRuntimeError(
+            f"installed Codex setup runtime directory is missing: {path.parent}"
+        )
+    if path.exists() or path.is_symlink():
+        _secure_path_info(path, kind="file")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise CodexRuntimeError(
+            f"cannot open Codex setup state lock {path}: {error}"
+        ) from error
+    deadline = time.monotonic() + timeout
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise CodexRuntimeError(f"unsafe Codex setup state lock: {path}")
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CodexRuntimeError(
+                        f"timed out waiting for Codex setup state lock: {path}"
+                    )
+                time.sleep(0.05)
+        yield
+    except OSError as error:
+        raise CodexRuntimeError(
+            f"cannot lock Codex setup state at {path}: {error}"
+        ) from error
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _wait_for_daemon(socket_path: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    last_detail = "daemon did not become ready"
+    while time.monotonic() < deadline:
+        ok, last_detail = probe_handshake(socket_path, timeout=0.5)
+        if ok:
+            require_validated_daemon(socket_path)
+            return
+        time.sleep(0.2)
+    raise CodexRuntimeError(f"app-server reload failed: {last_detail}")
+
+
+def _restart_wake_bridge(socket_path: Path, timeout: float) -> None:
+    require_validated_daemon(socket_path)
+    install_launch_agent(WAKE_LABEL, wake_plist(socket_path), reload=True)
+    kickstart(WAKE_LABEL, force=False)
+    deadline = time.monotonic() + timeout
+    last_detail = "wake bridge did not become ready"
+    while time.monotonic() < deadline:
+        ok, last_detail = wake_bridge_health(socket_path)
+        if ok:
+            return
+        time.sleep(0.2)
+    raise CodexRuntimeError(f"wake bridge repair failed: {last_detail}")
+
+
+def _reload_service_pair(socket_path: Path, timeout: float) -> None:
+    install_launch_agent(
+        APP_SERVER_LABEL,
+        app_server_plist(socket_path),
+        reload=True,
+    )
+    kickstart(APP_SERVER_LABEL, force=False)
+    _wait_for_daemon(socket_path, timeout)
+    _restart_wake_bridge(socket_path, timeout)
+
+
+def codex_launch_preflight(
+    socket_path: Path = DEFAULT_SOCKET,
+    *,
+    confirm_reload: Callable[[CodexServiceStatus], bool] | None = None,
+    ready_action: Callable[[], None] | None = None,
+    timeout: float = 10.0,
+) -> CodexServiceStatus:
+    """Make services ready and publish the client seat under the host lock.
+
+    ``ready_action`` is intentionally executed only after a final in-lock READY
+    observation.  The Codex launcher uses it to claim its seat, closing the
+    scan-to-reload race: once the lock is released, every later reload scan can
+    see that lease.
+    """
+
+    reload_approved = False
+    for _attempt in range(6):
+        # Avoid observing setup's marker/plist/manifest transaction halfway
+        # through. This first snapshot is advisory (for prompting); the final
+        # decision is repeated under both locks below.
+        with codex_setup_state_lock(timeout):
+            status = inspect_codex_services(socket_path)
+        if status.state in {
+            SERVICE_UNSUPPORTED,
+            SERVICE_UNSAFE,
+            SERVICE_SETUP_REQUIRED,
+            SERVICE_RELOAD_DEFERRED_BUSY,
+        }:
+            raise CodexRuntimeError(
+                f"Codex service preflight {status.state}: {status.detail}"
+            )
+        if status.state == SERVICE_RELOAD_REQUIRED_IDLE and not reload_approved:
+            if confirm_reload is None or not confirm_reload(status):
+                raise CodexRuntimeError(
+                    "Codex service reload is required but was not approved: "
+                    f"{status.detail}"
+                )
+            reload_approved = True
+
+        with codex_service_repair_lock(timeout):
+            with codex_setup_state_lock(timeout):
+                # Another launcher may have repaired or setup may have changed
+                # the managed plist while we waited. Every mutation decision is
+                # based on this in-lock snapshot, never the advisory one above.
+                current = inspect_codex_services(socket_path)
+                if current.state == SERVICE_READY:
+                    if ready_action is not None:
+                        ready_action()
+                    return current
+                if current.state == SERVICE_COLD:
+                    reload_payload = None
+                    if INSTALL_PREFIX:
+                        candidate = app_server_plist(
+                            socket_path,
+                            ensure_runtime=False,
+                        )
+                        if codex_reload_required(candidate):
+                            reload_payload = candidate
+                    if reload_payload is None:
+                        ensure_daemon(socket_path, timeout=timeout)
+                    else:
+                        # A marker means setup wrote a specific new plist. Use
+                        # the coordinated loader even for a nominally cold job
+                        # so the exact marked definition is what becomes live.
+                        _reload_service_pair(socket_path, timeout)
+                        clear_codex_reload_marker(reload_payload)
+                    continue
+                if current.state == SERVICE_BRIDGE_DOWN:
+                    _restart_wake_bridge(socket_path, timeout)
+                    continue
+                if (
+                    current.state == SERVICE_RELOAD_REQUIRED_IDLE
+                    and reload_approved
+                ):
+                    reload_payload = (
+                        app_server_plist(socket_path, ensure_runtime=False)
+                        if INSTALL_PREFIX
+                        else None
+                    )
+                    _reload_service_pair(socket_path, timeout)
+                    if reload_payload is not None:
+                        clear_codex_reload_marker(reload_payload)
+                    continue
+                if current.state == SERVICE_RELOAD_REQUIRED_IDLE:
+                    continue
+                raise CodexRuntimeError(
+                    f"Codex service preflight {current.state}: {current.detail}"
+                )
+    raise CodexRuntimeError("Codex service preflight did not converge")
 
 
 class WebSocketUnix:
@@ -726,6 +1678,29 @@ def daemon_version(socket_path: Path = DEFAULT_SOCKET) -> tuple[dict | None, str
         return None, output
 
 
+def daemon_managed_codex_paths(daemon: dict) -> tuple[Path, Path]:
+    """Return lexical selected/reported executable identities or fail closed."""
+
+    selected = codex_bin().expanduser()
+    if not selected.is_absolute():
+        raise CodexRuntimeError(f"selected Codex path is not absolute: {selected}")
+    reported_value = daemon.get("managedCodexPath")
+    if not isinstance(reported_value, str) or not reported_value:
+        raise CodexRuntimeError(
+            "daemon managedCodexPath is missing or invalid; "
+            "the running daemon cannot be tied to the selected Codex resolver"
+        )
+    reported = Path(reported_value).expanduser()
+    if not reported.is_absolute():
+        raise CodexRuntimeError(
+            f"daemon managedCodexPath is not absolute: {reported_value!r}"
+        )
+    return (
+        Path(os.path.normpath(str(selected))),
+        Path(os.path.normpath(str(reported))),
+    )
+
+
 def version_is_validated(version: tuple[int, int, int]) -> bool:
     return version in VALIDATED_CODEX_RELEASES
 
@@ -761,6 +1736,12 @@ def require_validated_daemon(socket_path: Path = DEFAULT_SOCKET) -> dict:
     if reported_socket != str(socket_path):
         raise CodexRuntimeError(
             f"daemon socket mismatch: {reported_socket!r} != {str(socket_path)!r}"
+        )
+    selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
+    if managed_codex != selected_codex:
+        raise CodexRuntimeError(
+            "selected CLI/daemon managed Codex path mismatch: "
+            f"{selected_codex} != {managed_codex}"
         )
     daemon_cli_version = daemon.get("cliVersion")
     app_version = daemon.get("appServerVersion")

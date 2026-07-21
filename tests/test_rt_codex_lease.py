@@ -217,7 +217,12 @@ def test_bind_command_records_current_lease_and_native_thread(
             pass
 
     monkeypatch.setattr(wake, "require_validated_version", lambda: None)
-    monkeypatch.setattr(wake, "ensure_daemon", lambda _socket: None)
+    monkeypatch.setattr(
+        wake,
+        "ensure_daemon",
+        lambda _socket: pytest.fail("bind must not repair or reload the daemon"),
+        raising=False,
+    )
     monkeypatch.setattr(wake, "require_validated_daemon", lambda _socket: None)
     monkeypatch.setattr(wake, "AppServerClient", lambda _socket: Client())
     monkeypatch.setattr(

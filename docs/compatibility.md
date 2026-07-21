@@ -14,13 +14,17 @@ real vendor session can wake.
 | --- | --- | --- |
 | Claude Code | Global skill link; owned SessionStart inbox hook; owned Stop drain gate; plan/apply/status/remove tests | Clean-account skill discovery and real send-to-wake-to-drain/ack |
 | Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests | Clean-account plugin load/injection and real send-to-wake-to-drain/ack |
-| Codex | Shared executable resolver; global skill link; owned app-server and wake plist generation | Safe service load/reload, cwd-verified thread bind, and real send-to-wake-to-drain/ack |
+| Codex | Shared executable resolver; global skill link; owned SessionStart auto-bind hook; owned app-server and wake plist generation; fail-closed service preflight tests | Live hook identity spike, coordinated host cutover, and real send-to-wake-to-drain/ack |
 
 The Codex plist files are written but not loaded by setup. This is an
 intentional safety boundary, not evidence that the daemon is running.
 Conversely, removing Codex onboarding requires
 `roundtable-setup remove --unload-codex` from outside a Codex session, so a
 loaded job cannot be orphaned after its plist and executable are removed.
+
+The normal `roundtable` launcher owns the next step: it performs a targeted
+Codex service preflight and starts or repairs only states proven safe. Users do
+not normally run the two low-level service reload commands themselves.
 
 ## Codex executable selection
 
@@ -37,6 +41,13 @@ The selected path is preserved rather than dereferenced. This matters for both
 the standalone `current` link and npm's visible CLI shim. The launcher,
 app-server LaunchAgent, wake LaunchAgent, daemon checks, and doctor all use that
 same path.
+
+One static custom `CODEX_HOME` is supported when it is an absolute owned path
+under the user's home and is present consistently during setup and launch. Its
+hook, skill link, standalone resolver, socket, and LaunchAgent environment all
+use that same root. Switching `CODEX_HOME` between identities on individual
+launches is multi-auth lifecycle management and remains outside P0; setup and
+preflight fail closed on the resulting ownership drift.
 
 ## Terminal launcher portability
 
@@ -62,7 +73,12 @@ Codex wake is ready only when all of the following are true:
 - the selected CLI is an explicitly validated release;
 - the daemon reports `running`;
 - the requested and reported Unix sockets match;
+- the daemon's `managedCodexPath` exactly identifies the selected executable;
 - the daemon's CLI and app-server versions both equal the selected CLI version;
+- no authenticated, digest-bound setup marker says the current app-server
+  plist is still awaiting activation or reload;
+- the wake heartbeat reports the fingerprint of the currently installed bridge
+  and its local dependencies;
 - the WebSocket-over-Unix-socket `initialize` / `initialized` handshake works.
 
 Handshake liveness alone is not readiness. A daemon left running after a CLI
@@ -72,12 +88,76 @@ Future Codex releases are not accepted through an open-ended minimum version.
 The app-server is an experimental integration surface, so each release is added
 only after its protocol and end-to-end wake path pass.
 
+## Codex service preflight
+
+The Codex launcher checks the service pair before publishing a project-seat
+lease. Its state machine is deliberately narrower than a generic repair tool:
+
+| State | Launcher behavior |
+| --- | --- |
+| `ready` | Continue silently |
+| `cold` | Under a host repair lock, re-check and start only a clear liveness failure |
+| `bridge_down` | Revalidate the app-server, then restart only the wake bridge |
+| `reload_required_idle` | Explain possible disconnection and ask before coordinated reload |
+| `reload_deferred_busy` | Refuse because the caller or another active, unhealthy-live, or ambiguous Codex lease may be disrupted |
+| `setup_required` | Stop and direct the user to managed setup |
+| `unsupported` | Stop because the selected Codex release has not passed this protocol matrix |
+| `unsafe` | Stop on foreign plist/socket ownership, permissions, malformed runtime state, or non-liveness protocol failure |
+
+Every launch takes one host-wide repair lock plus the install setup-state lock
+and re-runs the inspection inside them. The final `ready` observation and
+project-seat claim happen before those locks are released, so a concurrent
+setup or reload cannot slip between them. A version or owned-plist mismatch is
+never interpreted as permission to silently restart the shared app-server.
+Roundtable Codex therefore requires a project anchor in P0;
+unanchored users can run native `codex` without Roundtable messaging. True
+zero-downtime upgrades would require versioned blue/green sockets and are P1
+rather than a P0 claim.
+
+## Codex automatic binding
+
+The owned Codex SessionStart hook matches `startup`, `resume`, and `clear`, but
+not `compact`. It only writes a private atomic request and exits; it never calls
+the app-server recursively during thread startup. The wake bridge consumes that
+request later and accepts it only when all of these identities agree:
+
+- the hook's native session/thread ID exists in the app-server;
+- the app-server reports the exact canonical project cwd;
+- the thread is an interactive root thread, not a child or ephemeral thread;
+- the request's project, agent ID, Roundtable session ID, and lease revision
+  match the current fenced host lease;
+- the project has not acquired a conflicting current binding.
+
+Exact replays are idempotent. A trusted `clear` event may move the same current
+lease to its replacement native thread; a request from an older lease cannot
+replace a newer claim. If `clear` replaces a request while the bridge is
+draining it, the bridge quarantines the superseded binding and processes the
+replacement request before it can wake pending mail. User-level Codex hooks may
+require a one-time `/hooks` trust review, and Roundtable does not bypass that
+decision. The manual
+`rt-codex-wake bind /absolute/project/path` command remains a diagnostic
+fallback.
+
+The launcher thread's first `startup` or `resume` request wins for its lease;
+an interactive Codex started later from one of that thread's tool shells cannot
+replace it merely by inheriting the Roundtable environment. A `clear` event is
+allowed to replace the current native thread for the same lease. P0 treats an
+operator deliberately running `/clear` inside a nested Codex that inherited
+that lease as a same-user cooperative boundary, not as a supported nested-Codex
+routing topology; stronger per-client lifecycle identity is deferred to P1.
+
+This path has focused automated coverage, but it is not yet a public support
+claim. After the live machine cutover, a real spike must prove that Codex's
+SessionStart `session_id` is the same ID returned by `thread/read` and that the
+launcher-injected Roundtable environment reaches the hook. That is followed by
+the complete credentialed send-to-wake-to-drain/ack gate.
+
 ## Validation matrix
 
 | Codex distribution | CLI | App-server | Result |
 | --- | ---: | ---: | --- |
 | npm | `0.144.6` | isolated `0.144.6` | `initialize`, thread read/list, hooks list, and turn-history protocol smoke passed |
-| npm | `0.144.6` | existing default daemon `0.144.5` | rejected as stale; reload and full wake E2E pending |
+| npm | `0.144.6` | existing default daemon `0.144.5` | rejected as stale; the development machine has not yet performed the coordinated cutover or live hook/E2E gate |
 | standalone | not installed | not installed | resolver and fixtures only; support is not yet claimed |
 | any future or unlisted release | any | any | rejected until explicitly validated |
 
@@ -100,6 +180,14 @@ acknowledgement, and drain. It does not prove interactive wake UX.
 | tmux | Core design is reusable | Unsupported until lifecycle and wake E2E pass |
 | Cross-host SSH | No P0 transport | Unsupported |
 
+Every supported P0 participant currently shares one host filesystem and one
+host-local runtime root. This is independent of terminal emulator: Terminal,
+iTerm2, Ghostty, and cmux can all reach the same maildir and harness adapters.
+It is not cross-host transport. Two coding sessions on different Macs do not
+share a Roundtable merely because both were launched over SSH; a future
+cross-host transport must preserve durable delivery and identity fencing across
+machines.
+
 ## Legacy and migration boundary
 
 The current source tree replaces the earlier cmux keyboard-nudge delivery path.
@@ -109,9 +197,18 @@ session leases and heartbeats live under the host-local
 `~/.roundtable/.runtime/` tree.
 
 An active installation created before the managed package and harness manifests
-needs an explicit migration plan. The installer will not treat an unexplained
-legacy path as owned, and setup will not overwrite a foreign config fragment,
-plugin path, skill path, or plist.
+needs an explicit migration plan. The extracted artifact provides `./migrate`
+(read-only by default), `./migrate apply`, and `./migrate rollback`. The
+recognizer accepts only clean tracked predecessor program files, recognized
+command links, the unmodified canonical skill, and known old Roundtable Codex
+plist shapes. It backs those leaves up byte-for-byte and preserves registry,
+runtime, and mailbox state. Unknown or modified material fails closed.
+
+Migration only queries the two known service labels with read-only
+`launchctl print`; it never loads, unloads, or restarts them. `apply` refuses to
+run inside Codex or while a recognized legacy service remains loaded. The
+development machine has not yet exercised the one-time live migration/cutover,
+so this remains a release promotion gate rather than a completed support claim.
 
 ## Official surface notes
 

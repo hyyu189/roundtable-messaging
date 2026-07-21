@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Queue a fenced Codex SessionStart identity for the wake bridge.
+
+This hook deliberately performs no app-server RPC.  Calling ``thread/read``
+from a SessionStart hook would re-enter the app-server while it is starting the
+same session.  The launchd wake bridge consumes and validates this small,
+host-local request after the hook exits.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from _rtruntime import RuntimeStateError, bind_request_guard, runtime_root
+
+
+REQUEST_SCHEMA = "roundtable.codex-bind-request.v1"
+REQUESTS_DIRNAME = "codex-bind-requests"
+SUPPORTED_SOURCES = frozenset({"startup", "resume", "clear"})
+MAX_INPUT_BYTES = 64 * 1024
+MAX_VALUE_BYTES = 4096
+AGENT_ID_RE = re.compile(r"^[a-z0-9#_-]+$")
+
+
+class HookError(RuntimeError):
+    """The hook could not safely publish a bind request."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _safe_text(value, *, label: str, pattern=None) -> str | None:
+    if not isinstance(value, str) or not value or "\0" in value:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError:
+        return None
+    if len(encoded) > MAX_VALUE_BYTES:
+        return None
+    if pattern is not None and pattern.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _canonical_existing_dir(value, *, label: str) -> Path | None:
+    rendered = _safe_text(value, label=label)
+    if rendered is None:
+        return None
+    selected = Path(rendered).expanduser()
+    if not selected.is_absolute():
+        return None
+    try:
+        resolved = selected.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_dir():
+        return None
+    # Resolution can expose a surrogate-escaped filesystem component even
+    # when the configured symlink path itself was UTF-8.  Such a path cannot be
+    # represented safely in the JSON request or its UTF-8 identity digest.
+    return resolved if _safe_text(str(resolved), label=label) is not None else None
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create one private directory without following a symlink at its leaf."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as error:
+        raise HookError(f"cannot inspect runtime directory {path}: {error}") from error
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        raise HookError(f"runtime directory is a symlink: {path}")
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise HookError(f"cannot open runtime directory {path}: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise HookError(f"runtime path is not a directory: {path}")
+        if opened.st_uid != os.getuid():
+            raise HookError(
+                f"runtime directory owner uid {opened.st_uid} != {os.getuid()}: {path}"
+            )
+        os.fchmod(descriptor, 0o700)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+            raise HookError(f"cannot protect runtime directory {path}")
+    except OSError as error:
+        raise HookError(f"cannot protect runtime directory {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _validate_replace_target(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise HookError(f"cannot inspect bind request {path}: {error}") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise HookError(f"bind request target is not a regular file: {path}")
+    if info.st_uid != os.getuid():
+        raise HookError(
+            f"bind request owner uid {info.st_uid} != {os.getuid()}: {path}"
+        )
+    if info.st_mode & 0o077:
+        raise HookError(f"bind request exposes group/other permissions: {path}")
+
+
+def _atomic_request(path: Path, payload: dict) -> bool:
+    """Publish one complete request and return whether it changed queue state.
+
+    A launcher TUI's SessionStart completes before that TUI can run a nested
+    Codex process. Preserve that first ``startup``/``resume`` request for the
+    lease instead of letting an inherited tool environment steal the binding.
+    ``clear`` is the sole lifecycle event allowed to replace the current
+    request for the same fence.
+    """
+    _ensure_private_dir(path.parent.parent)
+    _ensure_private_dir(path.parent)
+    _validate_replace_target(path)
+    source = payload.get("source")
+    if not isinstance(source, str) or source not in SUPPORTED_SOURCES:
+        raise HookError(f"unsupported bind request source: {source!r}")
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        with bind_request_guard(path.parent.parent):
+            _validate_replace_target(path)
+            if source == "clear":
+                os.replace(temporary, path)
+                return True
+            try:
+                # Unlike os.replace(), link is an atomic no-clobber publication.
+                # The bridge sees either the old complete inode or this fully
+                # fsynced one, never a partially-written request.
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                _validate_replace_target(path)
+                return False
+            return True
+    except (OSError, RuntimeStateError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        raise HookError(f"cannot publish bind request {path}: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def request_from(payload: dict, environment: dict[str, str]) -> dict | None:
+    if payload.get("hook_event_name") != "SessionStart":
+        return None
+    source = _safe_text(payload.get("source"), label="source")
+    if source not in SUPPORTED_SOURCES:
+        return None
+
+    thread_id = _safe_text(payload.get("session_id"), label="session_id")
+    project = _canonical_existing_dir(
+        environment.get("RT_PROJECT_ROOT"), label="RT_PROJECT_ROOT"
+    )
+    cwd = _canonical_existing_dir(payload.get("cwd"), label="cwd")
+    agent_id = _safe_text(
+        environment.get("RT_FROM"), label="RT_FROM", pattern=AGENT_ID_RE
+    )
+    roundtable_session_id = _safe_text(
+        environment.get("RT_SESSION_ID"), label="RT_SESSION_ID"
+    )
+    lease_revision = _safe_text(
+        environment.get("RT_LEASE_REVISION"), label="RT_LEASE_REVISION"
+    )
+    configured_runtime = _safe_text(
+        environment.get("RT_RUNTIME_DIR"), label="RT_RUNTIME_DIR"
+    )
+    if not all(
+        (
+            thread_id,
+            project,
+            cwd,
+            agent_id,
+            roundtable_session_id,
+            lease_revision,
+            configured_runtime,
+        )
+    ):
+        return None
+    if cwd != project or not (project / ".roundtable" / "agents.yaml").is_file():
+        return None
+
+    # runtime_root() also rejects conflicting RT_RUNTIME_DIR and the legacy
+    # RT_CODEX_RUNTIME_DIR alias.  It is evaluated only after all launch-owned
+    # identity fields are present, so ordinary non-Roundtable Codex sessions
+    # remain a silent no-op.
+    try:
+        selected_runtime = runtime_root()
+    except RuntimeStateError as error:
+        raise HookError(str(error)) from error
+    if not selected_runtime.is_absolute():
+        raise HookError(f"runtime root is not absolute: {selected_runtime}")
+
+    return {
+        "schema": REQUEST_SCHEMA,
+        "hookEventName": "SessionStart",
+        "source": source,
+        "threadId": thread_id,
+        "projectRoot": str(project),
+        "agentId": agent_id,
+        "roundtableSessionId": roundtable_session_id,
+        "leaseRevision": lease_revision,
+        "createdAt": utc_now(),
+    }
+
+
+def request_path(payload: dict) -> Path:
+    identity = "\0".join(
+        str(payload[name])
+        for name in (
+            "projectRoot",
+            "agentId",
+            "roundtableSessionId",
+            "leaseRevision",
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    try:
+        root = runtime_root()
+    except RuntimeStateError as error:
+        raise HookError(str(error)) from error
+    return root / REQUESTS_DIRNAME / f"{digest}.json"
+
+
+def run(stdin, environment: dict[str, str] | None = None) -> int:
+    raw = stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        return 0
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    request = request_from(payload, dict(os.environ if environment is None else environment))
+    if request is None:
+        return 0
+    _atomic_request(request_path(request), request)
+    return 0
+
+
+def main() -> int:
+    try:
+        return run(sys.stdin)
+    except (HookError, OSError) as error:
+        print(f"rt-codex-session-start: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

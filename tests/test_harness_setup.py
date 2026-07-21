@@ -40,7 +40,12 @@ def installation(tmp_path: Path) -> tuple[Path, Path]:
         / "hermes"
         / "roundtable"
     ).mkdir(parents=True)
-    for command in ("rt-wait-inbox", "rt-stop-gate", "rt-codex-wake"):
+    for command in (
+        "rt-wait-inbox",
+        "rt-stop-gate",
+        "rt-codex-wake",
+        "rt-codex-session-start",
+    ):
         _write_executable(prefix / "bin" / command)
     _write_executable(
         home / ".npm-global" / "bin" / "codex",
@@ -117,6 +122,54 @@ def test_default_plan_is_read_only(
     assert not (prefix / "harness-setup.json").exists()
 
 
+def test_codex_setup_honors_one_static_codex_home_and_runtime_override(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, prefix = installation
+    codex_home = home / "custom-codex-home"
+    runtime = home / "custom-roundtable-runtime"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("RT_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("RT_CODEX_RUNTIME_DIR", str(runtime))
+
+    code, result = _run(
+        capsys,
+        home,
+        prefix,
+        "apply",
+        "--harness",
+        "codex",
+    )
+
+    assert code == 0, result
+    assert (codex_home / "hooks.json").is_file()
+    assert (codex_home / "skills" / "roundtable").is_symlink()
+    assert not (home / ".codex").exists()
+    assert runtime.is_dir()
+    for label in harness_setup.CODEX_LABELS:
+        plist_path = home / "Library" / "LaunchAgents" / f"{label}.plist"
+        payload = plistlib.loads(plist_path.read_bytes())
+        environment = payload["EnvironmentVariables"]
+        assert environment["CODEX_HOME"] == str(codex_home)
+        assert environment["RT_RUNTIME_DIR"] == str(runtime)
+        assert environment["RT_CODEX_RUNTIME_DIR"] == str(runtime)
+    app_payload = plistlib.loads(
+        (
+            home
+            / "Library"
+            / "LaunchAgents"
+            / "com.roundtable.codex-app-server.plist"
+        ).read_bytes()
+    )
+    assert app_payload["ProgramArguments"][-1] == (
+        f"unix://{codex_home}/app-server-control/app-server-control.sock"
+    )
+    assert harness_setup._codex_reload_marker_path(prefix).is_file()
+
+
 def test_clean_apply_status_idempotence_and_remove(
     installation: tuple[Path, Path],
     capsys: pytest.CaptureFixture[str],
@@ -163,10 +216,27 @@ def test_clean_apply_status_idempotence_and_remove(
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert plistlib.loads(path.read_bytes())["Label"] == label
 
+    codex_hooks = json.loads((home / ".codex" / "hooks.json").read_text())
+    codex_group = harness_setup._codex_groups(prefix)["SessionStart"]
+    assert codex_hooks["hooks"]["SessionStart"].count(codex_group) == 1
+
     manifest_path = prefix / "harness-setup.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["schema"] == "roundtable.harness-setup.v1"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+    marker_path = harness_setup._codex_reload_marker_path(prefix)
+    marker = json.loads(marker_path.read_text())
+    app_record = next(
+        item
+        for item in manifest["harnesses"]["codex"]["plists"]
+        if item["label"] == "com.roundtable.codex-app-server"
+    )
+    assert marker == harness_setup._codex_reload_marker_value(
+        prefix,
+        Path(app_record["path"]),
+        app_record["digest"],
+    )
+    assert stat.S_IMODE(marker_path.stat().st_mode) == 0o600
     lock_path = prefix / ".runtime" / "harness-setup.lock"
     assert lock_path.is_file()
     assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
@@ -218,6 +288,8 @@ def test_clean_apply_status_idempotence_and_remove(
     assert not manifest_path.exists()
     assert not (home / ".claude" / "settings.json").exists()
     assert not (home / ".hermes" / "config.yaml").exists()
+    assert not (home / ".codex" / "hooks.json").exists()
+    assert not marker_path.exists()
     for harness in harness_setup.HARNESSES:
         assert not (home / f".{harness}" / "skills" / "roundtable").exists()
     assert not (home / ".hermes" / "plugins" / "roundtable").exists()
@@ -231,6 +303,15 @@ def test_clean_apply_status_idempotence_and_remove(
     )
     assert code == 0
     assert repeated_remove["writes"] is False
+
+    # The launcher never had a chance to clear the first marker. Removal still
+    # owns it completely, so a later clean re-add cannot see a foreign remnant.
+    code, readded = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    assert readded["writes"] is True
+    assert marker_path.is_file()
 
 
 def test_existing_configuration_is_backed_up_and_preserved_exactly(
@@ -522,6 +603,175 @@ def test_different_existing_codex_plist_is_never_overwritten(
         launch_agents / "com.roundtable.codex-wake.plist"
     ).exists()
     assert not (prefix / "harness-setup.json").exists()
+
+
+def test_codex_hook_merge_and_remove_preserve_unrelated_groups(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, prefix = installation
+    path = home / ".codex" / "hooks.json"
+    path.parent.mkdir()
+    user_group = {
+        "hooks": [
+            {"type": "command", "command": "/usr/bin/true", "timeout": 3}
+        ]
+    }
+    original = {
+        "hooks": {
+            "SessionStart": [user_group],
+            "Stop": [{"hooks": [{"type": "command", "command": "mine"}]}],
+        },
+        "userSetting": True,
+    }
+    path.write_text(json.dumps(original, indent=4) + "\n")
+
+    code, configured = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+
+    assert code == 0
+    assert configured["writes"] is True
+    value = json.loads(path.read_text())
+    group = harness_setup._codex_groups(prefix)["SessionStart"]
+    assert value["hooks"]["SessionStart"] == [user_group, group]
+    assert value["hooks"]["Stop"] == original["hooks"]["Stop"]
+    assert value["userSetting"] is True
+    manifest = json.loads((prefix / "harness-setup.json").read_text())
+    assert manifest["harnesses"]["codex"]["config"]["fragments"][0]["added"]
+
+    launchctl = home / "fake-launchctl"
+    _write_executable(
+        launchctl,
+        "#!/bin/sh\n"
+        "if [ \"$1\" = print ]; then exit 113; fi\n"
+        "exit 0\n",
+    )
+    monkeypatch.setenv("RT_LAUNCHCTL", str(launchctl))
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    code, removed = _run(
+        capsys,
+        home,
+        prefix,
+        "remove",
+        "--unload-codex",
+        "--harness",
+        "codex",
+    )
+
+    assert code == 0
+    assert removed["writes"] is True
+    assert json.loads(path.read_text()) == original
+
+
+def test_owned_codex_plists_upgrade_only_from_manifest_digest(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, prefix = installation
+    code, _configured = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    app_path = (
+        home
+        / "Library"
+        / "LaunchAgents"
+        / "com.roundtable.codex-app-server.plist"
+    )
+    old_payload = app_path.read_bytes()
+    marker_path = harness_setup._codex_reload_marker_path(prefix)
+    old_marker = marker_path.read_bytes()
+    original_builder = harness_setup._codex_payloads
+
+    def upgraded_payloads(home_arg, prefix_arg, *, ensure_runtime):
+        payloads = original_builder(
+            home_arg,
+            prefix_arg,
+            ensure_runtime=ensure_runtime,
+        )
+        payloads["com.roundtable.codex-app-server"]["ThrottleInterval"] = 17
+        return payloads
+
+    monkeypatch.setattr(harness_setup, "_codex_payloads", upgraded_payloads)
+    before_plan = _tree_snapshot(home)
+    code, planned = _run(
+        capsys, home, prefix, "plan", "--harness", "codex"
+    )
+    assert code == 0
+    assert planned["harnesses"]["codex"]["state"] == "upgrade_planned"
+    assert any(
+        "update" in action
+        for action in planned["harnesses"]["codex"]["actions"]
+    )
+    assert _tree_snapshot(home) == before_plan
+
+    code, applied = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0, applied
+    assert applied["restart_required"] is True
+    assert app_path.read_bytes() != old_payload
+    assert plistlib.loads(app_path.read_bytes())["ThrottleInterval"] == 17
+    assert marker_path.read_bytes() != old_marker
+    upgraded_manifest = json.loads((prefix / "harness-setup.json").read_text())
+    upgraded_record = next(
+        item
+        for item in upgraded_manifest["harnesses"]["codex"]["plists"]
+        if item["label"] == "com.roundtable.codex-app-server"
+    )
+    assert json.loads(marker_path.read_text()) == (
+        harness_setup._codex_reload_marker_value(
+            prefix,
+            app_path,
+            upgraded_record["digest"],
+        )
+    )
+
+    code, repeated = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    assert repeated["writes"] is False
+
+
+def test_previous_managed_codex_record_is_upgraded_with_session_start_hook(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    code, _configured = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    manifest_path = prefix / "harness-setup.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["harnesses"]["codex"]["config"]
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    hook_path = home / ".codex" / "hooks.json"
+    hook_path.unlink()
+
+    before = _tree_snapshot(home)
+    code, status = _run(
+        capsys, home, prefix, "status", "--harness", "codex"
+    )
+    assert code == 0
+    assert status["harnesses"]["codex"]["state"] == "upgrade_required"
+    assert _tree_snapshot(home) == before
+
+    code, upgraded = _run(
+        capsys, home, prefix, "apply", "--harness", "codex"
+    )
+    assert code == 0
+    assert upgraded["writes"] is True
+    assert upgraded["restart_required"] is False
+    group = harness_setup._codex_groups(prefix)["SessionStart"]
+    hooks = json.loads(hook_path.read_text())
+    assert hooks["hooks"]["SessionStart"] == [group]
+    updated = json.loads(manifest_path.read_text())
+    assert "config" in updated["harnesses"]["codex"]
 
 
 def test_codex_remove_unloads_exact_jobs_and_refuses_inside_codex(
@@ -857,6 +1107,7 @@ def test_apply_failure_rolls_back_configs_links_plists_backups_and_manifest(
         assert not (
             home / "Library" / "LaunchAgents" / f"{label}.plist"
         ).exists()
+    assert not harness_setup._codex_reload_marker_path(prefix).exists()
 
 
 def test_remove_failure_restores_exact_configured_state(

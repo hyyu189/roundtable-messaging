@@ -2,4 +2,4 @@ codex:
   cwd: ${project_dir}
   role: fast implementation, tests, integration, CLI/runtime review
   always_read: [ROUTING.md, README.md]
-  startup: 新对话首回合先执行 `~/.roundtable/bin/rt-codex-wake bind ${project_dir}`(roundtable 唤醒自注册;resume 已绑定线程时跳过),再开始任务
+  startup: 由可信的 Roundtable SessionStart hook 自动排队并验证当前 Codex thread 绑定；正常情况下不要手动 bind。仅当 Roundtable diagnostics 明确报告自动绑定未完成时，才使用 fallback：`~/.roundtable/bin/rt-codex-wake bind ${project_dir}`

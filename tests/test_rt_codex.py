@@ -1229,6 +1229,47 @@ def test_invalid_persisted_project_disables_daemon_without_restart_storm(tmp_pat
     assert wake.run_command(args) == 1
 
 
+def test_wake_heartbeat_reports_loaded_bridge_build(tmp_path):
+    path = tmp_path / "wake-heartbeat.json"
+    socket_path = tmp_path / "app.sock"
+
+    wake.heartbeat(path, [], socket_path, "2026-07-20T00:00:00Z", None)
+
+    payload = json.loads(path.read_text())
+    assert payload["bridgeBuildFingerprint"] == wake.BRIDGE_BUILD_FINGERPRINT
+    assert payload["bridgeBuildFingerprint"].startswith("sha256:")
+
+
+def test_wake_run_backs_off_without_repairing_daemon(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    repair_calls = []
+    monkeypatch.setattr(wake, "require_validated_version", lambda: None)
+    monkeypatch.setattr(
+        wake,
+        "require_validated_daemon",
+        lambda _socket: (_ for _ in ()).throw(
+            _rtcodex.CodexRuntimeError("daemon unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        wake,
+        "ensure_daemon",
+        lambda _socket: repair_calls.append("repair"),
+        raising=False,
+    )
+    args = Namespace(
+        project=[str(project)],
+        once=True,
+        state_file=tmp_path / "wake-state.json",
+        socket=tmp_path / "app.sock",
+        auto_discover=False,
+        poll_seconds=0.0,
+    )
+
+    assert wake.run_command(args) == 1
+    assert repair_calls == []
+
+
 def _recv_http(conn):
     data = bytearray()
     while b"\r\n\r\n" not in data:
@@ -1845,9 +1886,11 @@ def test_rt_codex_import_rejects_split_runtime_roots(tmp_path):
 
 
 def test_daemon_version_mismatch_fails_closed(monkeypatch):
+    selected_codex = Path("/tmp/roundtable-current-codex")
     monkeypatch.setattr(
         _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
     )
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
     monkeypatch.setattr(
         _rtcodex,
         "daemon_version",
@@ -1855,6 +1898,7 @@ def test_daemon_version_mismatch_fails_closed(monkeypatch):
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+                "managedCodexPath": str(selected_codex),
                 "cliVersion": "0.144.6",
                 "appServerVersion": "0.144.5",
             },
@@ -1867,9 +1911,11 @@ def test_daemon_version_mismatch_fails_closed(monkeypatch):
 
 
 def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
+    selected_codex = Path("/tmp/roundtable-current-codex")
     monkeypatch.setattr(
         _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
     )
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
     monkeypatch.setattr(
         _rtcodex,
         "daemon_version",
@@ -1877,6 +1923,7 @@ def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+                "managedCodexPath": str(selected_codex),
                 "cliVersion": "0.144.5",
                 "appServerVersion": "0.144.6",
             },
@@ -1885,6 +1932,31 @@ def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
     )
 
     with pytest.raises(_rtcodex.CodexRuntimeError, match="daemon CLI"):
+        _rtcodex.require_validated_daemon()
+
+
+def test_daemon_managed_codex_path_mismatch_fails_closed(monkeypatch):
+    selected_codex = Path("/tmp/roundtable-current-codex")
+    monkeypatch.setattr(
+        _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
+    )
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "daemon_version",
+        lambda _path: (
+            {
+                "status": "running",
+                "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+                "managedCodexPath": "/tmp/roundtable-other-codex",
+                "cliVersion": "0.144.6",
+                "appServerVersion": "0.144.6",
+            },
+            "",
+        ),
+    )
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="managed Codex path mismatch"):
         _rtcodex.require_validated_daemon()
 
 
@@ -2030,7 +2102,7 @@ def test_doctor_failure_matrix_and_install_fix(monkeypatch, capsys):
     assert "FAIL rpc:" in output
     assert "OK version:" in output
     assert "FAIL bridge:" in output
-    assert "~/.roundtable/bin/rt-codex-wake install" in output
+    assert "run `roundtable codex` from a normal terminal" in output
 
 
 def test_doctor_reports_persisted_needs_human_as_warn(tmp_path, monkeypatch, capsys):
@@ -2152,7 +2224,7 @@ def test_doctor_version_mismatch_reinstalls_loaded_plist(monkeypatch, capsys):
     assert doctor.main() == 1
     output = capsys.readouterr().out
     assert "FAIL version:" in output
-    assert "rt-codex-daemon install --reload" in output
+    assert "run `roundtable codex` from a normal terminal" in output
 
 
 def test_daemon_status_rejects_handshake_only_readiness(monkeypatch, capsys):

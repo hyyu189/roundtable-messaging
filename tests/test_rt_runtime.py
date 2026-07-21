@@ -122,6 +122,14 @@ def test_runtime_path_hashes_canonical_project_and_enforces_private_modes(
     assert stat.S_IMODE(paths.state_lock.stat().st_mode) == 0o600
 
 
+def test_canonical_project_wraps_symlink_loop_as_runtime_error(tmp_path):
+    loop = tmp_path / "loop"
+    loop.symlink_to("loop", target_is_directory=True)
+
+    with pytest.raises(_rtruntime.RuntimeStateError, match="cannot resolve project root"):
+        _rtruntime.canonical_project(loop / "project")
+
+
 def test_claim_is_active_unhealthy_until_wake_heartbeat(
     tmp_path, runtime, process_table
 ):
@@ -158,6 +166,36 @@ def test_active_same_harness_blocks_other_agent_but_other_harness_is_allowed(
     assert captured.value.inspection.status == "active_unhealthy"
     hermes = _rtruntime.claim(root, "hermes", "hermes", owner_pid=102)
     assert hermes.harness == "hermes"
+
+
+def test_host_harness_scan_finds_unregistered_projects_and_filters_harness(
+    tmp_path, runtime, process_table
+):
+    first = project(tmp_path, "first")
+    second = project(tmp_path, "second")
+    codex = _rtruntime.claim(first, "codex-build", "codex", owner_pid=101)
+    _rtruntime.claim(second, "claude", "claude", owner_pid=102)
+
+    inspections = _rtruntime.inspect_host_harness_seats("codex")
+
+    assert len(inspections) == 1
+    assert inspections[0].status == "active_unhealthy"
+    assert inspections[0].token == codex
+    assert stat.S_IMODE((runtime / "projects").stat().st_mode) == 0o700
+
+
+def test_host_harness_scan_rejects_unsafe_runtime_project_container(
+    tmp_path, runtime, process_table
+):
+    root = project(tmp_path)
+    _rtruntime.claim(root, "codex", "codex", owner_pid=101)
+    (runtime / "projects").chmod(0o755)
+
+    with pytest.raises(
+        _rtruntime.RuntimeStateError,
+        match="exposes group/other permissions",
+    ):
+        _rtruntime.inspect_host_harness_seats("codex")
 
 
 def test_stale_owner_is_reclaimed_fresh_with_incremented_revision(

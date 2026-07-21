@@ -106,8 +106,14 @@ jobs:
             shasum -a 256 --check SHA256SUMS
             HOME="$setup_home" \
               ROUNDTABLE_BOOTSTRAP_PYTHON="$(command -v python)" \
+              ./migrate --home "$setup_home" --prefix "$prefix" \
+                --link-dir "$link_dir" --json
+            test ! -e "$prefix"
+            HOME="$setup_home" \
+              ROUNDTABLE_BOOTSTRAP_PYTHON="$(command -v python)" \
               ./install --prefix "$prefix" --link-dir "$link_dir"
-            HOME="$setup_home" "$link_dir/roundtable" --help
+            export PATH="$link_dir:$PATH"
+            HOME="$setup_home" roundtable --help
             setup=(
               "$link_dir/roundtable-setup"
               --home "$setup_home"

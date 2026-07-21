@@ -38,17 +38,18 @@ from _rtcodex import (
     CodexRuntimeError,
     RpcError,
     UnsupportedVersion,
-    ensure_daemon,
     install_launch_agent,
     require_default_socket,
     require_validated_daemon,
     require_validated_version,
+    wake_bridge_build_fingerprint,
     wake_plist,
 )
 from _rtruntime import (
     FenceRejected,
     LeaseToken,
     RuntimeStateError,
+    bind_request_guard,
     harness_lease_records,
     inspect_seat,
     legacy_harness_guard,
@@ -66,6 +67,11 @@ WAKE_TEXT = (
     "drain inbox at {inbox}, 按 roundtable skill Delivery v2 协议处理"
 )
 STATE_SCHEMA = "roundtable.codex-wake.v1"
+BIND_REQUEST_SCHEMA = "roundtable.codex-bind-request.v1"
+BIND_REQUESTS_DIRNAME = "codex-bind-requests"
+BIND_REQUEST_MAX_BYTES = 64 * 1024
+BIND_REQUEST_SOURCES = frozenset({"startup", "resume", "clear"})
+BRIDGE_BUILD_FINGERPRINT = wake_bridge_build_fingerprint()
 INTERRUPTED_BREAKER_LIMIT = 3
 HUMAN_DECISION_METHODS = frozenset(
     {
@@ -87,6 +93,18 @@ class HumanGate(RuntimeError):
         super().__init__(reason)
         self.source = source
         self.reason = reason
+
+
+class UnsafeBindRequest(RuntimeError):
+    """A queue entry cannot be inspected without following unsafe state."""
+
+
+class MalformedBindRequest(RuntimeError):
+    """A private regular queue entry has invalid request content."""
+
+    def __init__(self, reason: str, identity: tuple[int, int] | None = None):
+        super().__init__(reason)
+        self.identity = identity
 
 
 def utc_now() -> str:
@@ -279,6 +297,77 @@ class StateStore:
             atomic_json(self.path, self.data)
             return dict(binding)
 
+    def bind_from_request(
+        self,
+        project: Path,
+        thread: dict,
+        lease: LeaseToken,
+        *,
+        source: str,
+    ) -> tuple[dict, bool]:
+        """CAS-bind a validated hook request under its current lease guard.
+
+        An exact replay is idempotent.  Only a trusted ``clear`` SessionStart
+        may move the same launcher lease to a new native thread.  A binding
+        from an older lease may be replaced because the caller holds
+        ``seat_shared_guard`` for ``lease``; a stale request cannot acquire
+        that guard after a newer claim.
+        """
+        if source not in BIND_REQUEST_SOURCES:
+            raise IdentityError(f"unsupported bind request source: {source!r}")
+        key = str(project)
+        thread_id = thread["id"]
+        with self._lock(True):
+            loaded = self._read()
+            if loaded is not None:
+                self.data = loaded
+            existing = self.bindings.get(key)
+            if existing is not None:
+                if (
+                    not isinstance(existing.get("agent"), str)
+                    or not existing.get("agent")
+                    or existing.get("project") != key
+                    or not existing.get("threadId")
+                ):
+                    raise IdentityError(f"invalid stored binding identity for {project}")
+                same_fence = (
+                    existing.get("agent") == lease.agent_id
+                    and existing.get("roundtableSessionId") == lease.session_id
+                    and str(existing.get("leaseRevision")) == str(lease.revision)
+                )
+                if same_fence:
+                    if existing.get("threadId") != thread_id:
+                        if source != "clear":
+                            raise IdentityError(
+                                f"lease {lease.session_id} already binds a different "
+                                f"Codex thread for {project}"
+                            )
+                    else:
+                        return dict(existing), False
+            for other_project, binding in self.bindings.items():
+                if other_project != key and binding.get("threadId") == thread_id:
+                    raise IdentityError(
+                        f"thread {thread_id} is already bound to {other_project}"
+                    )
+            now = utc_now()
+            binding = {
+                "agent": lease.agent_id,
+                "project": key,
+                "threadId": thread_id,
+                "sessionId": thread.get("sessionId"),
+                "bindingRevision": uuid.uuid4().hex,
+                "boundAt": now,
+                "roundtableSessionId": lease.session_id,
+                "leaseRevision": lease.revision,
+            }
+            self.bindings[key] = binding
+            self.data.setdefault("projects", {})[key] = {
+                "phase": "EMPTY",
+                "reboundAt": now,
+            }
+            atomic_json(self.path, self.data)
+            return dict(binding), True
+
     def unbind(self, project: Path) -> bool:
         key = str(project.expanduser().resolve())
         with self._lock(True):
@@ -290,6 +379,40 @@ class StateStore:
             if removed_binding or removed_state:
                 atomic_json(self.path, self.data)
             return removed_binding or removed_state
+
+    def quarantine_binding_if_revision(
+        self,
+        project: Path,
+        binding_revision: str,
+    ) -> bool:
+        """Fail closed if a consumed bind request was concurrently replaced.
+
+        The revision comparison ensures that an independently completed newer
+        bind is never removed.  A successful later bind resets this persisted
+        quarantine through the normal project-state replacement in bind().
+        """
+        key = str(project)
+        with self._lock(True):
+            loaded = self._read()
+            if loaded is not None:
+                self.data = loaded
+            binding = self.bindings.get(key)
+            if not isinstance(binding, dict) or (
+                binding.get("bindingRevision") != binding_revision
+            ):
+                return False
+            self.bindings.pop(key, None)
+            self.data.setdefault("projects", {})[key] = {
+                "phase": "BIND_QUARANTINED",
+                "quarantinedAt": utc_now(),
+                "bindingRevision": binding_revision,
+                "lastError": (
+                    "SessionStart request was replaced before consumption; "
+                    "waiting for the replacement request"
+                ),
+            }
+            atomic_json(self.path, self.data)
+            return True
 
 
 def _lease_environment(project: Path) -> LeaseToken | None:
@@ -345,7 +468,7 @@ def _lease_environment(project: Path) -> LeaseToken | None:
     if configured_root:
         try:
             environment_root = Path(configured_root).expanduser().resolve()
-        except OSError as error:
+        except (OSError, RuntimeError, ValueError) as error:
             raise IdentityError(f"invalid RT_PROJECT_ROOT: {error}") from error
         if environment_root != project:
             raise IdentityError(
@@ -575,10 +698,183 @@ def notify_needs_human(
 
 
 def canonical_project(path: Path) -> Path:
-    project = path.expanduser().resolve()
+    try:
+        project = path.expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise IdentityError(f"cannot resolve project root {path}: {error}") from error
     if not (project / ".roundtable" / "agents.yaml").is_file():
         raise IdentityError(f"not a Roundtable project: {project}")
     return project
+
+
+def bind_requests_dir(root: Path | None = None) -> Path:
+    selected = Path(RUNTIME_DIR if root is None else root).expanduser()
+    if not selected.is_absolute():
+        raise UnsafeBindRequest(f"runtime root is not absolute: {selected}")
+    return selected / BIND_REQUESTS_DIRNAME
+
+
+def _validate_private_directory(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise UnsafeBindRequest(f"cannot inspect request directory {path}: {error}") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise UnsafeBindRequest(f"request path is not a real directory: {path}")
+    if info.st_uid != os.getuid():
+        raise UnsafeBindRequest(
+            f"request directory owner uid {info.st_uid} != {os.getuid()}: {path}"
+        )
+    if info.st_mode & 0o077:
+        raise UnsafeBindRequest(
+            f"request directory exposes group/other permissions: {path}"
+        )
+
+
+def _read_bind_request(path: Path) -> tuple[dict, tuple[int, int]]:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise UnsafeBindRequest(f"cannot inspect bind request {path}: {error}") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeBindRequest(f"bind request is not a regular file: {path}")
+    if info.st_uid != os.getuid():
+        raise UnsafeBindRequest(
+            f"bind request owner uid {info.st_uid} != {os.getuid()}: {path}"
+        )
+    if info.st_mode & 0o077:
+        raise UnsafeBindRequest(
+            f"bind request exposes group/other permissions: {path}"
+        )
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise UnsafeBindRequest(f"bind request became a symlink: {path}") from error
+        raise UnsafeBindRequest(f"cannot open bind request {path}: {error}") from error
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise UnsafeBindRequest(f"opened bind request is not regular: {path}")
+        if opened.st_uid != os.getuid() or opened.st_mode & 0o077:
+            raise UnsafeBindRequest(f"opened bind request is not private: {path}")
+        raw = handle.read(BIND_REQUEST_MAX_BYTES + 1)
+    identity = (opened.st_dev, opened.st_ino)
+    if len(raw) > BIND_REQUEST_MAX_BYTES:
+        raise MalformedBindRequest(
+            f"bind request is too large: {path.name}", identity
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise MalformedBindRequest(
+            f"bind request is not valid UTF-8 JSON: {path.name}", identity
+        ) from error
+    if not isinstance(payload, dict):
+        raise MalformedBindRequest(
+            f"bind request is not an object: {path.name}", identity
+        )
+    return payload, identity
+
+
+def _consume_bind_request(path: Path, identity: tuple[int, int]) -> bool:
+    """Unlink only the exact private regular file that was inspected."""
+    try:
+        with bind_request_guard(path.parent.parent):
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or current.st_uid != os.getuid()
+                or (current.st_dev, current.st_ino) != identity
+            ):
+                return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            return True
+    except RuntimeStateError:
+        return False
+
+
+def _request_text(payload: dict, name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise MalformedBindRequest(f"bind request field {name} is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError as error:
+        raise MalformedBindRequest(
+            f"bind request field {name} is not valid UTF-8 text"
+        ) from error
+    if len(encoded) > 4096:
+        raise MalformedBindRequest(f"bind request field {name} is invalid")
+    return value
+
+
+def _validated_bind_request(
+    path: Path,
+    payload: dict,
+    allowed_projects: set[str],
+) -> tuple[Path, str, str, str, str]:
+    if payload.get("schema") != BIND_REQUEST_SCHEMA:
+        raise MalformedBindRequest("bind request schema is invalid")
+    if payload.get("hookEventName") != "SessionStart":
+        raise MalformedBindRequest("bind request hook event is invalid")
+    source = _request_text(payload, "source")
+    if source not in BIND_REQUEST_SOURCES:
+        raise MalformedBindRequest("bind request SessionStart source is invalid")
+    raw_project = _request_text(payload, "projectRoot")
+    agent_id = _request_text(payload, "agentId")
+    roundtable_session_id = _request_text(payload, "roundtableSessionId")
+    lease_revision = _request_text(payload, "leaseRevision")
+    thread_id = _request_text(payload, "threadId")
+    created_at = _request_text(payload, "createdAt")
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise MalformedBindRequest("bind request createdAt is invalid") from error
+    if parsed.tzinfo is None:
+        raise MalformedBindRequest("bind request createdAt lacks a timezone")
+    # Hook-produced project roots are already canonical absolute paths.  Do not
+    # expand a hostile ``~user`` value before proving that invariant: pathlib
+    # raises RuntimeError when that account cannot be resolved.
+    raw_path = Path(raw_project)
+    if not raw_path.is_absolute():
+        raise MalformedBindRequest("bind request projectRoot is not absolute")
+    try:
+        project = canonical_project(raw_path)
+    except (IdentityError, OSError, RuntimeError) as error:
+        raise MalformedBindRequest(str(error)) from error
+    if raw_project != str(project):
+        raise MalformedBindRequest("bind request projectRoot is not canonical")
+    if str(project) not in allowed_projects:
+        raise IdentityError(f"bind request project is not registered: {project}")
+    identity = "\0".join(
+        (
+            str(project),
+            agent_id,
+            roundtable_session_id,
+            lease_revision,
+        )
+    )
+    expected_name = f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()}.json"
+    if path.name != expected_name:
+        raise MalformedBindRequest("bind request filename does not match its identity")
+    return project, agent_id, roundtable_session_id, lease_revision, thread_id
 
 
 def project_config_has_codex(project: Path) -> bool:
@@ -609,7 +905,7 @@ def validate_thread(project: Path, thread: dict, expected_id: str | None = None)
         )
     try:
         thread_cwd = Path(thread["cwd"]).expanduser().resolve()
-    except (KeyError, TypeError, OSError) as error:
+    except (KeyError, TypeError, OSError, RuntimeError, ValueError) as error:
         raise IdentityError(f"thread has invalid cwd: {error}") from error
     if thread_cwd != project:
         raise IdentityError(f"thread cwd mismatch: {thread_cwd} != {project}")
@@ -642,7 +938,142 @@ def read_thread(client: AppServerClient, thread_id: str) -> dict:
     result = client.request(
         "thread/read", {"threadId": thread_id, "includeTurns": False}
     )
-    return result.get("thread") or {}
+    if not isinstance(result, dict):
+        raise IdentityError("thread/read returned an invalid result")
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise IdentityError("thread/read returned an invalid thread")
+    return thread
+
+
+def drain_bind_requests(
+    client: AppServerClient,
+    store: StateStore,
+    projects: list[Path],
+    *,
+    requests_dir: Path | None = None,
+    quarantined_projects: set[str] | None = None,
+) -> set[str]:
+    """Validate and CAS-apply SessionStart requests outside the hook call."""
+    queue = bind_requests_dir() if requests_dir is None else Path(requests_dir)
+    try:
+        _validate_private_directory(queue.parent)
+        _validate_private_directory(queue)
+    except FileNotFoundError:
+        return set()
+    except UnsafeBindRequest as error:
+        log_event("auto_bind_queue_unsafe", path=str(queue), error=str(error))
+        return set()
+    try:
+        entries = sorted(queue.iterdir())
+    except OSError as error:
+        log_event("auto_bind_queue_unsafe", path=str(queue), error=str(error))
+        return set()
+
+    allowed_projects = set()
+    for candidate in projects:
+        try:
+            allowed_projects.add(str(candidate.expanduser().resolve()))
+        except (OSError, RuntimeError) as error:
+            # Registry projects are canonical when discovered, but the path can
+            # be replaced between discovery and a bridge iteration.  Isolate
+            # that project instead of letting one symlink loop stop every bind.
+            log_event(
+                "auto_bind_project_unsafe",
+                project=str(candidate),
+                error=str(error),
+            )
+    changed: set[str] = set()
+    for path in entries:
+        if path.name.startswith("."):
+            continue
+        identity = None
+        try:
+            payload, identity = _read_bind_request(path)
+            (
+                project,
+                agent_id,
+                roundtable_session_id,
+                lease_revision,
+                thread_id,
+            ) = _validated_bind_request(path, payload, allowed_projects)
+            source = payload["source"]
+            with seat_shared_guard(
+                project,
+                agent_id,
+                roundtable_session_id,
+                lease_revision,
+            ) as current:
+                if current.harness != "codex":
+                    raise IdentityError(
+                        f"bind request lease is for harness {current.harness!r}, not codex"
+                    )
+                selected_thread = validate_thread(
+                    project,
+                    read_thread(client, thread_id),
+                    thread_id,
+                )
+                binding, did_change = store.bind_from_request(
+                    project,
+                    selected_thread,
+                    current,
+                    source=source,
+                )
+                update_wake(
+                    project,
+                    current.agent_id,
+                    current.session_id,
+                    current.revision,
+                    native_session_id=thread_id,
+                )
+            if did_change:
+                changed.add(str(project))
+            consumed = _consume_bind_request(path, identity)
+            quarantined = False
+            if not consumed:
+                # A clear may atomically replace this path after it was opened.
+                # The validated old thread must not receive mail during the
+                # resulting one-iteration handoff.  Remove only the binding we
+                # just observed; a concurrently completed newer bind wins.
+                if quarantined_projects is not None:
+                    quarantined_projects.add(str(project))
+                quarantined = store.quarantine_binding_if_revision(
+                    project,
+                    binding.get("bindingRevision"),
+                )
+            elif quarantined_projects is not None:
+                # A fully validated replacement request has now been applied
+                # and consumed, so routing may resume in this iteration.
+                quarantined_projects.discard(str(project))
+            log_event(
+                "auto_bind_succeeded",
+                project=str(project),
+                agent=agent_id,
+                thread_id=thread_id,
+                binding_revision=binding.get("bindingRevision"),
+                changed=did_change,
+                request_consumed=consumed,
+                binding_quarantined=quarantined,
+            )
+        except UnsafeBindRequest as error:
+            # Do not unlink an entry that was never proven to be the private
+            # regular file we intended to inspect.
+            log_event("auto_bind_request_unsafe", path=str(path), error=str(error))
+        except (MalformedBindRequest, IdentityError, FenceRejected, RuntimeStateError) as error:
+            if identity is None and isinstance(error, MalformedBindRequest):
+                identity = error.identity
+            consumed = bool(identity) and _consume_bind_request(path, identity)
+            log_event(
+                "auto_bind_rejected",
+                path=str(path),
+                error=str(error),
+                request_consumed=consumed,
+            )
+        except (RpcError, OSError, TimeoutError) as error:
+            # A valid current request survives transient app-server or I/O
+            # failure and is retried on the next bridge iteration.
+            log_event("auto_bind_deferred", path=str(path), error=str(error))
+    return changed
 
 
 def resume_thread(client: AppServerClient, project: Path, thread_id: str) -> dict:
@@ -651,7 +1082,9 @@ def resume_thread(client: AppServerClient, project: Path, thread_id: str) -> dic
     result = client.request(
         "thread/resume", {"threadId": thread_id, "excludeTurns": True}
     )
-    return validate_thread(project, result.get("thread") or {}, thread_id)
+    if not isinstance(result, dict) or not isinstance(result.get("thread"), dict):
+        raise IdentityError("thread/resume returned an invalid thread")
+    return validate_thread(project, result["thread"], thread_id)
 
 
 def resume_or_loaded(
@@ -810,6 +1243,7 @@ class WakeBridge:
         self.active_observed: set[str] = set()
         self.resume_attempted: set[str] = set()
         self.subscribed_threads: set[str] = set()
+        self.bind_quarantined: set[str] = set()
 
     @staticmethod
     def _request_key(request_id) -> str:
@@ -1081,7 +1515,7 @@ class WakeBridge:
                 continue
             try:
                 cwd = Path(cwd_value).expanduser().resolve()
-            except OSError:
+            except (OSError, RuntimeError, ValueError):
                 continue
             if cwd == project:
                 matches.append(entry)
@@ -1435,6 +1869,11 @@ class WakeBridge:
 
     def step_project(self, project: Path) -> ProjectResult:
         project_state = self.store.project_state(project)
+        if project_state.get("phase") == "BIND_QUARANTINED":
+            return ProjectResult(
+                False,
+                "binding quarantined; waiting for replacement SessionStart request",
+            )
         if (
             project_state.get("phase") == "IDENTITY_ERROR"
             and time.time() < safe_timestamp(project_state.get("retryAt"))
@@ -1670,8 +2109,27 @@ class WakeBridge:
 
     def step(self, messages: list[dict] | None = None) -> list[ProjectResult]:
         self.store.reload()
+        rebound = drain_bind_requests(
+            self.client,
+            self.store,
+            self.projects,
+            quarantined_projects=self.bind_quarantined,
+        )
+        for project in rebound:
+            self.resumed.pop(project, None)
+            self.resume_attempted.discard(project)
         self.consume_messages(messages or [])
-        return [self.step_project(project) for project in self.projects]
+        return [
+            (
+                ProjectResult(
+                    False,
+                    "binding quarantined; waiting for replacement SessionStart request",
+                )
+                if str(project) in self.bind_quarantined
+                else self.step_project(project)
+            )
+            for project in self.projects
+        ]
 
 
 def discover_projects(explicit: list[str], *, warn: bool = True) -> list[Path]:
@@ -1738,6 +2196,7 @@ def heartbeat(
         {
             "schema": "roundtable.codex-wake-heartbeat.v1",
             "pid": os.getpid(),
+            "bridgeBuildFingerprint": BRIDGE_BUILD_FINGERPRINT,
             "heartbeatAt": utc_now(),
             "lastRpcOkAt": last_rpc_ok_at,
             "lastError": error,
@@ -1755,7 +2214,6 @@ def bind_command(args) -> int:
             "CODEX_THREAD_ID is unavailable; run bind from the target Codex turn"
         )
     require_validated_version()
-    ensure_daemon(args.socket)
     require_validated_daemon(args.socket)
     client = AppServerClient(args.socket)
     try:
@@ -1842,7 +2300,6 @@ def run_command(args) -> int:
         while not stopping:
             try:
                 require_validated_version()
-                ensure_daemon(args.socket)
                 require_validated_daemon(args.socket)
                 client = AppServerClient(args.socket)
                 bridge = WakeBridge(

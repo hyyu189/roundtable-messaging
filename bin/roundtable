@@ -4,17 +4,24 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from _rtlauncher import SelectionError, configured_sender_ids, project_at_or_above
+from _rtlauncher import (
+    SelectionError,
+    configured_sender_ids,
+    harness_bin,
+    project_at_or_above,
+)
 from _rtlib import emit_registry_warnings, is_project_root, load_project_registry
 
 
 ALIASES = {
     "init": "roundtable-init",
+    "migrate": "roundtable-migrate",
     "setup": "roundtable-setup",
     "doctor": "rt-doctor",
     "projects": "rt-projects",
@@ -35,7 +42,8 @@ Run without a command in a terminal for project-first onboarding.
 
 commands:
   init       Create or safely set up a Roundtable project
-  setup      Plan, apply, inspect, or remove harness integration
+  setup      Preview or explicitly manage harness integration
+  migrate    Preview, apply, or roll back a recognized legacy install
   doctor     Diagnose the current Roundtable project
   projects   List or manage registered projects
   smoke      Test the installed package
@@ -88,6 +96,116 @@ def read_yes_no(stdin, stderr, prompt: str) -> bool:
     )
 
 
+def _setup_json(
+    command: str,
+    harness: str,
+    *,
+    home: Path,
+    prefix: Path,
+    environ,
+    setup_runner=subprocess.run,
+) -> dict:
+    invocation = [
+        str(sibling("roundtable-setup")),
+        command,
+        "--harness",
+        harness,
+        "--home",
+        str(home),
+        "--prefix",
+        str(prefix),
+        "--json",
+    ]
+    process_environment = dict(os.environ)
+    process_environment.update(environ)
+    try:
+        result = setup_runner(
+            invocation,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=process_environment,
+        )
+    except OSError as error:
+        raise OnboardingError(
+            f"roundtable: cannot run one-time {harness} setup: {error}"
+        ) from error
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        detail = (result.stderr or result.stdout or "invalid setup output").strip()
+        raise OnboardingError(
+            f"roundtable: cannot inspect one-time {harness} setup: {detail}"
+        ) from error
+    if result.returncode != 0 or payload.get("ok") is not True:
+        detail = payload.get("error") or result.stderr.strip() or f"exit {result.returncode}"
+        raise OnboardingError(
+            f"roundtable: {harness} integration is not ready: {detail}"
+        )
+    return payload
+
+
+def ensure_harness_setup(
+    harness: str,
+    *,
+    home: Path,
+    stdin,
+    stderr,
+    environ,
+    setup_runner=subprocess.run,
+) -> None:
+    """Run the installed package's ownership-safe setup once per harness."""
+
+    configured_prefix = environ.get("ROUNDTABLE_INSTALL_PREFIX")
+    if not configured_prefix:
+        # Source-tree/developer invocations intentionally keep setup explicit.
+        return
+    prefix = Path(configured_prefix).expanduser().resolve()
+    status = _setup_json(
+        "status",
+        harness,
+        home=home,
+        prefix=prefix,
+        environ=environ,
+        setup_runner=setup_runner,
+    )
+    detail = status.get("harnesses", {}).get(harness, {})
+    if detail.get("state") == "configured":
+        return
+
+    plan = _setup_json(
+        "plan",
+        harness,
+        home=home,
+        prefix=prefix,
+        environ=environ,
+        setup_runner=setup_runner,
+    )
+    planned = plan.get("harnesses", {}).get(harness, {})
+    print(f"One-time {harness} integration setup:", file=stderr)
+    for action in planned.get("actions", []):
+        print(f"  - {action}", file=stderr)
+    if not read_yes_no(stdin, stderr, "Apply these managed changes? [y/N]: "):
+        raise OnboardingError(
+            f"roundtable: {harness} setup was not applied; nothing was launched"
+        )
+    _setup_json(
+        "apply",
+        harness,
+        home=home,
+        prefix=prefix,
+        environ=environ,
+        setup_runner=setup_runner,
+    )
+    if harness == "codex":
+        print(
+            "Codex may ask once to review the Roundtable SessionStart hook. "
+            "Approve it with /hooks; Roundtable never bypasses hook trust.",
+            file=stderr,
+        )
+
+
 def canonical_existing_folder(raw: str, cwd: Path) -> Path:
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
@@ -98,7 +216,7 @@ def canonical_existing_folder(raw: str, cwd: Path) -> Path:
         )
     try:
         resolved = candidate.resolve()
-    except OSError as error:
+    except (OSError, RuntimeError, ValueError) as error:
         raise OnboardingError(
             f"roundtable: cannot resolve project folder {candidate}: {error}"
         ) from error
@@ -192,6 +310,18 @@ def choose_project(
 
     entries, warnings = load_project_registry()
     emit_registry_warnings(warnings, stream=stderr, tool="roundtable")
+    if not entries:
+        print(
+            "\n"
+            "  [project folder]\n"
+            "         |\n"
+            "  [durable mailboxes]\n"
+            "     /    |    \\\n"
+            " Claude  Codex  Hermes\n"
+            "\n"
+            "A Roundtable project can be any folder; Git is optional.\n",
+            file=stderr,
+        )
     options = []
     for entry in entries:
         root = entry["root"]
@@ -255,20 +385,32 @@ def choose_project(
 
 def choose_seat(root: Path, *, stdin, stderr) -> tuple[str, str]:
     seats = []
+    unavailable: list[tuple[str, str]] = []
     for harness in HARNESS_ORDER:
         try:
             ids = configured_sender_ids(root, harness)
         except SelectionError as error:
             raise OnboardingError(f"roundtable: {error}") from error
+        if not ids:
+            continue
+        try:
+            harness_bin(harness)
+        except SelectionError as error:
+            unavailable.append((harness, str(error)))
+            continue
         seats.extend((harness, agent_id) for agent_id in ids)
     if not seats:
+        detail = " | ".join(f"{name}: {error}" for name, error in unavailable)
         raise OnboardingError(
-            f"roundtable: no Claude, Codex, or Hermes seats configured in {root}"
+            f"roundtable: no launchable Claude, Codex, or Hermes seats in {root}"
+            + (f"; {detail}" if detail else "")
         )
 
     print("Choose a harness seat:", file=stderr)
     for index, (harness, agent_id) in enumerate(seats, 1):
         print(f"  {index}) {harness} — {agent_id}", file=stderr)
+    for harness, detail in unavailable:
+        print(f"  unavailable: {harness} — {detail}", file=stderr)
     raw = read_choice(stdin, stderr, "Select harness: ")
     try:
         selected = int(raw)
@@ -289,6 +431,7 @@ def onboard(
     stderr,
     environ,
     init_runner=subprocess.run,
+    setup_runner=subprocess.run,
     exec_runner=os.execv,
     chdir_runner=os.chdir,
 ) -> int:
@@ -300,6 +443,14 @@ def onboard(
         init_runner=init_runner,
     )
     harness, agent_id = choose_seat(root, stdin=stdin, stderr=stderr)
+    ensure_harness_setup(
+        harness,
+        home=home,
+        stdin=stdin,
+        stderr=stderr,
+        environ=environ,
+        setup_runner=setup_runner,
+    )
     environ["RT_FROM"] = agent_id
     chdir_runner(root)
     return execute(f"rt-{harness}", [], exec_runner=exec_runner)
@@ -315,6 +466,7 @@ def main(
     stderr=None,
     environ=None,
     init_runner=subprocess.run,
+    setup_runner=subprocess.run,
     exec_runner=os.execv,
     chdir_runner=os.chdir,
 ) -> int:
@@ -337,6 +489,19 @@ def main(
                 print(f"roundtable: unknown command: {command}", file=stderr)
                 print(HELP, end="", file=stderr)
                 return 2
+            if command in HARNESS_ORDER:
+                try:
+                    harness_bin(command)
+                except SelectionError as error:
+                    raise OnboardingError(f"roundtable: {error}") from error
+                ensure_harness_setup(
+                    command,
+                    home=home,
+                    stdin=stdin,
+                    stderr=stderr,
+                    environ=environ,
+                    setup_runner=setup_runner,
+                )
             return execute(target, argv[1:], exec_runner=exec_runner)
 
         if not stdin.isatty():
@@ -353,6 +518,7 @@ def main(
             stderr=stderr,
             environ=environ,
             init_runner=init_runner,
+            setup_runner=setup_runner,
             exec_runner=exec_runner,
             chdir_runner=chdir_runner,
         )

@@ -23,6 +23,7 @@ MANAGED_ASSETS = (
 TOOLS = (
     "roundtable",
     "roundtable-init",
+    "roundtable-migrate",
     "roundtable-setup",
     "roundtable-smoke",
     "roundtable-uninstall",
@@ -30,6 +31,7 @@ TOOLS = (
     "rt-claude",
     "rt-codex",
     "rt-codex-daemon",
+    "rt-codex-session-start",
     "rt-codex-wake",
     "rt-doctor",
     "rt-hermes",

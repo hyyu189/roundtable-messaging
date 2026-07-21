@@ -24,6 +24,15 @@ UNINSTALL = ROOT / "scripts" / "uninstall.sh"
 
 def packaging_env(home: Path) -> dict[str, str]:
     env = os.environ.copy()
+    # The suite-wide conftest fences host-local Roundtable state.  Packaging
+    # tests intentionally model a brand-new HOME, so do not leak that parent
+    # process fence into the installed CLI subprocesses.
+    env.pop("RT_PROJECTS_FILE", None)
+    env.pop("RT_RUNTIME_DIR", None)
+    env.pop("RT_CODEX_RUNTIME_DIR", None)
+    env.pop("CODEX_HOME", None)
+    env.pop("RT_LAUNCH_AGENTS_DIR", None)
+    env.pop("RT_LAUNCHCTL", None)
     env.update(
         {
             "HOME": str(home),
@@ -183,12 +192,27 @@ def built_wheel(tmp_path_factory):
 def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
     with zipfile.ZipFile(built_wheel) as archive:
         names = set(archive.namelist())
+        entry_points_name = next(
+            name for name in names if name.endswith(".dist-info/entry_points.txt")
+        )
+        entry_points = archive.read(entry_points_name).decode("utf-8")
+        skill_name = next(
+            name
+            for name in names
+            if name.endswith(
+                ".data/data/share/roundtable/skills/shared/roundtable/SKILL.md"
+            )
+        )
+        skill = archive.read(skill_name).decode("utf-8")
 
     assert "roundtable_packaging/cli.py" in names
     assert "roundtable_packaging/setup.py" in names
     assert "_rtruntime.py" in names
     assert any(name.endswith(".data/scripts/roundtable") for name in names)
     assert any(name.endswith(".data/scripts/rt-say") for name in names)
+    assert any(
+        name.endswith(".data/scripts/rt-codex-session-start") for name in names
+    )
     assert any(name.endswith(".data/scripts/_rtlib.py") for name in names)
     assert any(name.endswith(".data/scripts/_rtruntime.py") for name in names)
     assert any(
@@ -209,10 +233,11 @@ def test_wheel_contains_commands_helpers_templates_and_uninstaller(built_wheel):
         )
         for name in names
     )
-    assert any(
-        name.endswith(".dist-info/entry_points.txt")
-        for name in names
-    )
+    assert "roundtable-migrate = roundtable_packaging.migrate:main" in entry_points
+    assert "trusted SessionStart hook" in skill
+    assert "diagnostic fallback only" in skill
+    assert "rt-codex-daemon install --reload" not in skill
+    assert "then self-register in the first" not in skill
 
 
 def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path):
@@ -230,6 +255,7 @@ def test_clean_home_install_is_idempotent_and_uninstall_preserves_state(tmp_path
         home=home,
     )
     assert first.returncode == 0, first.stderr
+    assert f"run now: {link_dir / 'roundtable'}" in first.stdout
 
     manifest_path = prefix / "install-manifest.json"
     manifest = json.loads(manifest_path.read_text())

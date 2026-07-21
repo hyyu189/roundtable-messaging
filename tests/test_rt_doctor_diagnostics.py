@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN = ROOT / "bin"
+sys.path.insert(0, str(BIN))
+
+
+def load_doctor():
+    name = "rt_doctor_diagnostics"
+    loader = importlib.machinery.SourceFileLoader(name, str(BIN / "rt-doctor"))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+doctor = load_doctor()
+
+
+def bind_request(runtime: Path, created_at: datetime) -> Path:
+    queue = runtime / doctor.BIND_REQUESTS_DIRNAME
+    queue.mkdir(parents=True, mode=0o700)
+    os.chmod(runtime, 0o700)
+    os.chmod(queue, 0o700)
+    payload = {
+        "schema": doctor.BIND_REQUEST_SCHEMA,
+        "hookEventName": "SessionStart",
+        "source": "startup",
+        "threadId": "thread-1",
+        "projectRoot": "/tmp/example-project",
+        "agentId": "codex",
+        "roundtableSessionId": "roundtable-session-1",
+        "leaseRevision": "lease-revision-1",
+        "createdAt": created_at.isoformat().replace("+00:00", "Z"),
+    }
+    identity = "\0".join(
+        payload[name]
+        for name in (
+            "projectRoot",
+            "agentId",
+            "roundtableSessionId",
+            "leaseRevision",
+        )
+    )
+    name = hashlib.sha256(identity.encode()).hexdigest() + ".json"
+    path = queue / name
+    path.write_text(json.dumps(payload) + "\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+def test_doctor_skips_codex_services_but_keeps_runtime_checks_without_codex(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    observed: list[str] = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rt-doctor",
+            "--runtime-dir",
+            str(tmp_path / "runtime"),
+            "--registry",
+            str(tmp_path / "projects.yaml"),
+            "--prefix",
+            str(tmp_path / "prefix"),
+            "--home",
+            str(tmp_path / "home"),
+        ],
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_codex_setup_status",
+        lambda *_a: (
+            0,
+            {
+                "ok": True,
+                "harnesses": {"codex": {"state": "not_configured"}},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "codex_version",
+        lambda: (_ for _ in ()).throw(RuntimeError("no Codex executable")),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "daemon_version",
+        lambda *_a: pytest.fail("daemon resolver must be skipped"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "socket_check",
+        lambda *_a: pytest.fail("Codex socket check must be skipped"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "probe_handshake",
+        lambda *_a: pytest.fail("Codex RPC check must be skipped"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "bridge_check",
+        lambda *_a: pytest.fail("Codex bridge check must be skipped"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "report_bind_request_queue",
+        lambda *_a, **_k: observed.append("bind-queue"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "project_health_checks",
+        lambda *_a, **_k: observed.append("project-health"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "report_hook_trust",
+        lambda *_a, **_k: observed.append("hook-trust"),
+    )
+
+    code = doctor.main()
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "WARN codex-setup:" in output
+    assert "WARN codex-cli: Codex resolver unavailable" in output
+    assert "SKIP daemon:" in output
+    assert "SKIP bridge:" in output
+    assert observed == ["bind-queue", "project-health", "hook-trust"]
+
+
+def test_doctor_fails_daemon_when_managed_codex_path_differs(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    socket_path = tmp_path / "app.sock"
+    daemon = {
+        "status": "running",
+        "socketPath": str(socket_path),
+        "managedCodexPath": "/tmp/old-codex",
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rt-doctor",
+            "--socket",
+            str(socket_path),
+            "--runtime-dir",
+            str(tmp_path / "runtime"),
+            "--registry",
+            str(tmp_path / "projects.yaml"),
+        ],
+    )
+    monkeypatch.setattr(doctor, "report_codex_setup", lambda *_a: None)
+    monkeypatch.setattr(
+        doctor,
+        "codex_version",
+        lambda: ((0, 144, 6), "codex-cli 0.144.6"),
+    )
+    monkeypatch.setattr(doctor, "daemon_version", lambda *_a: (daemon, ""))
+    monkeypatch.setattr(
+        doctor,
+        "daemon_managed_codex_paths",
+        lambda _daemon: (Path("/tmp/current-codex"), Path("/tmp/old-codex")),
+    )
+    monkeypatch.setattr(doctor, "socket_check", lambda *_a: (True, "safe"))
+    monkeypatch.setattr(doctor, "probe_handshake", lambda *_a: (True, "ready"))
+    monkeypatch.setattr(doctor, "bridge_check", lambda *_a: (True, "healthy"))
+    monkeypatch.setattr(doctor, "report_bind_request_queue", lambda *_a, **_k: None)
+    monkeypatch.setattr(doctor, "project_health_checks", lambda *_a, **_k: None)
+    monkeypatch.setattr(doctor, "report_hook_trust", lambda *_a, **_k: None)
+
+    code = doctor.main()
+
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "FAIL daemon:" in output
+    assert "managed Codex path mismatch" in output
+    assert "selected=/tmp/current-codex daemon=/tmp/old-codex" in output
+
+
+@pytest.mark.parametrize(
+    ("result", "expected", "failed"),
+    [
+        (
+            {
+                "ok": True,
+                "harnesses": {"codex": {"state": "configured"}},
+            },
+            "match the recorded ownership",
+            False,
+        ),
+        (
+            {
+                "ok": True,
+                "harnesses": {"codex": {"state": "not_configured"}},
+            },
+            "not configured by this Roundtable installation",
+            False,
+        ),
+        (
+            {
+                "ok": True,
+                "harnesses": {
+                    "codex": {
+                        "state": "upgrade_required",
+                        "actions": ["merge the managed Codex hooks file"],
+                    }
+                },
+            },
+            "Codex setup upgrade is required",
+            True,
+        ),
+        (
+            {
+                "ok": False,
+                "error": "managed Codex SessionStart hook drift",
+            },
+            "managed Codex SessionStart hook drift",
+            True,
+        ),
+    ],
+)
+def test_setup_diagnostic_translates_authoritative_read_only_status(
+    tmp_path, monkeypatch, capsys, result, expected, failed
+):
+    code = 0 if result["ok"] else 2
+    monkeypatch.setattr(doctor, "_codex_setup_status", lambda *_args: (code, result))
+    report = doctor.Report()
+
+    doctor.report_codex_setup(report, tmp_path / "prefix", tmp_path / "home")
+
+    assert expected in capsys.readouterr().out
+    assert report.failed is failed
+
+
+def test_setup_diagnostic_skips_developer_invocation_without_touching_home(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        doctor,
+        "_codex_setup_status",
+        lambda *_args: pytest.fail("setup status must not run without a prefix"),
+    )
+    report = doctor.Report()
+
+    doctor.report_codex_setup(report, None, tmp_path / "home")
+
+    assert "ownership was not checked" in capsys.readouterr().out
+    assert not report.failed
+    assert not (tmp_path / "home").exists()
+
+
+def test_auto_bind_queue_reports_fresh_request_without_mutating_it(
+    tmp_path, capsys
+):
+    now = datetime(2026, 7, 20, 20, 0, tzinfo=timezone.utc)
+    request = bind_request(tmp_path / "runtime", now - timedelta(seconds=4))
+    before = request.read_bytes()
+    report = doctor.Report()
+
+    doctor.report_bind_request_queue(report, tmp_path / "runtime", 30, now=now)
+
+    output = capsys.readouterr().out
+    assert "WARN auto-bind-queue:" in output
+    assert "fresh request" in output
+    assert "age=4.0s" in output
+    assert not report.failed
+    assert request.read_bytes() == before
+
+
+def test_auto_bind_queue_reports_stale_request_without_expiring_it(
+    tmp_path, capsys
+):
+    now = datetime(2026, 7, 20, 20, 0, tzinfo=timezone.utc)
+    request = bind_request(tmp_path / "runtime", now - timedelta(seconds=31))
+    before = request.read_bytes()
+    report = doctor.Report()
+
+    doctor.report_bind_request_queue(report, tmp_path / "runtime", 30, now=now)
+
+    output = capsys.readouterr().out
+    assert "FAIL auto-bind-queue:" in output
+    assert "older than 30.0s" in output
+    assert "bridge will safely accept or reject" in output
+    assert report.failed
+    assert request.read_bytes() == before
+
+
+def test_auto_bind_queue_rejects_unsafe_directory_without_following_it(
+    tmp_path, capsys
+):
+    runtime = tmp_path / "runtime"
+    outside = tmp_path / "outside"
+    runtime.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    (runtime / doctor.BIND_REQUESTS_DIRNAME).symlink_to(
+        outside, target_is_directory=True
+    )
+    report = doctor.Report()
+
+    doctor.report_bind_request_queue(report, runtime, 30)
+
+    assert "unsafe request directory" in capsys.readouterr().out
+    assert report.failed
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("reported", [None, "sha256:stale"])
+def test_bridge_check_rejects_missing_or_stale_build_fingerprint(
+    tmp_path, monkeypatch, reported
+):
+    now = datetime.now(timezone.utc).isoformat()
+    socket_path = tmp_path / "app.sock"
+    (tmp_path / "rt-codex-wake.pid").write_text("123\n")
+    heartbeat = {
+        "schema": "roundtable.codex-wake-heartbeat.v1",
+        "pid": 123,
+        "heartbeatAt": now,
+        "lastRpcOkAt": now,
+        "lastError": None,
+        "socketPath": str(socket_path),
+    }
+    if reported is not None:
+        heartbeat["bridgeBuildFingerprint"] = reported
+    (tmp_path / "rt-codex-wake-heartbeat.json").write_text(json.dumps(heartbeat))
+    monkeypatch.setattr(doctor, "pid_is_running", lambda *_args: (True, "pid 123"))
+    monkeypatch.setattr(
+        doctor,
+        "wake_bridge_build_fingerprint",
+        lambda: "sha256:current",
+    )
+
+    ok, detail = doctor.bridge_check(tmp_path, 15, socket_path)
+
+    assert not ok
+    assert "build fingerprint is stale or invalid" in detail
+    assert "expected=sha256:current" in detail
+
+
+class HookClient:
+    response = None
+    calls = []
+    closed = False
+
+    def __init__(self, _socket):
+        type(self).calls = []
+        type(self).closed = False
+
+    def request(self, method, params):
+        type(self).calls.append((method, params))
+        return type(self).response
+
+    def close(self):
+        type(self).closed = True
+
+
+@pytest.mark.parametrize(
+    ("trust_status", "level", "text"),
+    [
+        ("managed", "OK", "all managed or trusted"),
+        ("trusted", "OK", "all managed or trusted"),
+        ("untrusted", "FAIL", "wake is blocked pending hook review"),
+        ("modified", "FAIL", "wake is blocked pending hook review"),
+        ("future-status", "FAIL", "unknown enabled hook trust state"),
+    ],
+)
+def test_hook_trust_diagnostic_matches_bridge_gate(
+    tmp_path, monkeypatch, capsys, trust_status, level, text
+):
+    project = (tmp_path / "project").resolve()
+    project.mkdir()
+    HookClient.response = {
+        "data": [
+            {
+                "cwd": str(project),
+                "hooks": [
+                    {
+                        "key": "user:session_start:0:0",
+                        "enabled": True,
+                        "trustStatus": trust_status,
+                    }
+                ],
+                "warnings": [],
+                "errors": [],
+            }
+        ]
+    }
+    monkeypatch.setattr(doctor, "_configured_codex_projects", lambda _path: [project])
+    monkeypatch.setattr(doctor, "AppServerClient", HookClient)
+    report = doctor.Report()
+
+    doctor.report_hook_trust(
+        report, tmp_path / "projects.json", tmp_path / "app.sock", True
+    )
+
+    output = capsys.readouterr().out
+    assert f"{level} hook-trust:" in output
+    assert text in output
+    assert report.failed is (level == "FAIL")
+    assert HookClient.calls == [
+        ("hooks/list", {"cwds": [str(project)]})
+    ]
+    assert HookClient.closed
+
+
+def test_hook_trust_diagnostic_never_connects_when_rpc_is_unavailable(
+    tmp_path, monkeypatch, capsys
+):
+    project = (tmp_path / "project").resolve()
+    monkeypatch.setattr(doctor, "_configured_codex_projects", lambda _path: [project])
+    monkeypatch.setattr(
+        doctor,
+        "AppServerClient",
+        lambda _socket: pytest.fail("client must not connect when RPC is down"),
+    )
+    report = doctor.Report()
+
+    doctor.report_hook_trust(
+        report, tmp_path / "projects.json", tmp_path / "app.sock", False
+    )
+
+    assert "unchecked for 1 Codex project" in capsys.readouterr().out
+    assert not report.failed
+
+
+def test_queue_files_remain_private_in_fixture(tmp_path):
+    request = bind_request(
+        tmp_path / "runtime", datetime.now(timezone.utc)
+    )
+
+    assert stat.S_IMODE(request.stat().st_mode) == 0o600
+    assert stat.S_IMODE(request.parent.stat().st_mode) == 0o700

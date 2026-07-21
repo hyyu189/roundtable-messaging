@@ -284,6 +284,42 @@ def clear_unanchored_lease_context() -> None:
         os.environ.pop(name, None)
 
 
+def _confirm_codex_reload(status, *, stdin=None, stderr=None) -> bool:
+    stdin = stdin or sys.stdin
+    stderr = stderr or sys.stderr
+    if not stdin.isatty():
+        return False
+    print(
+        "Roundtable needs to reload its Codex app-server before launch.",
+        file=stderr,
+    )
+    print(f"  {status.detail}", file=stderr)
+    print(
+        "  This can disconnect Codex sessions attached to that service.",
+        file=stderr,
+    )
+    answer = _read_choice(stdin, stderr, "Reload now? [y/N]: ").lower()
+    if answer not in {"", "n", "no", "y", "yes"}:
+        raise SelectionError(
+            f"rt-codex: expected yes or no for service reload, got {answer!r}"
+        )
+    return answer in {"y", "yes"}
+
+
+def preflight_codex_services(*, ready_action=None) -> None:
+    """Prepare services and publish the Codex seat under the host repair lock."""
+
+    try:
+        from _rtcodex import CodexRuntimeError, codex_launch_preflight
+
+        codex_launch_preflight(
+            confirm_reload=_confirm_codex_reload,
+            ready_action=ready_action,
+        )
+    except CodexRuntimeError as error:
+        raise SelectionError(f"rt-codex: {error}") from error
+
+
 def project_at_or_above(start: Path) -> Path | None:
     current = start.expanduser().resolve()
     for candidate in (current, *current.parents):
@@ -340,14 +376,21 @@ def choose_launch_cwd(
     can_setup_here = cwd not in {Path.home().resolve(), Path(cwd.anchor)}
     setup_here_index = len(roots) + 1 if can_setup_here else None
     create_index = len(roots) + 1 + int(can_setup_here)
-    unanchored_index = create_index + 1
+    unanchored_index = create_index + 1 if harness != "codex" else None
     if setup_here_index is not None:
         print(
             f"  {setup_here_index}) Set up this folder safely: {cwd}",
             file=stderr,
         )
     print(f"  {create_index}) Create a new project in {cwd}", file=stderr)
-    print(f"  {unanchored_index}) Start without a project anchor", file=stderr)
+    if unanchored_index is not None:
+        print(f"  {unanchored_index}) Start without a project anchor", file=stderr)
+    else:
+        print(
+            "  Roundtable Codex requires a project anchor; use native `codex` "
+            "for an unanchored session.",
+            file=stderr,
+        )
 
     raw = _read_choice(stdin, stderr, "Select: ")
     try:
@@ -390,7 +433,7 @@ def choose_launch_cwd(
                 f"rt-{harness}: roundtable-init did not create {root}"
             )
         return root
-    if selected == unanchored_index:
+    if unanchored_index is not None and selected == unanchored_index:
         print(
             f"rt-{harness}: advisory: starting without a Roundtable project anchor from {cwd}",
             file=stderr,
@@ -408,11 +451,26 @@ def launch(harness: str, argv: list[str]) -> int:
     root = selected or project_at_or_above(Path.cwd())
     if root is None:
         clear_unanchored_lease_context()
+        if harness == "codex":
+            raise SelectionError(
+                "rt-codex: Roundtable Codex requires a Roundtable project anchor "
+                "so its host service lease and native-thread binding are safe; "
+                "choose or initialize a project, or run native `codex` directly"
+            )
     agent_id = set_launch_identity(root, harness)
-    if root is not None:
+    if root is not None or harness == "codex":
         normalize_runtime_environment()
     executable = harness_bin(harness)
-    claim_launch_seat(root, harness, agent_id)
+    if harness == "codex":
+        # Service repair must happen before publishing a seat lease.  A
+        # declined/deferred reload therefore cannot strand an occupied seat.
+        # The final READY recheck and claim share the host repair lock, so a
+        # concurrent reload cannot slip between them.
+        preflight_codex_services(
+            ready_action=lambda: claim_launch_seat(root, harness, agent_id)
+        )
+    else:
+        claim_launch_seat(root, harness, agent_id)
     command = [*COMMANDS[harness]]
     if harness == "codex" and root is not None:
         command.extend(append_codex_seat_overrides(argv))
