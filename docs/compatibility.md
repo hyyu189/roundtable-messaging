@@ -58,6 +58,11 @@ targets. `RT_CLAUDE_BIN`, `RT_HERMES_BIN`, and `RT_CODEX_BIN` provide explicit
 selection; an explicit Claude or Hermes path is still rejected if it resolves
 to a cmux wrapper.
 
+With no native Hermes arguments, the Roundtable seat launches as
+`hermes --tui`. Any explicit arguments are passed through unchanged, preserving
+oneshot, headless, and management modes; callers can request `--tui` alongside
+resume or other native arguments when desired.
+
 Inside a Roundtable project, each launcher exports `RT_FROM` automatically when
 exactly one configured instance uses that harness. A multi-instance
 configuration must select its identity explicitly, for example
@@ -170,12 +175,12 @@ is followed by the complete credentialed send-to-wake-to-drain/ack gate.
 | Codex distribution | CLI | App-server | Result |
 | --- | ---: | ---: | --- |
 | npm | `0.144.6` | isolated `0.144.6` | `initialize`, thread read/list, hooks list, and turn-history protocol smoke passed |
-| npm | `0.144.6` | Roundtable launchd `0.144.6` | live cold start passed; RC4 source proved launchd-to-socket-peer ownership after correcting the fixed standalone-slot metadata assumption; RC4 upgrade and wake E2E remain pending |
+| npm | `0.144.6` | Roundtable launchd `0.144.6` | live cold start passed; current source proved launchd-to-socket-peer ownership after correcting the fixed standalone-slot metadata assumption; isolated upgrade passed, while live candidate cutover and wake E2E remain pending |
 | standalone | not installed | not installed | resolver and fixtures only; support is not yet claimed |
 | any future or unlisted release | any | any | rejected until explicitly validated |
 
-Before the Build Week release, npm `0.144.6` still needs the RC4 in-place
-upgrade plus the real SessionStart and send-to-wake-to-drain/ack gate.
+Before the Build Week release, npm `0.144.6` still needs the live candidate
+cutover plus the real SessionStart and send-to-wake-to-drain/ack gate.
 Standalone support requires an official standalone installation followed by
 the same gate; an app-bundled internal Codex binary does not qualify as the
 standalone distribution.

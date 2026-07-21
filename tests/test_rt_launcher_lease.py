@@ -106,7 +106,17 @@ def test_anchored_launcher_claims_seat_and_exports_lease_environment(
     }
 
 
-def test_unanchored_launcher_does_not_claim_a_seat(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("argv", "expected_args"),
+    [
+        ([], ["--tui"]),
+        (["--continue"], ["--continue"]),
+        (["--oneshot", "hello"], ["--oneshot", "hello"]),
+    ],
+)
+def test_unanchored_hermes_defaults_to_tui_without_changing_explicit_modes(
+    tmp_path, monkeypatch, argv, expected_args
+):
     fake_binary = tmp_path / "hermes"
     observed = {}
 
@@ -143,11 +153,11 @@ def test_unanchored_launcher_does_not_claim_a_seat(tmp_path, monkeypatch):
     monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
 
     with pytest.raises(ExecCalled):
-        _rtlauncher.launch("hermes", ["--continue"])
+        _rtlauncher.launch("hermes", argv)
 
     assert observed == {
         "program": str(fake_binary),
-        "command": [str(fake_binary), "--continue"],
+        "command": [str(fake_binary), *expected_args],
         "environment": {
             "RT_PROJECT_ROOT": None,
             "RT_FROM": "manual-identity",

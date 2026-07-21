@@ -119,8 +119,10 @@ implicitly.
 `rt-codex`, `rt-claude`, and `rt-hermes` share one selector. Inside a project
 they preserve the existing direct-launch behavior. Outside a project they show
 the registry menu only on a TTY; non-interactive use fails with exit 2 instead
-of waiting for input. Codex retains its `--remote unix://` injection, while
-Claude and Hermes receive their original arguments unchanged.
+of waiting for input. Codex retains its `--remote unix://` injection. Claude
+receives its original arguments unchanged. A bare Hermes seat defaults to
+`hermes --tui`; explicit Hermes arguments remain unchanged for compatibility
+with its scripted and management modes.
 
 At the time of this historical Phase 3 proof, the local harness configurations
 called `rt-watch-ensure`. That watcher and its SessionStart path are now

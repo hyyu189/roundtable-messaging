@@ -481,6 +481,8 @@ def launch(harness: str, argv: list[str]) -> int:
     else:
         claim_launch_seat(root, harness, agent_id)
     command = [*COMMANDS[harness]]
+    if harness == "hermes" and not argv:
+        command.append("--tui")
     if harness == "codex" and root is not None:
         command.extend(append_codex_seat_overrides(argv))
     else:

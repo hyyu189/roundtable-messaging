@@ -293,6 +293,27 @@ def create_project(
     return target
 
 
+def choose_registered_project(
+    roots: list[Path],
+    *,
+    stdin,
+    stderr,
+) -> Path:
+    print("Choose an existing Roundtable project:", file=stderr)
+    for index, root in enumerate(roots, 1):
+        print(f"  {index}) {root}", file=stderr)
+    raw = read_choice(stdin, stderr, "Select existing project: ")
+    try:
+        selected = int(raw)
+        if not 1 <= selected <= len(roots):
+            raise IndexError(selected)
+        return roots[selected - 1]
+    except (ValueError, IndexError) as error:
+        raise OnboardingError(
+            f"roundtable: invalid existing project selection: {raw!r}"
+        ) from error
+
+
 def choose_project(
     *,
     cwd: Path,
@@ -306,9 +327,20 @@ def choose_project(
         print(f"Roundtable project: {anchored}", file=stderr)
         return anchored
 
+    if anchored is None:
+        print(
+            f"This folder is not a Roundtable project yet: {cwd}",
+            file=stderr,
+        )
+
     entries, warnings = load_project_registry()
     emit_registry_warnings(warnings, stream=stderr, tool="roundtable")
-    if not entries:
+    registered_roots = [
+        entry["root"]
+        for entry in entries
+        if not forbidden_project_root(entry["root"], home)
+    ]
+    if not registered_roots:
         print(
             "\n"
             "  [project folder]\n"
@@ -321,18 +353,16 @@ def choose_project(
             file=stderr,
         )
     options = []
-    for entry in entries:
-        root = entry["root"]
-        if not forbidden_project_root(root, home):
-            options.append(("project", root))
+    if registered_roots:
+        options.append(("registered", None))
     if not forbidden_project_root(cwd, home):
         options.append(("here", cwd))
     options.extend((("another", None), ("create", None)))
 
     print("Choose a Roundtable project:", file=stderr)
     for index, (kind, value) in enumerate(options, 1):
-        if kind == "project":
-            label = str(value)
+        if kind == "registered":
+            label = "Choose an existing project"
         elif kind == "here":
             label = f"Set up this folder safely: {cwd}"
         elif kind == "another":
@@ -352,8 +382,12 @@ def choose_project(
             f"roundtable: invalid project selection: {raw!r}"
         ) from error
 
-    if kind == "project":
-        return value
+    if kind == "registered":
+        return choose_registered_project(
+            registered_roots,
+            stdin=stdin,
+            stderr=stderr,
+        )
     if kind == "create":
         return create_project(
             cwd,

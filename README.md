@@ -62,7 +62,7 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
-| npm Codex CLI `0.144.6` | Exact-release protocol smoke, live cold start, launchd-to-socket-peer identity, and automated service/auto-bind coverage pass; RC4 upgrade, live hook identity, and full wake E2E remain release gates |
+| npm Codex CLI `0.144.6` | Exact-release protocol smoke, live cold start, launchd-to-socket-peer identity, isolated upgrade, and automated service/auto-bind coverage pass; live candidate cutover, hook identity, and full wake E2E remain release gates |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
 | tmux and cross-host SSH | Not yet supported |
@@ -102,7 +102,9 @@ roundtable
 (Git is optional), asks which installed and configured Claude, Codex, or Hermes
 seat to launch, and performs any missing one-time harness setup only after
 showing the owned changes and receiving confirmation. A Roundtable project may
-be any ordinary folder, including a non-code folder.
+be any ordinary folder, including a non-code folder. Outside a Roundtable
+project, the menu says so explicitly and keeps registered projects behind one
+second-level `Choose an existing project` selector.
 
 Roundtable-managed Codex launches require that project anchor. This lets the
 launcher publish a fenced host-service lease and auto-bind the native thread
@@ -190,8 +192,10 @@ Roundtable skill into each selected harness's global skill directory. A normal
 user does not copy or pull the skill into every project.
 
 The menu can adopt the current non-Git directory without replacing user files,
-select a registered project, choose another existing folder, or create a new
-one. Git is always opt-in. Scriptable users can use `roundtable init`,
+select a registered project from a compact second-level list, choose another
+existing folder, or create a new one. Git is always opt-in. A Hermes seat
+launched without native arguments uses TUI mode by default. Scriptable users
+can use `roundtable init`,
 `roundtable claude`, `roundtable hermes`, or `roundtable codex`; the underlying
 `roundtable-init` and `rt-*` commands remain available.
 

@@ -171,6 +171,6 @@ Before tagging or attaching the archive to a public release:
 
 At this release-candidate stage, the npm cold start and corrected
 launchd-to-socket-peer identity gate have passed on the development machine.
-The RC4 upgrade, Codex SessionStart identity spike, and full wake E2E have not
-yet passed. They must not be presented in a video, README support table, or
-Devpost submission as completed evidence.
+The current candidate's live host cutover, Codex SessionStart identity spike,
+and full wake E2E have not yet passed. They must not be presented in a video,
+README support table, or Devpost submission as completed evidence.

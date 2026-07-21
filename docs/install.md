@@ -237,8 +237,10 @@ repository is created by default; `--git` initializes and makes an initial
 commit only when the target is not already inside a Git worktree. Existing
 repositories and user-owned documents are preserved.
 
-Once registered, launch from the project or use the interactive selector from
-elsewhere:
+Once registered, launch from the project or run bare `roundtable` elsewhere.
+Its first menu groups all registered roots behind one `Choose an existing
+project` option, then shows their paths in a second-level menu. The explicit
+harness commands remain available for direct/scriptable launches:
 
 ```bash
 roundtable claude
@@ -250,6 +252,10 @@ rt-claude
 rt-hermes
 rt-codex
 ```
+
+With no native arguments, the Hermes launcher defaults to `hermes --tui`.
+Explicit native arguments are passed through unchanged so scripted/headless
+Hermes modes remain available.
 
 Roundtable Codex requires an initialized/registered project anchor. The anchor
 is what lets the launcher claim a fenced seat under the host service lock and

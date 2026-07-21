@@ -64,7 +64,7 @@ roundtable-init
   -> optional Git initialization only when requested
 
 roundtable
-  -> project-first selector over registered/current/new folders
+  -> compact project-first menu; registered roots expand in a second level
   -> configured harness-seat selector, then the fenced rt-* launcher
 ```
 

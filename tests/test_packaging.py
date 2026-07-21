@@ -184,7 +184,7 @@ def built_wheel(tmp_path_factory):
         check=False,
     )
     assert process.returncode == 0, process.stderr
-    matches = list(wheel_dir.glob("roundtable_messaging-0.1.1-*.whl"))
+    matches = list(wheel_dir.glob("roundtable_messaging-0.1.2-*.whl"))
     assert len(matches) == 1
     return matches[0]
 

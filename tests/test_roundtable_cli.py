@@ -166,6 +166,7 @@ def test_anchored_project_goes_directly_to_configured_seat_selector(
     assert result == 0
     assert f"Roundtable project: {project}" in stderr.getvalue()
     assert "Choose a Roundtable project:" not in stderr.getvalue()
+    assert "not a Roundtable project yet" not in stderr.getvalue()
     assert "codex — codex-b" in stderr.getvalue()
     assert environment["RT_FROM"] == "codex-b"
     assert chdir_calls == [project]
@@ -369,7 +370,7 @@ def test_registered_project_can_be_selected_without_reinitializing(
         [],
         cwd=cwd,
         home=tmp_path / "home",
-        stdin=TTYInput("1\n1\n"),
+        stdin=TTYInput("1\n1\n1\n"),
         stderr=io.StringIO(),
         environ={},
         init_runner=lambda *args, **kwargs: init_calls.append((args, kwargs)),
@@ -379,6 +380,83 @@ def test_registered_project_can_be_selected_without_reinitializing(
 
     assert result == 0
     assert init_calls == []
+
+
+def test_registered_projects_are_grouped_in_a_second_level_menu(
+    tmp_path, isolated_registry
+):
+    first = write_project(tmp_path / "first")
+    second = write_project(tmp_path / "second")
+    isolated_registry.write_text(
+        json.dumps(
+            {
+                "schema": "roundtable.projects.v1",
+                "projects": [
+                    {
+                        "root": str(first),
+                        "registered_at": "2026-07-19T00:00:00Z",
+                    },
+                    {
+                        "root": str(second),
+                        "registered_at": "2026-07-20T00:00:00Z",
+                    },
+                ],
+            }
+        )
+        + "\n"
+    )
+    cwd = tmp_path / "outside"
+    cwd.mkdir()
+    stderr = io.StringIO()
+
+    selected = roundtable.choose_project(
+        cwd=cwd,
+        home=tmp_path / "home",
+        stdin=TTYInput("1\n2\n"),
+        stderr=stderr,
+    )
+
+    assert selected == second
+    output = stderr.getvalue()
+    first_level, second_level = output.split("Select project: ", 1)
+    assert first_level.count("Choose an existing project") == 1
+    assert str(first) not in first_level
+    assert str(second) not in first_level
+    assert "Choose an existing Roundtable project:" in second_level
+    assert second_level.index(str(first)) < second_level.index(str(second))
+
+
+def test_registered_project_second_level_rejects_zero(
+    tmp_path, isolated_registry
+):
+    project = write_project(tmp_path / "registered")
+    isolated_registry.write_text(
+        json.dumps(
+            {
+                "schema": "roundtable.projects.v1",
+                "projects": [
+                    {
+                        "root": str(project),
+                        "registered_at": "2026-07-19T00:00:00Z",
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+    cwd = tmp_path / "outside"
+    cwd.mkdir()
+
+    with pytest.raises(
+        roundtable.OnboardingError,
+        match="invalid existing project selection",
+    ):
+        roundtable.choose_project(
+            cwd=cwd,
+            home=tmp_path / "home",
+            stdin=TTYInput("1\n0\n"),
+            stderr=io.StringIO(),
+        )
 
 
 def test_installed_onboarding_previews_and_applies_selected_harness_once(
@@ -597,5 +675,6 @@ def test_first_project_onboarding_explains_non_git_topology(
 
     assert result == 2
     output = stderr.getvalue()
+    assert f"This folder is not a Roundtable project yet: {folder}" in output
     assert "[durable mailboxes]" in output
     assert "Git is optional" in output
