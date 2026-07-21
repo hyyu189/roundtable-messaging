@@ -8,6 +8,7 @@ currently claimed host-local seat in ``RT_RUNTIME_DIR``.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -34,6 +35,31 @@ POLL_SECONDS = 5
 
 class StopRequested(Exception):
     pass
+
+
+def _managed_command_root() -> Path:
+    configured = os.environ.get("ROUNDTABLE_INSTALL_PREFIX")
+    if configured:
+        prefix = Path(configured).expanduser()
+        if prefix.is_absolute():
+            return prefix / "bin"
+    return Path(os.path.abspath(sys.argv[0])).parent
+
+
+def _claude_drain_instructions(agent: str) -> str:
+    command_root = _managed_command_root()
+    return (
+        "Roundtable mail arrived. Read and act on every pending message for "
+        f"{agent!r}. Use these package-managed command paths exactly so the "
+        "narrow setup permissions apply:\n"
+        f"  {command_root / 'rt-inbox'} --fenced --archive-quiet-acks "
+        "-f json\n"
+        f"  {command_root / 'rt-ack'} --fenced <id>[,<id>...]\n"
+        f"  {command_root / 'rt-say'} --fenced --no-nudge "
+        "<agent> <kind> <body...>\n"
+        "The Stop hook re-arms the inbox watcher automatically after this "
+        "turn; do not start another watcher yourself."
+    )
 
 
 def _stop(_signum, _frame) -> None:
@@ -165,6 +191,8 @@ def run(
     explicit_minutes: int | None,
     *,
     claude_hook: bool = False,
+    claude_stop_hook: bool = False,
+    stop_hook_active: bool = False,
 ) -> int:
     project = _project_root()
     session_id, revision = _lease_environment(agent)
@@ -180,6 +208,22 @@ def run(
     new_dir = inbox / "new"
     for path in (new_dir, inbox / "cur", inbox / "tmp"):
         path.mkdir(parents=True, exist_ok=True)
+    pending_at_stop = _wake_mail(new_dir)
+    if (
+        claude_stop_hook
+        and stop_hook_active
+        and tuple(pending_at_stop) == lease.last_wake_messages
+        and lease.wake_attempts >= 2
+    ):
+        print(
+            "rt-wait-inbox: the same Roundtable mail generation is still "
+            "pending after one Stop-hook retry; automatic re-wake is paused "
+            "to prevent a loop. "
+            "The mail remains durable in new/. Resolve any /permissions or "
+            "command error, then interact with this Claude session to retry.",
+            file=sys.stderr,
+        )
+        return 0
 
     watcher_pid = os.getpid()
     try:
@@ -239,23 +283,26 @@ def run(
             print("rt-wait-inbox: seat lease or watcher was superseded")
             return 0
         if mail:
-            update_wake(
+            prior_messages = token.last_wake_messages
+            attempts = (
+                token.wake_attempts + 1
+                if tuple(mail) == prior_messages
+                else 1
+            )
+            token = update_wake(
                 project,
                 agent,
                 session_id,
                 revision,
                 empty_beats=0,
+                last_wake_messages=mail,
+                wake_attempts=attempts,
                 expected_watcher_pid=watcher_pid,
             )
             print(f"rt-wait-inbox: mail after {ticks * POLL_SECONDS}s:")
             print("\n".join(mail))
             if claude_hook:
-                print(
-                    "Roundtable mail arrived. Read and act on every pending "
-                    f"message for {agent!r}, acknowledge and drain it, then "
-                    "re-arm the inbox tripwire before stopping.",
-                    file=sys.stderr,
-                )
+                print(_claude_drain_instructions(agent), file=sys.stderr)
         else:
             empty_beats += 1
             update_wake(
@@ -273,8 +320,9 @@ def run(
             )
             if claude_hook:
                 print(
-                    "Roundtable inbox heartbeat completed. Re-arm the inbox "
-                    "tripwire before stopping so this session remains reachable.",
+                    "Roundtable inbox heartbeat completed. The Stop hook will "
+                    "re-arm the watcher automatically; do not start another "
+                    "watcher yourself.",
                     file=sys.stderr,
                 )
         acks = _ack_count(new_dir)
@@ -326,24 +374,48 @@ def _claude_hook_is_managed() -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    claude_hook = bool(argv and argv[0] == "--claude-hook")
+    claude_stop_hook = bool(argv and argv[0] == "--claude-stop-hook")
+    claude_hook = bool(
+        argv and argv[0] in ("--claude-hook", "--claude-stop-hook")
+    )
+    stop_hook_active = False
     if claude_hook:
         argv.pop(0)
         if not _claude_hook_is_managed():
             return 0
+        if claude_stop_hook:
+            try:
+                hook_input = json.load(sys.stdin)
+                if not isinstance(hook_input, dict):
+                    raise ValueError("hook input must be an object")
+                stop_hook_active = hook_input.get("stop_hook_active") is True
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                print(
+                    "rt-wait-inbox: invalid Claude Stop hook input; refusing "
+                    f"automatic re-wake to avoid a loop: {error}",
+                    file=sys.stderr,
+                )
+                return 0
         if not argv:
             launched_as = os.environ.get("RT_FROM", "").strip()
             if launched_as:
                 argv.append(launched_as)
     if not 1 <= len(argv) <= 2:
         print(
-            "usage: rt-wait-inbox [--claude-hook] <agent> [max-minutes]",
+            "usage: rt-wait-inbox [--claude-hook|--claude-stop-hook] "
+            "<agent> [max-minutes]",
             file=sys.stderr,
         )
         return 2
     try:
         explicit = _parse_minutes(argv[1] if len(argv) == 2 else None)
-        return run(argv[0], explicit, claude_hook=claude_hook)
+        return run(
+            argv[0],
+            explicit,
+            claude_hook=claude_hook,
+            claude_stop_hook=claude_stop_hook,
+            stop_hook_active=stop_hook_active,
+        )
     except (FenceRejected, RuntimeStateError, OSError) as error:
         print(f"rt-wait-inbox: {error}", file=sys.stderr)
         return 2

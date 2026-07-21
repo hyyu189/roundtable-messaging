@@ -21,6 +21,58 @@ LIFECYCLE_ORDINAL = {"pending": 0, "injected": 1, "submitted": 2, "accepted": 3,
 PROJECTS_SCHEMA = "roundtable.projects.v1"
 
 
+def require_fenced_seat(project, tool):
+    """Validate the exact launcher lease before a pre-approved mail action."""
+
+    from _rtruntime import RuntimeStateError, inspect_seat, load_validated_lease
+
+    canonical = Path(project).expanduser().resolve()
+    values = {
+        "RT_PROJECT_ROOT": os.environ.get("RT_PROJECT_ROOT", "").strip(),
+        "RT_FROM": os.environ.get("RT_FROM", "").strip().lower(),
+        "RT_SESSION_ID": os.environ.get("RT_SESSION_ID", "").strip(),
+        "RT_LEASE_REVISION": os.environ.get("RT_LEASE_REVISION", "").strip(),
+    }
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise SystemExit(
+            f"{tool}: --fenced requires a Roundtable-launched seat; missing "
+            + ", ".join(missing)
+        )
+    try:
+        configured_root = Path(values["RT_PROJECT_ROOT"]).expanduser().resolve()
+    except OSError as error:
+        raise SystemExit(
+            f"{tool}: invalid RT_PROJECT_ROOT for --fenced: {error}"
+        ) from None
+    if configured_root != canonical:
+        raise SystemExit(
+            f"{tool}: fenced project {configured_root} does not match {canonical}"
+        )
+    agent = values["RT_FROM"]
+    try:
+        token = load_validated_lease(
+            canonical,
+            agent,
+            values["RT_SESSION_ID"],
+            values["RT_LEASE_REVISION"],
+        )
+        inspection = inspect_seat(canonical, agent)
+    except (OSError, RuntimeStateError) as error:
+        raise SystemExit(f"{tool}: fenced seat validation failed: {error}") from None
+    if not inspection.status.startswith("active_") or inspection.token is None:
+        raise SystemExit(
+            f"{tool}: fenced seat is not active: {inspection.status} "
+            f"({inspection.detail})"
+        )
+    if (
+        inspection.token.session_id != token.session_id
+        or inspection.token.revision != token.revision
+    ):
+        raise SystemExit(f"{tool}: fenced seat changed during validation")
+    return agent
+
+
 def projects_registry_path():
     override = os.environ.get("RT_PROJECTS_FILE")
     if override:

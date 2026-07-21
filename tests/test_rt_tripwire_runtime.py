@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -204,6 +205,8 @@ def test_claude_hook_uses_async_rewake_exit_for_mail(tmp_path, monkeypatch):
     project = write_project(tmp_path / "project")
     runtime = tmp_path / "runtime"
     environment = claim_environment(monkeypatch, runtime, project)
+    install_prefix = tmp_path / "managed-prefix"
+    environment["ROUNDTABLE_INSTALL_PREFIX"] = str(install_prefix)
     new_dir = project / ".roundtable" / "inbox" / "claude" / "new"
     new_dir.mkdir(parents=True)
     (new_dir / "message-claude.md").write_text(
@@ -222,6 +225,16 @@ def test_claude_hook_uses_async_rewake_exit_for_mail(tmp_path, monkeypatch):
     assert result.returncode == 2
     assert "message-claude.md" in result.stdout
     assert "Roundtable mail arrived" in result.stderr
+    assert (
+        f"{install_prefix}/bin/rt-inbox --fenced --archive-quiet-acks -f json"
+        in result.stderr
+    )
+    assert f"{install_prefix}/bin/rt-ack --fenced <id>" in result.stderr
+    assert (
+        f"{install_prefix}/bin/rt-say --fenced --no-nudge"
+        in result.stderr
+    )
+    assert "Stop hook re-arms" in result.stderr
 
 
 def test_global_claude_hooks_use_the_claimed_instance_identity(
@@ -302,6 +315,116 @@ def test_claude_hook_uses_async_rewake_exit_for_heartbeat(
     assert result.returncode == 2
     assert "heartbeat timeout after 0m" in result.stdout
     assert "heartbeat completed" in result.stderr
+    assert "Stop hook will re-arm" in result.stderr
+
+
+def test_claude_stop_hook_breaks_an_undrained_mail_retry_loop(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    new_dir = project / ".roundtable" / "inbox" / "claude" / "new"
+    new_dir.mkdir(parents=True)
+    (new_dir / "message-still-pending.md").write_text(
+        "[CODEX→CLAUDE question id=message-still-pending] test\n"
+    )
+
+    initial_wake = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+    )
+    assert initial_wake.returncode == 2
+
+    first_retry = run_tool(
+        "rt-wait-inbox",
+        "--claude-stop-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+        input_text='{"stop_hook_active": false}',
+    )
+    assert first_retry.returncode == 2
+    assert "message-still-pending.md" in first_retry.stdout
+
+    breaker = run_tool(
+        "rt-wait-inbox",
+        "--claude-stop-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+        input_text='{"stop_hook_active": true}',
+    )
+    assert breaker.returncode == 0
+    assert "automatic re-wake is paused" in breaker.stderr
+    assert "message-still-pending.md" not in breaker.stdout
+
+
+def test_claude_stop_hook_wakes_a_fresh_late_message_generation(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    inbox = project / ".roundtable" / "inbox" / "claude"
+    new_dir = inbox / "new"
+    cur_dir = inbox / "cur"
+    new_dir.mkdir(parents=True)
+    cur_dir.mkdir(parents=True)
+    first = new_dir / "message-a.md"
+    first.write_text("[CODEX→CLAUDE question id=message-a] first\n")
+
+    initial_wake = run_tool(
+        "rt-wait-inbox",
+        "--claude-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+    )
+    assert initial_wake.returncode == 2
+    first.rename(cur_dir / first.name)
+    second = new_dir / "message-b.md"
+    second.write_text("[CODEX→CLAUDE question id=message-b] late\n")
+
+    late_generation = run_tool(
+        "rt-wait-inbox",
+        "--claude-stop-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+        input_text='{"stop_hook_active": true}',
+    )
+
+    assert late_generation.returncode == 2
+    assert "message-b.md" in late_generation.stdout
+    assert "automatic re-wake is paused" not in late_generation.stderr
+
+
+def test_claude_stop_hook_rearms_after_a_successful_drain(tmp_path, monkeypatch):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+
+    result = run_tool(
+        "rt-wait-inbox",
+        "--claude-stop-hook",
+        "claude",
+        "0",
+        cwd=project,
+        env=environment,
+        input_text='{"stop_hook_active": true}',
+    )
+
+    assert result.returncode == 2
+    assert "heartbeat timeout after 0m" in result.stdout
 
 
 def test_quiet_ack_does_not_wake_and_empty_heartbeat_backoff_persists(
@@ -330,6 +453,97 @@ def test_quiet_ack_does_not_wake_and_empty_heartbeat_backoff_persists(
     assert "1 quiet ack file(s) pending" in first.stdout
     assert "ack-message-1.md" not in first.stdout.split("heartbeat timeout", 1)[0]
     assert_no_project_liveness(project)
+
+
+def test_fenced_inbox_archives_quiet_ack_without_a_shell_move(
+    tmp_path, monkeypatch
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    inbox = project / ".roundtable" / "inbox" / "claude"
+    new_dir = inbox / "new"
+    new_dir.mkdir(parents=True)
+    msg_id = "20260721T220000Z-codex-to-claude-quiet"
+    source = new_dir / f"ack-{msg_id}.md"
+    source.write_text(
+        f"[CODEX→CLAUDE sync-ack id={msg_id}] refs=original-message\n"
+    )
+
+    result = run_tool(
+        "rt-inbox",
+        "--fenced",
+        "--archive-quiet-acks",
+        "-f",
+        "json",
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
+    assert "archived 1 quiet acknowledgement" in result.stderr
+    assert not source.exists()
+    assert (inbox / "cur" / source.name).is_file()
+
+
+def test_fenced_ack_rejects_an_unanchored_session_before_foreign_archive(
+    tmp_path,
+):
+    project = write_project(tmp_path / "project")
+    msg_id = "20260721T220100Z-codex-to-hermes-foreign"
+    new_dir = project / ".roundtable" / "inbox" / "hermes" / "new"
+    new_dir.mkdir(parents=True)
+    source = new_dir / f"{msg_id}.md"
+    source.write_text(f"[CODEX→HERMES question id={msg_id}] keep\n")
+    environment = os.environ.copy()
+    for name in (
+        "RT_PROJECT_ROOT",
+        "RT_FROM",
+        "RT_SESSION_ID",
+        "RT_LEASE_REVISION",
+    ):
+        environment.pop(name, None)
+
+    result = run_tool(
+        "rt-ack",
+        "--fenced",
+        msg_id,
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "--fenced requires a Roundtable-launched seat" in result.stderr
+    assert source.is_file()
+    assert not (new_dir.parent / "cur" / source.name).exists()
+
+
+def test_active_fenced_claude_cannot_ack_another_seats_message(
+    tmp_path,
+    monkeypatch,
+):
+    project = write_project(tmp_path / "project")
+    runtime = tmp_path / "runtime"
+    environment = claim_environment(monkeypatch, runtime, project)
+    msg_id = "20260721T220200Z-codex-to-hermes-foreign"
+    new_dir = project / ".roundtable" / "inbox" / "hermes" / "new"
+    new_dir.mkdir(parents=True)
+    source = new_dir / f"{msg_id}.md"
+    source.write_text(f"[CODEX→HERMES question id={msg_id}] keep\n")
+
+    result = run_tool(
+        "rt-ack",
+        "--fenced",
+        msg_id,
+        cwd=project,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "fenced seat claude cannot acknowledge mail for hermes" in result.stderr
+    assert source.is_file()
+    assert not (new_dir.parent / "cur" / source.name).exists()
 
 
 def test_global_stop_gate_is_noop_for_direct_launch_but_partial_lease_fails(

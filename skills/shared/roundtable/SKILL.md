@@ -6,7 +6,7 @@ description: >-
   rt-say, rt-ack, rt-refresh, rt-resolve, handoff delivery, multi-instance agent
   routing, or cmux surface-routing bugs. Do not use merely because a repo
   contains .roundtable/agents.yaml.
-version: 7.1.0
+version: 7.2.0
 author: Roundtable contributors
 license: MIT
 platforms: [macos]
@@ -116,14 +116,24 @@ inbox has mail: run `rt-inbox -f json`, act on every non-ack message, then
 `rt-ack` the ids (comma-batch). A successful `rt-ack` sends the quiet
 confirmation and atomically archives those exact inbound files from `new/` to
 `cur/`; a failed acknowledgement leaves them in `new/`. Move any quiet
-`ack-*` files to `cur/` without acknowledging them. Hermes and Codex re-arm
-automatically after the triggered non-ack generation is archived; Claude must
-follow any re-arm instruction from its Stop hook.
+`ack-*` files to `cur/` without acknowledging them; Claude's hook-provided
+fenced inbox command performs that quiet-ack drain itself. Hermes and Codex
+re-arm automatically after the triggered non-ack generation is archived.
+Claude's Stop hook normally re-arms automatically; never launch a second
+watcher from the model turn. One unchanged pending generation receives its
+initial wake and at most one Stop-hook retry, then pauses instead of looping.
+User interruption and API/authentication failure do not run a usable Stop hook;
+mail remains durable, but that Claude session may need a later normal
+interaction or resume before it is armed again.
 
-**Arming (Claude)** — the setup-owned SessionStart hook launches the fenced
-inbox watcher for a Roundtable-launched session. Its Stop hook prevents Claude
-from going idle with undrained mail or a missing watcher. Follow the hook's
-diagnostic instruction; ordinary users should not start or kill watcher
+**Arming (Claude)** — the setup-owned SessionStart hook launches the first
+fenced inbox watcher for a Roundtable-launched session, and its Stop hook
+normally launches the successor after a completed turn. When mail wakes
+Claude, the system reminder prints the package-managed absolute paths for
+`rt-inbox`, `rt-ack`, and `rt-say`, including their `--fenced` and
+`--no-nudge` flags. Use those exact paths and flag order: setup pre-approves
+only lease-validated maildir commands, not a PATH lookalike or the legacy
+keyboard route. Ordinary users and agents should not start or kill watcher
 processes themselves.
 
 **Arming (Hermes)** — the setup-owned plugin starts the fenced watcher at
@@ -150,7 +160,10 @@ state and must not be used as routing or liveness truth.
 `rt-say <agent> <kind> "body"` from the project root. That's the whole ritual
 — no refresh, no resolve, no liveness check. In a remote Codex app-server
 turn, sender inference uses `CODEX_THREAD_ID`; outside a harness set
-`RT_FROM`.
+`RT_FROM`. During an automatically woken Claude turn, use the absolute
+`rt-say --fenced --no-nudge` form printed by the hook so the setup-owned narrow
+permission matches, the current launcher lease is validated, and the archived
+keyboard path cannot be selected.
 
 `kind` is a free triage label (fyi, question, answer, proposal, review,
 correction, directive, urgent) with no effect on delivery. For anything long,

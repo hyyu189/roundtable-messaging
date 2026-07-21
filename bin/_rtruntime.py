@@ -91,6 +91,20 @@ class LeaseToken:
         return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
     @property
+    def last_wake_messages(self) -> tuple[str, ...]:
+        value = (self.record.get("wake") or {}).get("lastWakeMessages", [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) for item in value
+        ):
+            return ()
+        return tuple(value)
+
+    @property
+    def wake_attempts(self) -> int:
+        value = (self.record.get("wake") or {}).get("wakeAttempts", 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    @property
     def activity_at(self) -> str | None:
         value = self.record.get("activityAt")
         return value if isinstance(value, str) and value else None
@@ -549,6 +563,18 @@ def _validate_record(
     wake = record.get("wake", {})
     if not isinstance(wake, dict):
         raise RuntimeStateError("lease wake state is not an object")
+    last_wake_messages = wake.get("lastWakeMessages", [])
+    if not isinstance(last_wake_messages, list) or any(
+        not isinstance(item, str) or not item for item in last_wake_messages
+    ):
+        raise RuntimeStateError("lease wake.lastWakeMessages is invalid")
+    wake_attempts = wake.get("wakeAttempts", 0)
+    if (
+        not isinstance(wake_attempts, int)
+        or isinstance(wake_attempts, bool)
+        or wake_attempts < 0
+    ):
+        raise RuntimeStateError("lease wake.wakeAttempts is invalid")
 
 
 def _token(record: dict[str, Any]) -> LeaseToken:
@@ -1200,6 +1226,8 @@ def update_wake(
     watcher_pid: int | None | object = UNCHANGED,
     native_session_id: str | None | object = UNCHANGED,
     empty_beats: int | object = UNCHANGED,
+    last_wake_messages: list[str] | tuple[str, ...] | object = UNCHANGED,
+    wake_attempts: int | object = UNCHANGED,
     expected_watcher_pid: int | None = None,
 ) -> LeaseToken:
     canonical = canonical_project(project)
@@ -1253,6 +1281,25 @@ def update_wake(
             ):
                 raise RuntimeStateError("empty_beats must be a non-negative integer")
             wake["emptyBeats"] = empty_beats
+        if last_wake_messages is not UNCHANGED:
+            if not isinstance(last_wake_messages, (list, tuple)) or any(
+                not isinstance(item, str) or not item
+                for item in last_wake_messages
+            ):
+                raise RuntimeStateError(
+                    "last_wake_messages must contain non-empty strings"
+                )
+            wake["lastWakeMessages"] = list(last_wake_messages)
+        if wake_attempts is not UNCHANGED:
+            if (
+                not isinstance(wake_attempts, int)
+                or isinstance(wake_attempts, bool)
+                or wake_attempts < 0
+            ):
+                raise RuntimeStateError(
+                    "wake_attempts must be a non-negative integer"
+                )
+            wake["wakeAttempts"] = wake_attempts
         wake["heartbeatAt"] = utc_now()
         record["wake"] = wake
         _atomic_json(paths.lease, record)

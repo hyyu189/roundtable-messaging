@@ -9,9 +9,11 @@ manifest and stops before overwriting an unrelated or locally modified path.
 The source-install path and extracted offline artifact pass automated
 clean-home installation, repeated-install, conflict, command, harness-setup,
 core-smoke, and uninstall tests. RC5's development-host Codex SessionStart
-thread/lease identity and automatic binding spike also passed. The artifact
-remains a release candidate until clean-account repetition, real credentialed
-harness wake tests, and the terminal UX matrix pass the promotion gates.
+thread/lease identity and automatic binding spike also passed; an installed
+RC7 Hermes TUI passed two sequential real wake generations on that host. The
+artifact remains a release candidate until RC8 artifact repetition,
+clean-account tests, the remaining credentialed harness paths, and the terminal
+UX matrix pass the promotion gates.
 
 To preview the managed installer without touching a live installation, use
 isolated paths:
@@ -180,13 +182,20 @@ is idempotent. It performs these harness-specific actions:
 
 | Harness | Managed onboarding |
 | --- | --- |
-| Claude | Merges a SessionStart inbox wake hook and Stop drain gate into `~/.claude/settings.json`; links the global Roundtable skill |
+| Claude | Merges owned asynchronous SessionStart and Stop inbox watchers plus three absolute, lease-fenced mail-command allow rules into `~/.claude/settings.json`; links the global Roundtable skill |
 | Hermes | Adds one marked `roundtable` plugin entry to `~/.hermes/config.yaml`; links the packaged plugin and global skill |
 | Codex | Merges one SessionStart auto-bind hook into `~/.codex/hooks.json`; writes the app-server and wake-bridge plist files under `~/Library/LaunchAgents`; links the global skill |
 
 Setup never installs Claude, Hermes, or Codex itself and never copies
 credentials. It configures only harnesses already detected, unless
 `--harness` is supplied explicitly.
+
+Claude setup fails before writing when the same settings file has
+`disableAllHooks: true` or an `ask`/`deny` rule that overrides Roundtable's
+three narrow mail commands. Review those choices with `/hooks` or
+`/permissions`; setup never deletes them. Organization-managed, project-local,
+or command-line policy can still take precedence outside that file, so a
+successful plan/apply is not a substitute for the real wake acceptance test.
 
 Codex may require a one-time `/hooks` review before it trusts the installed
 user-level SessionStart hook. That user decision cannot be automated and
@@ -267,6 +276,11 @@ rt-codex
 With no native arguments, the Hermes launcher defaults to `hermes --tui`.
 Explicit native arguments are passed through unchanged so scripted/headless
 Hermes modes remain available.
+
+A project-anchored bare Claude launch supplies a fresh native `--session-id`,
+so Roundtable opens an addressable chat even when Claude is configured to start
+in Remote Control/FleetView. Explicit Claude arguments and unanchored launches
+are passed through unchanged.
 
 Roundtable Codex requires an initialized/registered project anchor. The anchor
 is what lets the launcher claim a fenced seat under the host service lock and

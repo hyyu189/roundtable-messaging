@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from _rtlib import find_project_root
+from _rtlib import find_project_root, require_fenced_seat
 
 TOOL_DIR = Path(__file__).resolve().parent
 # Agent names may be multi-instance ids (claude#1, codex-build), so the from/to
@@ -20,7 +20,7 @@ ROOT = find_project_root("rt-ack")
 
 
 def usage():
-    print("usage: rt-ack <ref_csv> [body]", file=sys.stderr)
+    print("usage: rt-ack [--fenced] <ref_csv> [body]", file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -108,12 +108,17 @@ def archive_inbound(ref, recipient):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = list(sys.argv[1:])
+    fenced = bool(args and args[0] == "--fenced")
+    if fenced:
+        args.pop(0)
+    if "--fenced" in args or not args:
         usage()
-    refs = [ref.strip() for ref in sys.argv[1].split(",") if ref.strip()]
+    fenced_agent = require_fenced_seat(ROOT, "rt-ack") if fenced else ""
+    refs = [ref.strip() for ref in args[0].split(",") if ref.strip()]
     if not refs:
         usage()
-    body = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
+    body = " ".join(args[1:]) if len(args) > 1 else ""
 
     parsed_refs = []
     for ref in refs:
@@ -129,6 +134,11 @@ def main():
         )
     inferred_sender = next(iter(recipients))
     explicit_sender = os.environ.get("RT_FROM", "").lower()
+    if fenced_agent and inferred_sender != fenced_agent:
+        raise SystemExit(
+            f"rt-ack: fenced seat {fenced_agent} cannot acknowledge mail for "
+            f"{inferred_sender}"
+        )
     if explicit_sender and explicit_sender != inferred_sender:
         raise SystemExit(
             f"rt-ack: RT_FROM={explicit_sender} does not match message recipient "

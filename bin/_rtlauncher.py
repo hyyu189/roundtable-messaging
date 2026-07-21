@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from _rtlib import (
@@ -481,6 +482,13 @@ def launch(harness: str, argv: list[str]) -> int:
     else:
         claim_launch_seat(root, harness, agent_id)
     command = [*COMMANDS[harness]]
+    if harness == "claude" and root is not None and not argv:
+        # A bare Claude launch may open the user's FleetView/Remote Control
+        # surface instead of creating a chat.  That surface does not run the
+        # claimed seat's SessionStart hook, so it cannot own the inbox
+        # tripwire.  Roundtable's bare-seat contract is a fresh addressable
+        # chat; explicit native arguments remain untouched.
+        command.extend(["--session-id", str(uuid.uuid4())])
     if harness == "hermes" and not argv:
         command.append("--tui")
     if harness == "codex" and root is not None:

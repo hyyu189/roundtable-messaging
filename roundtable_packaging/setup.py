@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import copy
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -737,29 +738,90 @@ def _write_manifest(prefix: Path, manifest: dict[str, Any]) -> None:
 
 
 def _claude_groups(prefix: Path) -> dict[str, dict[str, Any]]:
+    session_waiter = {
+        "type": "command",
+        "command": str(prefix / "bin" / "rt-wait-inbox"),
+        "args": ["--claude-hook"],
+        "asyncRewake": True,
+        "timeout": CLAUDE_HOOK_TIMEOUT_SECONDS,
+    }
     return {
         "SessionStart": {
             "matcher": "startup|resume|clear|compact",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": str(prefix / "bin" / "rt-wait-inbox"),
-                    "args": ["--claude-hook"],
-                    "asyncRewake": True,
-                    "timeout": CLAUDE_HOOK_TIMEOUT_SECONDS,
-                }
-            ],
+            "hooks": [session_waiter],
         },
         "Stop": {
             "hooks": [
                 {
-                    "type": "command",
-                    "command": str(prefix / "bin" / "rt-stop-gate"),
-                    "args": [],
+                    **session_waiter,
+                    "args": ["--claude-stop-hook"],
                 }
             ],
         },
     }
+
+
+def _legacy_claude_groups(prefix: Path) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Known setup-owned hook generations that may be upgraded in place."""
+
+    return {
+        "Stop": (
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": str(prefix / "bin" / "rt-stop-gate"),
+                        "args": [],
+                    }
+                ],
+            },
+        ),
+    }
+
+
+def _claude_permission_rules(prefix: Path) -> tuple[str, ...]:
+    """Narrow, stable commands needed for an unattended mail-drain turn."""
+
+    rendered_prefix = str(prefix)
+    unsafe = set("*?[](){}'\"\\$`;|&<>")
+    if any(character.isspace() or character in unsafe for character in rendered_prefix):
+        raise SetupError(
+            "Claude integration requires a shell-safe Roundtable install prefix "
+            f"for exact permission rules; unsupported prefix: {rendered_prefix!r}"
+        )
+    command_root = prefix / "bin"
+    return (
+        f"Bash({command_root / 'rt-inbox'} --fenced "
+        "--archive-quiet-acks -f json)",
+        f"Bash({command_root / 'rt-ack'} --fenced *)",
+        f"Bash({command_root / 'rt-say'} --fenced --no-nudge *)",
+    )
+
+
+def _claude_permission_conflicts(
+    permissions: dict[str, Any],
+    expected_rules: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    conflicts: list[tuple[str, str]] = []
+    for policy in ("deny", "ask"):
+        values = permissions.get(policy, [])
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) for item in values
+        ):
+            raise SetupError(f"Claude permissions.{policy} must be a string list")
+        for rule in values:
+            pattern = rule
+            if pattern.endswith(":*)"):
+                pattern = pattern[:-3] + " *)"
+            bare_matches_bash = "(" not in pattern and fnmatch.fnmatchcase(
+                "Bash", pattern
+            )
+            if bare_matches_bash or any(
+                fnmatch.fnmatchcase(expected, pattern)
+                for expected in expected_rules
+            ):
+                conflicts.append((policy, rule))
+    return conflicts
 
 
 def _codex_groups(prefix: Path) -> dict[str, dict[str, Any]]:
@@ -901,54 +963,192 @@ def _validate_executable(target: Path, description: str) -> None:
         raise SetupError(f"{description} is not executable: {target}")
 
 
-def _prepare_claude(home: Path, prefix: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _prepare_claude(
+    home: Path,
+    prefix: Path,
+    existing_record: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     path = home / ".claude" / "settings.json"
     _validate_user_chain(home, path)
     before, raw, mode = _load_json_config(path)
     after = copy.deepcopy(before)
-    hooks_added = "hooks" not in after
-    if hooks_added:
+    if after.get("disableAllHooks") is True:
+        raise SetupError(
+            "Claude disableAllHooks=true prevents Roundtable wake hooks; "
+            "review that user choice with /hooks before applying setup"
+        )
+    prior_config = (
+        existing_record.get("config")
+        if isinstance(existing_record, dict)
+        else None
+    )
+    if existing_record is not None and not isinstance(prior_config, dict):
+        raise SetupError("invalid Claude configuration ownership record")
+
+    hooks_added = (
+        bool(prior_config["hooks_container_added"])
+        if prior_config is not None
+        else "hooks" not in after
+    )
+    if "hooks" not in after:
         after["hooks"] = {}
     hooks = after.get("hooks")
     if not isinstance(hooks, dict):
         raise SetupError(f"Claude hooks must be an object: {path}")
 
     fragments: list[dict[str, Any]] = []
-    event_added: dict[str, bool] = {}
+    event_added: dict[str, bool] = (
+        copy.deepcopy(prior_config["event_containers_added"])
+        if prior_config is not None
+        else {}
+    )
+    prior_fragments = {
+        fragment.get("event"): fragment
+        for fragment in (prior_config or {}).get("fragments", [])
+        if isinstance(fragment, dict)
+    }
     for event, group in _claude_groups(prefix).items():
-        event_added[event] = event not in hooks
-        if event_added[event]:
+        if prior_config is None:
+            event_added[event] = event not in hooks
+        if event not in hooks:
             hooks[event] = []
         groups = hooks.get(event)
         if not isinstance(groups, list):
             raise SetupError(f"Claude hook event {event} must be a list: {path}")
-        count = groups.count(group)
-        if count > 1:
-            raise SetupError(
-                f"Claude hook event {event} contains duplicate Roundtable "
-                f"fragments: {path}"
-            )
-        added = count == 0
-        if added:
-            groups.append(copy.deepcopy(group))
+        prior_fragment = prior_fragments.get(event)
+        if prior_fragment is None:
+            count = groups.count(group)
+            if count > 1:
+                raise SetupError(
+                    f"Claude hook event {event} contains duplicate Roundtable "
+                    f"fragments: {path}"
+                )
+            added = count == 0
+            if added:
+                groups.append(copy.deepcopy(group))
+        else:
+            prior_group = prior_fragment["group"]
+            added = bool(prior_fragment["added"])
+            if prior_group != group:
+                if prior_group not in _legacy_claude_groups(prefix).get(event, ()):
+                    raise SetupError(
+                        f"unsupported managed Claude {event} hook generation"
+                    )
+                if not added:
+                    raise SetupError(
+                        f"cannot replace pre-existing legacy Claude {event} "
+                        "hook; first remove Roundtable setup, then remove that "
+                        "user-owned fragment, and apply setup again"
+                    )
+                if groups.count(group):
+                    raise SetupError(
+                        f"Claude hook event {event} already contains the new "
+                        f"Roundtable fragment: {path}"
+                    )
+                index = groups.index(prior_group)
+                groups[index] = copy.deepcopy(group)
         fragments.append(
             {
                 "event": event,
-                "group": group,
+                "group": copy.deepcopy(group),
                 "added": added,
             }
         )
 
+    prior_permissions = (
+        prior_config.get("permissions") if prior_config is not None else None
+    )
+    if prior_permissions is not None and not isinstance(prior_permissions, dict):
+        raise SetupError("invalid Claude permission ownership record")
+    permissions_container_added = (
+        bool(prior_permissions["permissions_container_added"])
+        if prior_permissions is not None
+        else "permissions" not in after
+    )
+    if "permissions" not in after:
+        after["permissions"] = {}
+    permissions = after.get("permissions")
+    if not isinstance(permissions, dict):
+        raise SetupError(f"Claude permissions must be an object: {path}")
+    expected_permission_rules = _claude_permission_rules(prefix)
+    conflicts = _claude_permission_conflicts(
+        permissions,
+        expected_permission_rules,
+    )
+    if conflicts:
+        rendered = ", ".join(
+            f"permissions.{policy}={rule!r}" for policy, rule in conflicts
+        )
+        raise SetupError(
+            "Claude ask/deny rules override Roundtable's narrow unattended "
+            f"mail permissions: {rendered}; review them with /permissions "
+            "before applying setup"
+        )
+    allow_container_added = (
+        bool(prior_permissions["allow_container_added"])
+        if prior_permissions is not None
+        else "allow" not in permissions
+    )
+    if "allow" not in permissions:
+        permissions["allow"] = []
+    allow = permissions.get("allow")
+    if not isinstance(allow, list) or any(
+        not isinstance(item, str) for item in allow
+    ):
+        raise SetupError(f"Claude permissions.allow must be a string list: {path}")
+    prior_rules = {
+        item.get("rule"): item
+        for item in (prior_permissions or {}).get("rules", [])
+        if isinstance(item, dict)
+    }
+    permission_rules: list[dict[str, Any]] = []
+    permission_rules_added: list[str] = []
+    for rule in expected_permission_rules:
+        count = allow.count(rule)
+        if count > 1:
+            raise SetupError(
+                f"Claude permissions.allow contains duplicate Roundtable rule "
+                f"{rule!r}: {path}"
+            )
+        prior_rule = prior_rules.get(rule)
+        if prior_rule is not None:
+            added = bool(prior_rule["added"])
+        else:
+            added = count == 0
+            if added:
+                allow.append(rule)
+                permission_rules_added.append(rule)
+        permission_rules.append({"rule": rule, "added": added})
+
     record = {
         "config": {
             "path": str(path),
-            "created": raw is None,
-            "backup": None,
+            "created": (
+                bool(prior_config["created"])
+                if prior_config is not None
+                else raw is None
+            ),
+            "backup": (
+                prior_config.get("backup") if prior_config is not None else None
+            ),
             "hooks_container_added": hooks_added,
             "event_containers_added": event_added,
             "fragments": fragments,
+            "permissions": {
+                "permissions_container_added": permissions_container_added,
+                "allow_container_added": allow_container_added,
+                "rules": permission_rules,
+            },
         },
-        "skill": _link_plan(home, _skill_path(home, "claude"), _skill_target(prefix)),
+        "skill": (
+            copy.deepcopy(existing_record["skill"])
+            if existing_record is not None
+            else _link_plan(
+                home,
+                _skill_path(home, "claude"),
+                _skill_target(prefix),
+            )
+        ),
     }
     operation = {
         "path": path,
@@ -957,6 +1157,8 @@ def _prepare_claude(home: Path, prefix: Path) -> tuple[dict[str, Any], dict[str,
         "mode": mode,
         "changed": after != before,
         "backup_label": "claude-settings.json",
+        "existing": existing_record is not None,
+        "permission_rules_added": permission_rules_added,
     }
     return record, operation
 
@@ -1381,6 +1583,8 @@ def _validate_claude(
     if not isinstance(fragments, list):
         raise SetupError("invalid Claude hook ownership record")
     expected_groups = _claude_groups(prefix)
+    legacy_groups = _legacy_claude_groups(prefix)
+    seen_events: set[str] = set()
     for fragment in fragments:
         if not isinstance(fragment, dict):
             raise SetupError("invalid Claude hook fragment record")
@@ -1389,7 +1593,11 @@ def _validate_claude(
         added = fragment.get("added")
         if (
             event not in expected_groups
-            or group != expected_groups[event]
+            or event in seen_events
+            or (
+                group != expected_groups[event]
+                and group not in legacy_groups.get(event, ())
+            )
             or not isinstance(added, bool)
             or not isinstance(
                 config["event_containers_added"].get(event),
@@ -1397,6 +1605,7 @@ def _validate_claude(
             )
         ):
             raise SetupError("invalid Claude hook fragment ownership")
+        seen_events.add(event)
         if added_only and not added:
             continue
         groups = hooks.get(event) if isinstance(hooks, dict) else None
@@ -1405,6 +1614,49 @@ def _validate_claude(
             raise SetupError(
                 f"managed Claude {event} hook drift: expected exactly one owned fragment"
             )
+    if seen_events != set(expected_groups):
+        raise SetupError("invalid Claude hook fragment ownership")
+
+    permissions_record = config.get("permissions")
+    if permissions_record is not None:
+        if (
+            not isinstance(permissions_record, dict)
+            or not isinstance(
+                permissions_record.get("permissions_container_added"), bool
+            )
+            or not isinstance(
+                permissions_record.get("allow_container_added"), bool
+            )
+            or not isinstance(permissions_record.get("rules"), list)
+        ):
+            raise SetupError("invalid Claude permission ownership record")
+        expected_rules = set(_claude_permission_rules(prefix))
+        seen_rules: set[str] = set()
+        permissions = value.get("permissions")
+        allow = permissions.get("allow") if isinstance(permissions, dict) else None
+        for item in permissions_record["rules"]:
+            if not isinstance(item, dict):
+                raise SetupError("invalid Claude permission rule ownership")
+            rule = item.get("rule")
+            added = item.get("added")
+            if (
+                not isinstance(rule, str)
+                or rule not in expected_rules
+                or rule in seen_rules
+                or not isinstance(added, bool)
+            ):
+                raise SetupError("invalid Claude permission rule ownership")
+            seen_rules.add(rule)
+            if added_only and not added:
+                continue
+            count = allow.count(rule) if isinstance(allow, list) else 0
+            if count != 1:
+                raise SetupError(
+                    "managed Claude permission drift: expected exactly one "
+                    f"owned rule {rule!r}"
+                )
+        if seen_rules != expected_rules:
+            raise SetupError("invalid Claude permission rule ownership")
     skill = record.get("skill")
     if not isinstance(skill, dict):
         raise SetupError("invalid Claude skill ownership record")
@@ -1639,7 +1891,7 @@ def _apply_prepared(
             path: Path = item["path"]
             _ensure_user_dir(home, path.parent)
             _atomic_write(path, item["payload"], 0o600)
-    if not (harness == "codex" and operation.get("existing")):
+    if not operation.get("existing"):
         _apply_link(home, record["skill"])
 
 
@@ -1668,9 +1920,7 @@ def _apply_mutation_paths(
             paths.extend(
                 item["path"] for item in operation["plists"] if item["changed"]
             )
-        if record["skill"]["added"] and not (
-            harness == "codex" and operation.get("existing")
-        ):
+        if record["skill"]["added"] and not operation.get("existing"):
             paths.append(Path(record["skill"]["path"]))
     if prepared:
         paths.append(_manifest_path(prefix))
@@ -1685,8 +1935,18 @@ def _remove_mutation_paths(
     paths: list[Path] = []
     for harness in selected_owned:
         record = owned[harness]
-        if harness == "claude" and any(
-            fragment["added"] for fragment in record["config"]["fragments"]
+        if harness == "claude" and (
+            any(
+                fragment["added"]
+                for fragment in record["config"]["fragments"]
+            )
+            or any(
+                item.get("added")
+                for item in record["config"].get("permissions", {}).get(
+                    "rules", []
+                )
+                if isinstance(item, dict)
+            )
         ):
             paths.append(Path(record["config"]["path"]))
         elif harness == "hermes" and record["config"]["enabled_added"]:
@@ -1771,17 +2031,41 @@ def _remove_claude(home: Path, record: dict[str, Any]) -> None:
     added_fragments = [
         fragment for fragment in config["fragments"] if fragment["added"]
     ]
-    if added_fragments:
+    permissions_record = config.get("permissions")
+    added_rules = (
+        [item for item in permissions_record["rules"] if item["added"]]
+        if isinstance(permissions_record, dict)
+        else []
+    )
+    if added_fragments or added_rules:
         value, _raw, mode = _load_json_config(path)
-        hooks = value.get("hooks")
-        assert isinstance(hooks, dict)
-        for fragment in added_fragments:
-            groups = hooks[fragment["event"]]
-            groups.remove(fragment["group"])
-            if config["event_containers_added"].get(fragment["event"]) and not groups:
-                hooks.pop(fragment["event"])
-        if config["hooks_container_added"] and not hooks:
-            value.pop("hooks")
+        if added_fragments:
+            hooks = value.get("hooks")
+            assert isinstance(hooks, dict)
+            for fragment in added_fragments:
+                groups = hooks[fragment["event"]]
+                groups.remove(fragment["group"])
+                if (
+                    config["event_containers_added"].get(fragment["event"])
+                    and not groups
+                ):
+                    hooks.pop(fragment["event"])
+            if config["hooks_container_added"] and not hooks:
+                value.pop("hooks")
+        if added_rules:
+            permissions = value.get("permissions")
+            assert isinstance(permissions, dict)
+            allow = permissions.get("allow")
+            assert isinstance(allow, list)
+            for item in added_rules:
+                allow.remove(item["rule"])
+            if permissions_record["allow_container_added"] and not allow:
+                permissions.pop("allow")
+            if (
+                permissions_record["permissions_container_added"]
+                and not permissions
+            ):
+                value.pop("permissions")
         if config["created"] and value == {}:
             path.unlink()
         else:
@@ -1984,6 +2268,17 @@ def _selected(
 def _source_preflight(prefix: Path, harnesses: list[str]) -> None:
     if harnesses:
         _validate_source(_skill_target(prefix), "installed Roundtable skill")
+    if "claude" in harnesses:
+        for command, description in (
+            ("rt-wait-inbox", "Claude inbox wake hook"),
+            ("rt-inbox", "Claude inbox reader"),
+            ("rt-ack", "Claude acknowledgement command"),
+            ("rt-say", "Claude mail sender"),
+        ):
+            _validate_executable(
+                prefix / "bin" / command,
+                f"installed Roundtable {description}",
+            )
     if "hermes" in harnesses:
         _validate_source(
             _hermes_plugin_target(prefix),
@@ -2011,6 +2306,12 @@ def _actions(
             actions.append(f"merge {config['path']}")
         elif config.get("enabled_added"):
             actions.append(f"merge {config['path']}")
+        permissions_record = config.get("permissions")
+        if isinstance(permissions_record, dict):
+            actions.extend(
+                f"allow {rule} in {config['path']}"
+                for rule in config_operation.get("permission_rules_added", [])
+            )
     for key in ("plugin", "skill"):
         item = record.get(key)
         if (
@@ -2051,6 +2352,14 @@ def _codex_needs_upgrade(
     )
 
 
+def _claude_needs_upgrade(
+    record: dict[str, Any],
+    previous: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    return bool(record != previous or operation["changed"])
+
+
 def _plan(
     home: Path,
     prefix: Path,
@@ -2072,7 +2381,23 @@ def _plan(
                 owned[harness],
                 added_only=False,
             )
-            if harness == "codex":
+            if harness == "claude":
+                record, operation = _prepare_claude(
+                    home,
+                    prefix,
+                    existing_record=owned[harness],
+                )
+                if _claude_needs_upgrade(record, owned[harness], operation):
+                    prepared[harness] = (record, operation)
+                    actions = _actions(record, operation)
+                    if actions == ["no changes"]:
+                        actions = ["record existing Claude integration state"]
+                    results[harness] = {
+                        "state": "upgrade_planned",
+                        "actions": actions,
+                    }
+                    continue
+            elif harness == "codex":
                 record, operation = _prepare_codex(
                     home,
                     prefix,
@@ -2139,7 +2464,22 @@ def _status(
             owned[harness],
             added_only=False,
         )
-        if harness == "codex":
+        if harness == "claude":
+            record, operation = _prepare_claude(
+                home,
+                prefix,
+                existing_record=owned[harness],
+            )
+            if _claude_needs_upgrade(record, owned[harness], operation):
+                actions = _actions(record, operation)
+                if actions == ["no changes"]:
+                    actions = ["record existing Claude integration state"]
+                results[harness] = {
+                    "state": "upgrade_required",
+                    "actions": actions,
+                }
+                continue
+        elif harness == "codex":
             record, operation = _prepare_codex(
                 home,
                 prefix,
@@ -2192,7 +2532,16 @@ def _apply(
                 owned[harness],
                 added_only=False,
             )
-            if harness == "codex":
+            if harness == "claude":
+                record, operation = _prepare_claude(
+                    home,
+                    prefix,
+                    existing_record=owned[harness],
+                )
+                if _claude_needs_upgrade(record, owned[harness], operation):
+                    prepared[harness] = (record, operation)
+                    continue
+            elif harness == "codex":
                 record, operation = _prepare_codex(
                     home,
                     prefix,
@@ -2230,7 +2579,7 @@ def _apply(
             record, operation = prepared[harness]
             actions = _actions(record, operation)
             if actions == ["no changes"] and harness in owned:
-                actions = ["record existing Codex integration state"]
+                actions = [f"record existing {harness.title()} integration state"]
             _apply_prepared(harness, home, prefix, record, operation)
             owned[harness] = record
             results[harness] = {"state": "configured", "actions": actions}

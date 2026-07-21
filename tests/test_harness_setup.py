@@ -43,6 +43,9 @@ def installation(tmp_path: Path) -> tuple[Path, Path]:
     for command in (
         "rt-wait-inbox",
         "rt-stop-gate",
+        "rt-inbox",
+        "rt-ack",
+        "rt-say",
         "rt-codex-wake",
         "rt-codex-session-start",
     ):
@@ -196,7 +199,14 @@ def test_clean_apply_status_idempotence_and_remove(
         session_command["timeout"]
         == harness_setup.CLAUDE_HOOK_TIMEOUT_SECONDS
     )
-    assert groups["Stop"]["hooks"][0]["args"] == []
+    stop_command = groups["Stop"]["hooks"][0]
+    assert stop_command["command"] == str(prefix / "bin" / "rt-wait-inbox")
+    assert stop_command["args"] == ["--claude-stop-hook"]
+    assert stop_command["asyncRewake"] is True
+    assert stop_command["timeout"] == harness_setup.CLAUDE_HOOK_TIMEOUT_SECONDS
+    assert settings["permissions"]["allow"] == list(
+        harness_setup._claude_permission_rules(prefix)
+    )
 
     hermes = yaml.safe_load((home / ".hermes" / "config.yaml").read_text())
     assert hermes["plugins"]["enabled"] == ["roundtable"]
@@ -223,6 +233,12 @@ def test_clean_apply_status_idempotence_and_remove(
     manifest_path = prefix / "harness-setup.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["schema"] == "roundtable.harness-setup.v1"
+    claude_permissions = manifest["harnesses"]["claude"]["config"][
+        "permissions"
+    ]
+    assert claude_permissions["permissions_container_added"] is True
+    assert claude_permissions["allow_container_added"] is True
+    assert all(item["added"] is True for item in claude_permissions["rules"])
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
     marker_path = harness_setup._codex_reload_marker_path(prefix)
     marker = json.loads(marker_path.read_text())
@@ -410,6 +426,235 @@ def test_existing_configuration_is_backed_up_and_preserved_exactly(
     assert remaining_hermes["plugins"]["enabled"] == ["personal"]
     assert claude_skill.is_symlink()
     assert hermes_plugin.is_symlink()
+
+
+def test_claude_permissions_preserve_preexisting_rules_on_remove(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    rules = harness_setup._claude_permission_rules(prefix)
+    path = home / ".claude" / "settings.json"
+    path.parent.mkdir()
+    original = {
+        "permissions": {
+            "allow": [rules[0], "Bash(rt-wait-inbox:*)"],
+            "defaultMode": "default",
+        }
+    }
+    path.write_text(json.dumps(original))
+
+    code, _result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+    manifest = json.loads((prefix / "harness-setup.json").read_text())
+    permission_record = manifest["harnesses"]["claude"]["config"][
+        "permissions"
+    ]
+    assert [item["added"] for item in permission_record["rules"]] == [
+        False,
+        True,
+        True,
+    ]
+
+    code, _removed = _run(
+        capsys, home, prefix, "remove", "--harness", "claude"
+    )
+    assert code == 0
+    assert json.loads(path.read_text()) == original
+
+
+def test_claude_legacy_stop_and_permissions_upgrade_in_place(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    code, _result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+
+    settings_path = home / ".claude" / "settings.json"
+    manifest_path = prefix / "harness-setup.json"
+    settings = json.loads(settings_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    current_stop = harness_setup._claude_groups(prefix)["Stop"]
+    legacy_stop = harness_setup._legacy_claude_groups(prefix)["Stop"][0]
+    assert settings["hooks"]["Stop"] == [current_stop]
+    settings["hooks"]["Stop"] = [legacy_stop]
+    settings.pop("permissions")
+    claude_config = manifest["harnesses"]["claude"]["config"]
+    stop_record = next(
+        item for item in claude_config["fragments"] if item["event"] == "Stop"
+    )
+    stop_record["group"] = legacy_stop
+    claude_config.pop("permissions")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    before = _tree_snapshot(home)
+    code, status = _run(
+        capsys, home, prefix, "status", "--harness", "claude"
+    )
+    assert code == 0
+    assert status["harnesses"]["claude"]["state"] == "upgrade_required"
+    assert _tree_snapshot(home) == before
+
+    code, plan = _run(
+        capsys, home, prefix, "plan", "--harness", "claude"
+    )
+    assert code == 0
+    assert plan["writes"] is False
+    assert plan["harnesses"]["claude"]["state"] == "upgrade_planned"
+    assert len(
+        [
+            action
+            for action in plan["harnesses"]["claude"]["actions"]
+            if action.startswith("allow Bash(")
+        ]
+    ) == 3
+    assert _tree_snapshot(home) == before
+
+    code, applied = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+    assert applied["writes"] is True
+    upgraded = json.loads(settings_path.read_text())
+    assert upgraded["hooks"]["Stop"] == [current_stop]
+    assert upgraded["permissions"]["allow"] == list(
+        harness_setup._claude_permission_rules(prefix)
+    )
+    upgraded_manifest = json.loads(manifest_path.read_text())
+    upgraded_stop = next(
+        item
+        for item in upgraded_manifest["harnesses"]["claude"]["config"][
+            "fragments"
+        ]
+        if item["event"] == "Stop"
+    )
+    assert upgraded_stop["group"] == current_stop
+    assert upgraded_stop["added"] is True
+
+    code, repeated = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+    assert repeated["writes"] is False
+
+
+def test_claude_legacy_preexisting_stop_is_not_claimed_for_upgrade(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    code, _result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+    settings_path = home / ".claude" / "settings.json"
+    manifest_path = prefix / "harness-setup.json"
+    settings = json.loads(settings_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    legacy_stop = harness_setup._legacy_claude_groups(prefix)["Stop"][0]
+    settings["hooks"]["Stop"] = [legacy_stop]
+    settings.pop("permissions")
+    config = manifest["harnesses"]["claude"]["config"]
+    config["created"] = False
+    config["hooks_container_added"] = False
+    config["event_containers_added"]["Stop"] = False
+    stop_record = next(
+        item for item in config["fragments"] if item["event"] == "Stop"
+    )
+    stop_record["group"] = legacy_stop
+    stop_record["added"] = False
+    config.pop("permissions")
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    before = _tree_snapshot(home)
+
+    code, result = _run(
+        capsys, home, prefix, "plan", "--harness", "claude"
+    )
+
+    assert code == 2
+    assert "cannot replace pre-existing legacy Claude Stop hook" in result["error"]
+    assert _tree_snapshot(home) == before
+
+
+def test_claude_owned_permission_drift_fails_closed(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    code, _result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+    assert code == 0
+    path = home / ".claude" / "settings.json"
+    settings = json.loads(path.read_text())
+    settings["permissions"]["allow"].remove(
+        harness_setup._claude_permission_rules(prefix)[1]
+    )
+    path.write_text(json.dumps(settings))
+    before = _tree_snapshot(home)
+
+    code, status = _run(
+        capsys, home, prefix, "status", "--harness", "claude"
+    )
+    assert code == 2
+    assert "managed Claude permission drift" in status["error"]
+    assert _tree_snapshot(home) == before
+
+    code, removed = _run(
+        capsys, home, prefix, "remove", "--harness", "claude"
+    )
+    assert code == 2
+    assert "managed Claude permission drift" in removed["error"]
+    assert _tree_snapshot(home) == before
+
+
+@pytest.mark.parametrize("policy_rule", ["Bash", "Bash(*)"])
+def test_claude_permission_conflict_fails_before_writes(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+    policy_rule: str,
+) -> None:
+    home, prefix = installation
+    path = home / ".claude" / "settings.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"permissions": {"ask": [policy_rule]}}))
+    before = _tree_snapshot(home)
+
+    code, result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+
+    assert code == 2
+    assert "ask/deny rules override" in result["error"]
+    assert "/permissions" in result["error"]
+    assert _tree_snapshot(home) == before
+
+
+def test_claude_disabled_hooks_fail_before_writes(
+    installation: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, prefix = installation
+    path = home / ".claude" / "settings.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"disableAllHooks": True}))
+    before = _tree_snapshot(home)
+
+    code, result = _run(
+        capsys, home, prefix, "apply", "--harness", "claude"
+    )
+
+    assert code == 2
+    assert "disableAllHooks=true" in result["error"]
+    assert "/hooks" in result["error"]
+    assert _tree_snapshot(home) == before
 
 
 def test_unrelated_changes_survive_exact_fragment_removal(

@@ -181,6 +181,13 @@ when no Codex harness lease record exists anywhere in that project; the guard
 remains held through binding or `turn/start`, so a legacy action and the first
 unified claim also have a deterministic order.
 
+Claude's automatically approved mail actions are not ambient PATH authority.
+The hook names the installed wrappers by absolute path, and each fenced inbox,
+acknowledgement, or send operation revalidates all four launcher fields against
+the current active lease before touching project mail. Its host-local wake
+state also records the last pending filename generation and bounded attempt
+count, preventing one undrained generation from causing an infinite wake loop.
+
 Heartbeat reports adapter health; it is not by itself permission to steal a
 seat. On the same host, owner PID plus a process-start fingerprint protects
 against PID reuse and is the primary liveness proof. An unexpired-looking
@@ -204,6 +211,10 @@ native-session resume, the new process still receives a new Roundtable session
 ID and lease revision; only `native_session_id` is reused. P0 exposes only the
 fresh path until each harness's native resume flow and project-root validation
 have passed real end-to-end tests.
+
+For anchored Claude with no explicit native arguments, the launcher implements
+that fresh-session rule with a new UUID passed as `--session-id`. Explicit
+Claude arguments and unanchored native startup remain unchanged.
 
 The mailbox remains addressed by stable `agent_id`, so queued mail survives a
 session replacement and is drained by the new owner. Historical native IDs

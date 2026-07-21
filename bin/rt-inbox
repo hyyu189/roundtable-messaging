@@ -3,6 +3,8 @@ import argparse
 import json
 import os
 import re
+import stat
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from _rtlib import (
     find_project_root,
     load_agents_doc,
     read_records,
+    require_fenced_seat,
 )
 
 ROOT = find_project_root("rt-inbox")
@@ -30,6 +33,16 @@ def parse_args():
     parser = argparse.ArgumentParser(prog="rt-inbox")
     parser.add_argument("agent", nargs="?", help="agent or instance to inspect; defaults to inferred sender")
     parser.add_argument("--all", action="store_true", help="include acked messages")
+    parser.add_argument(
+        "--fenced",
+        action="store_true",
+        help="require the current Roundtable launcher lease",
+    )
+    parser.add_argument(
+        "--archive-quiet-acks",
+        action="store_true",
+        help="archive validated quiet acknowledgements for the fenced seat",
+    )
     parser.add_argument("-f", "--format", choices=("text", "json"), default="text")
     return parser.parse_args()
 
@@ -168,6 +181,71 @@ def read_maildir_records():
     return records
 
 
+def _fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def archive_quiet_acks(agent):
+    inbox = INBOX_DIR / agent
+    new_dir = inbox / "new"
+    cur_dir = inbox / "cur"
+    for directory in (INBOX_DIR, inbox, new_dir):
+        if directory.is_symlink():
+            raise SystemExit(f"rt-inbox: maildir path is a symlink: {directory}")
+        if directory.exists() and not directory.is_dir():
+            raise SystemExit(
+                f"rt-inbox: maildir path is not a directory: {directory}"
+            )
+    if not new_dir.exists():
+        return 0
+    cur_dir.mkdir(parents=True, exist_ok=True)
+    if cur_dir.is_symlink() or not cur_dir.is_dir():
+        raise SystemExit(f"rt-inbox: invalid archive directory: {cur_dir}")
+
+    candidates = [
+        Path(record["maildir_path"])
+        for record in read_maildir_records()
+        if record.get("to") == agent
+        and record.get("kind") == "sync-ack"
+        and Path(record.get("maildir_path", "")).parent == new_dir
+    ]
+    archived = 0
+    for source in candidates:
+        destination = cur_dir / source.name
+        try:
+            source_info = source.lstat()
+            if not stat.S_ISREG(source_info.st_mode):
+                raise OSError(f"quiet acknowledgement is not a regular file: {source}")
+            try:
+                destination_info = destination.lstat()
+            except FileNotFoundError:
+                destination_info = None
+            if destination_info is None:
+                os.link(source, destination, follow_symlinks=False)
+                _fsync_directory(cur_dir)
+            elif (
+                not stat.S_ISREG(destination_info.st_mode)
+                or (source_info.st_dev, source_info.st_ino)
+                != (destination_info.st_dev, destination_info.st_ino)
+            ):
+                raise FileExistsError(
+                    f"refusing to overwrite quiet acknowledgement archive: "
+                    f"{destination}"
+                )
+            source.unlink()
+            _fsync_directory(new_dir)
+            archived += 1
+        except OSError as error:
+            raise SystemExit(
+                f"rt-inbox: failed to archive quiet acknowledgement: {error}"
+            ) from None
+    return archived
+
+
 def visible_records(agent, include_all):
     ledger_records = read_records(MSG_DIR)
     maildir_records = read_maildir_records()
@@ -232,7 +310,21 @@ def print_text(records):
 
 def main():
     args = parse_args()
-    agent = (args.agent or infer_agent()).lower()
+    if args.archive_quiet_acks and not args.fenced:
+        raise SystemExit("rt-inbox: --archive-quiet-acks requires --fenced")
+    fenced_agent = require_fenced_seat(ROOT, "rt-inbox") if args.fenced else ""
+    agent = (args.agent or fenced_agent or infer_agent()).lower()
+    if fenced_agent and agent != fenced_agent:
+        raise SystemExit(
+            f"rt-inbox: fenced seat {fenced_agent} cannot inspect {agent}"
+        )
+    if args.archive_quiet_acks:
+        archived = archive_quiet_acks(agent)
+        if archived:
+            print(
+                f"rt-inbox: archived {archived} quiet acknowledgement(s)",
+                file=sys.stderr,
+            )
     records = visible_records(agent, args.all)
     if args.format == "json":
         print(json.dumps(records, ensure_ascii=False, indent=2))

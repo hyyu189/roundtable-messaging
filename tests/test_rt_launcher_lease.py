@@ -106,6 +106,81 @@ def test_anchored_launcher_claims_seat_and_exports_lease_environment(
     }
 
 
+def test_bare_claude_launcher_forces_a_fresh_native_chat(tmp_path, monkeypatch):
+    project = write_project(
+        tmp_path / "project", agent_id="claude", harness="claude-code"
+    )
+    fake_binary = tmp_path / "claude"
+    native_session_id = "7f7c1e26-7632-4f66-bc5e-14ec57c61001"
+    observed = {}
+
+    clear_lease_environment(monkeypatch)
+    monkeypatch.setenv("RT_FROM", "claude")
+    monkeypatch.setattr(
+        _rtlauncher, "choose_launch_cwd", lambda _harness: project
+    )
+    monkeypatch.setattr(_rtlauncher.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(
+        _rtlauncher, "harness_bin", lambda _harness: fake_binary
+    )
+    monkeypatch.setattr(
+        _rtlauncher,
+        "claim",
+        lambda root, agent_id, _harness: lease(root, agent_id),
+    )
+    monkeypatch.setattr(
+        _rtlauncher.uuid,
+        "uuid4",
+        lambda: native_session_id,
+    )
+
+    def fake_execv(program, command):
+        observed.update(program=program, command=command)
+        raise ExecCalled
+
+    monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
+
+    with pytest.raises(ExecCalled):
+        _rtlauncher.launch("claude", [])
+
+    assert observed == {
+        "program": str(fake_binary),
+        "command": [str(fake_binary), "--session-id", native_session_id],
+    }
+
+
+def test_unanchored_bare_claude_preserves_native_startup_mode(
+    tmp_path, monkeypatch
+):
+    fake_binary = tmp_path / "claude"
+    observed = {}
+
+    clear_lease_environment(monkeypatch)
+    monkeypatch.setattr(
+        _rtlauncher, "choose_launch_cwd", lambda _harness: None
+    )
+    monkeypatch.setattr(
+        _rtlauncher, "project_at_or_above", lambda _cwd: None
+    )
+    monkeypatch.setattr(
+        _rtlauncher, "harness_bin", lambda _harness: fake_binary
+    )
+
+    def fake_execv(program, command):
+        observed.update(program=program, command=command)
+        raise ExecCalled
+
+    monkeypatch.setattr(_rtlauncher.os, "execv", fake_execv)
+
+    with pytest.raises(ExecCalled):
+        _rtlauncher.launch("claude", [])
+
+    assert observed == {
+        "program": str(fake_binary),
+        "command": [str(fake_binary)],
+    }
+
+
 @pytest.mark.parametrize(
     ("argv", "expected_args"),
     [

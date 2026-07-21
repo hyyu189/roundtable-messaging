@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _rtlib import find_project_root, load_agents_doc
+from _rtlib import find_project_root, load_agents_doc, require_fenced_seat
 
 TOOL_DIR = Path(__file__).resolve().parent
 
@@ -31,7 +31,8 @@ LEGACY_OPERATION_ACTIVE = False
 
 def usage():
     print(
-        "usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] "
+        "usage: rt-say [--verbose] [--fenced] "
+        "[--no-nudge | --legacy-nudge-only] "
         "<agent-or-instance> <kind> <body...>",
         file=sys.stderr,
     )
@@ -40,13 +41,14 @@ def usage():
 
 def print_help():
     print(
-        """usage: rt-say [--verbose] [--no-nudge | --legacy-nudge-only] <agent-or-instance> <kind> <body...>
+        """usage: rt-say [--verbose] [--fenced] [--no-nudge | --legacy-nudge-only] <agent-or-instance> <kind> <body...>
 
 Deliver a roundtable message through the project's maildir. A successful atomic
 write to inbox/<agent>/new is successful delivery and exits 0. Normal delivery
 does not require a topology map and never touches the keyboard.
 
 options:
+  --fenced             require the current Roundtable launcher lease; use with --no-nudge
   --no-nudge           compatibility alias; normal delivery is already maildir-only
   --legacy-nudge-only  emergency legacy cmux path; do not write maildir; failures exit 3
   --verbose            print route and submit details
@@ -495,17 +497,29 @@ def main():
     if "--verbose" in args:
         verbose = True
         args = [arg for arg in args if arg != "--verbose"]
+    fenced = "--fenced" in args
+    if args.count("--fenced") > 1:
+        print("rt-say: --fenced may be supplied only once", file=sys.stderr)
+        raise SystemExit(2)
     explicit_no_nudge = "--no-nudge" in args
     legacy_nudge_only = "--legacy-nudge-only" in args
     if explicit_no_nudge and legacy_nudge_only:
         print("rt-say: --no-nudge and --legacy-nudge-only are mutually exclusive", file=sys.stderr)
         raise SystemExit(2)
-    args = [arg for arg in args if arg not in {"--no-nudge", "--legacy-nudge-only"}]
+    if fenced and not explicit_no_nudge:
+        print("rt-say: --fenced requires --no-nudge", file=sys.stderr)
+        raise SystemExit(2)
+    args = [
+        arg
+        for arg in args
+        if arg not in {"--fenced", "--no-nudge", "--legacy-nudge-only"}
+    ]
     if len(args) < 2:
         usage()
     target = args[0].lower()
     kind = args[1]
     body_arg = " ".join(args[2:])
+    fenced_agent = require_fenced_seat(ROOT, "rt-say") if fenced else ""
     ack_mode = os.environ.get("RT_ACK_MODE") == "1"
     if kind == "sync-ack" and not ack_mode:
         raise SystemExit("rt-say: sync-ack is reserved for rt-ack; use rt-ack <msg_id>[,<msg_id>...] [body]")
@@ -533,7 +547,7 @@ def main():
         # Launchers inject RT_FROM; Codex app-server turns expose
         # CODEX_THREAD_ID. The compatibility --no-nudge flag is intentionally
         # identical to the normal maildir path.
-        sender = explicit_sender or infer_sender_from_harness_env(ROOT)
+        sender = fenced_agent or explicit_sender or infer_sender_from_harness_env(ROOT)
     else:
         runtime = read_runtime()
         # Preserve WP1 caller authority: a live cmux caller wins over all

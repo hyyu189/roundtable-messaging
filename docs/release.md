@@ -176,3 +176,13 @@ and automatic binding have passed on the development machine. Clean-account
 repetition and full credentialed wake E2E have not yet passed. They must not be
 presented in a video, README support table, or Devpost submission as completed
 evidence.
+
+On 2026-07-21, the installed RC7/0.1.4 Hermes TUI on the development host
+passed two sequential message generations in one freshly started session.
+Message `20260721T205151Z-codex-to-hermes-86049` was acknowledged and answered
+`RC7_A_OK`; after re-arm,
+`20260721T205253Z-codex-to-hermes-87191` was independently acknowledged and
+answered `RC7_B_OK`. The live terminal observation establishes the second
+wake; the durable records establish both deliveries, replies, acknowledgements,
+and final archive state. This is development-host RC7 evidence, not an RC8
+artifact, clean-account, or terminal-matrix support claim.

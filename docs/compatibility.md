@@ -12,8 +12,8 @@ real vendor session can wake.
 
 | Harness | Packaged and automated | Still required before support promotion |
 | --- | --- | --- |
-| Claude Code | Global skill link; owned SessionStart inbox hook; owned Stop drain gate; plan/apply/status/remove tests | Clean-account skill discovery and real send-to-wake-to-drain/ack |
-| Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests | Clean-account plugin load/injection and real send-to-wake-to-drain/ack |
+| Claude Code | Global skill link; owned asynchronous SessionStart/Stop watchers; absolute lease-fenced mail permissions; plan/apply/status/remove tests | RC8 artifact and clean-account real send-to-wake-to-drain/ack |
+| Hermes | Global skill link; packaged lifecycle plugin; marked plugin enablement; plan/apply/status/remove tests; two sequential RC7 development-host wake generations | RC8 artifact and clean-account plugin/wake repeat |
 | Codex | Shared executable resolver; global skill link; owned SessionStart auto-bind hook; owned app-server and wake plist generation; fail-closed service preflight tests; development-host cutover and thread/lease identity spike | Clean-account repeat and real send-to-wake-to-drain/ack |
 
 The Codex plist files are written but not loaded by setup. This is an
@@ -83,6 +83,49 @@ configuration must select its identity explicitly, for example
 and does not require a cmux surface, so it works in ordinary terminal apps.
 The cmux topology commands remain optional integration tools; full tmux support
 is not claimed until its end-to-end gate passes.
+
+## Claude lifecycle and unattended drain
+
+For an anchored bare Claude launch, Roundtable supplies a fresh
+`--session-id <UUID>`. This makes the P0 default a new, addressable chat even
+when the user's native startup preference is Remote Control/FleetView. An
+unanchored launch or any explicit native arguments keep Claude's native
+behavior unchanged.
+
+The owned SessionStart hook matches `startup|resume|clear|compact` and starts
+the first `asyncRewake` inbox watcher. After a normal completed turn, the owned
+Stop hook normally starts its successor. A pending non-ack filename generation
+receives one initial wake and at most one Stop-hook retry. If that exact
+generation remains undrained, automatic re-wake pauses to prevent a model-turn
+loop; a changed generation receives a fresh bounded attempt set. Durable mail
+remains in `new/` throughout.
+
+Setup owns only these absolute command rules:
+
+```text
+Bash(<prefix>/bin/rt-inbox --fenced --archive-quiet-acks -f json)
+Bash(<prefix>/bin/rt-ack --fenced *)
+Bash(<prefix>/bin/rt-say --fenced --no-nudge *)
+```
+
+Every `--fenced` action revalidates the canonical project, agent, session ID,
+lease revision, and current active lease. The send rule requires `--no-nudge`,
+so it cannot select the archived keyboard route. The fenced inbox operation
+also archives validated quiet `sync-ack` files for that seat before listing
+normal mail.
+
+Setup fails before writing when the same `~/.claude/settings.json` contains a
+matching `permissions.ask`/`permissions.deny` rule or
+`disableAllHooks: true`. It does not rewrite those user choices. Organization
+policy, project/local settings, or command-line policy can still override the
+user file, so live acceptance remains the final proof.
+
+Claude does not run Stop after a user interrupt, and API failures use
+StopFailure, whose output and exit status cannot perform this asynchronous
+re-wake. After either event the watcher can remain unarmed until a later normal
+interaction, resume, or restart. Mail is still durable and diagnostics expose
+the unhealthy adapter; fully autonomous recovery from those failures is a
+post-P0 improvement.
 
 ## Readiness contract
 

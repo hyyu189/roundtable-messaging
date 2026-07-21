@@ -9,8 +9,10 @@ harnesses through native mechanisms instead of injecting keystrokes.
 > tests. The result is a release candidate, not yet a public support claim: the
 > npm Codex cold start and the corrected launchd-to-socket-peer identity check
 > have passed on the development machine. The installed RC5 also passed the
-> SessionStart thread/lease identity and automatic-binding spike. Real
-> credentialed harness wake tests and the mainstream terminal matrix remain
+> SessionStart thread/lease identity and automatic-binding spike. An installed
+> RC7 Hermes TUI passed two sequential real wake/drain/reply generations on the
+> development host. RC8 artifact repetition, clean-account tests, the other
+> credentialed harness wake paths, and the mainstream terminal matrix remain
 > promotion gates.
 
 ## Why it exists
@@ -61,8 +63,8 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | --- | --- |
 | Installer runtime | Requires an existing CPython 3.11–3.14; the installer discovers versioned executables on PATH, while the archive bundles package dependencies but not the interpreter |
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
-| Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
-| Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
+| Claude Code | Owned global skill, asynchronous SessionStart/Stop watchers, and absolute lease-fenced mail permissions are packaged and configuration-tested; RC8 artifact and clean-account wake E2E remain release gates |
+| Hermes | Owned global skill and plugin links are packaged and configuration-tested; two sequential RC7 development-host wake generations passed, while RC8 artifact and clean-account repeats remain release gates |
 | npm Codex CLI `0.144.6` | Exact-release protocol smoke, live RC5 cutover, cold start, launchd-to-socket-peer identity, SessionStart thread/lease identity, auto-bind, and isolated upgrade pass; full credentialed wake E2E remains a release gate |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
