@@ -157,10 +157,11 @@ Before tagging or attaching the archive to a public release:
    `plan -> apply -> status -> remove --unload-codex` setup cycle;
 3. clean-account Claude and Hermes setup passes skill discovery, lifecycle
    hook, tripwire, and real send-to-wake-to-drain/ack acceptance;
-4. npm Codex `0.144.6` passes the coordinated default-daemon reload, verifies
-   that trusted SessionStart `session_id` matches the app-server thread and the
-   private runtime launch intent resolves to the same current fenced lease,
-   then completes real send-to-wake-to-drain/ack acceptance;
+4. npm Codex `0.144.6` passes the coordinated default-daemon reload, proves the
+   socket peer belongs to the exact Roundtable LaunchAgent process tree,
+   verifies that trusted SessionStart `session_id` matches the app-server
+   thread and the private runtime launch intent resolves to the same current
+   fenced lease, then completes real send-to-wake-to-drain/ack acceptance;
 5. standalone Codex passes that same acceptance before support is claimed;
 6. the same harness acceptance passes in Terminal.app, iTerm2, and Ghostty;
 7. the five-minute judge path creates or adopts a non-Git directory, launches
@@ -168,6 +169,8 @@ Before tagging or attaching the archive to a public release:
 8. `README.md`, `docs/compatibility.md`, provenance, and Devpost copy describe
    only the gates that actually passed.
 
-At this release-candidate stage, the Codex hook identity spike has not yet run.
-It must not be presented in a video, README support table, or Devpost
-submission as completed evidence.
+At this release-candidate stage, the npm cold start and corrected
+launchd-to-socket-peer identity gate have passed on the development machine.
+The RC4 upgrade, Codex SessionStart identity spike, and full wake E2E have not
+yet passed. They must not be presented in a video, README support table, or
+Devpost submission as completed evidence.

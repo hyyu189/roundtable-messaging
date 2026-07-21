@@ -147,16 +147,26 @@ def test_doctor_skips_codex_services_but_keeps_runtime_checks_without_codex(
     assert observed == ["bind-queue", "project-health", "hook-trust"]
 
 
-def test_doctor_fails_daemon_when_managed_codex_path_differs(
+@pytest.mark.parametrize(
+    ("reported_socket", "expected_detail"),
+    [
+        (None, "not owned by the Roundtable LaunchAgent"),
+        ([], "reported socket []"),
+    ],
+)
+def test_doctor_fails_daemon_when_roundtable_owner_is_unproven_or_malformed(
     tmp_path,
     monkeypatch,
     capsys,
+    reported_socket,
+    expected_detail,
 ):
     socket_path = tmp_path / "app.sock"
     daemon = {
         "status": "running",
-        "socketPath": str(socket_path),
+        "socketPath": str(socket_path) if reported_socket is None else reported_socket,
         "managedCodexPath": "/tmp/old-codex",
+        "managedCodexVersion": None,
         "cliVersion": "0.144.6",
         "appServerVersion": "0.144.6",
     }
@@ -182,8 +192,12 @@ def test_doctor_fails_daemon_when_managed_codex_path_differs(
     monkeypatch.setattr(doctor, "daemon_version", lambda *_a: (daemon, ""))
     monkeypatch.setattr(
         doctor,
-        "daemon_managed_codex_paths",
-        lambda _daemon: (Path("/tmp/current-codex"), Path("/tmp/old-codex")),
+        "require_daemon_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError(
+                "Unix socket peer is not owned by the Roundtable LaunchAgent process tree"
+            )
+        ),
     )
     monkeypatch.setattr(doctor, "socket_check", lambda *_a: (True, "safe"))
     monkeypatch.setattr(doctor, "probe_handshake", lambda *_a: (True, "ready"))
@@ -197,8 +211,7 @@ def test_doctor_fails_daemon_when_managed_codex_path_differs(
     output = capsys.readouterr().out
     assert code == 1
     assert "FAIL daemon:" in output
-    assert "managed Codex path mismatch" in output
-    assert "selected=/tmp/current-codex daemon=/tmp/old-codex" in output
+    assert expected_detail in output
 
 
 @pytest.mark.parametrize(

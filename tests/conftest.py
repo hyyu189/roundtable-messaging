@@ -26,6 +26,16 @@ os.environ["RT_RUNTIME_DIR"] = str(_TEST_RUNTIME)
 os.environ["RT_CODEX_RUNTIME_DIR"] = str(_TEST_RUNTIME)
 os.environ["RT_PROJECTS_FILE"] = str(_TEST_ROOT / "projects.yaml")
 os.environ["RT_LAUNCH_AGENTS_DIR"] = str(_TEST_HOME / "Library" / "LaunchAgents")
+# Installed launchers export this into child shells.  Tests import modules from
+# the checkout and must never inherit an installed prefix or its live markers.
+os.environ.pop("ROUNDTABLE_INSTALL_PREFIX", None)
+for name in (
+    "RT_CODEX_BIN",
+    "CODEX_THREAD_ID",
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_MANAGED_PACKAGE_ROOT",
+):
+    os.environ.pop(name, None)
 # A missed mock must fail without reaching the user's launchd domain.
 os.environ["RT_LAUNCHCTL"] = "/usr/bin/false"
 

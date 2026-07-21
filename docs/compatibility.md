@@ -73,16 +73,29 @@ Codex wake is ready only when all of the following are true:
 - the selected CLI is an explicitly validated release;
 - the daemon reports `running`;
 - the requested and reported Unix sockets match;
-- the daemon's `managedCodexPath` exactly identifies the selected executable;
+- the daemon response has the validated required fields and does not claim a
+  foreign Codex-managed lifecycle backend;
+- the owned/current app-server plist matches the selected executable and the
+  live Roundtable LaunchAgent reports that same program, arguments, and
+  critical environment;
+- Darwin's kernel-reported Unix-socket peer PID is that LaunchAgent process or
+  one of its same-user descendants, and the LaunchAgent PID is stable across
+  the check;
 - the daemon's CLI and app-server versions both equal the selected CLI version;
+- when the selected executable actually is Codex's standalone management slot,
+  its reported managed version also equals the selected version;
 - no authenticated, digest-bound setup marker says the current app-server
   plist is still awaiting activation or reload;
 - the wake heartbeat reports the fingerprint of the currently installed bridge
   and its local dependencies;
 - the WebSocket-over-Unix-socket `initialize` / `initialized` handshake works.
 
-Handshake liveness alone is not readiness. A daemon left running after a CLI
-upgrade fails closed until it is reloaded and revalidated.
+`managedCodexPath` and `managedCodexVersion` are schema-checked metadata, not a
+general process-identity proof: Codex 0.144.6 always reports the fixed
+`$CODEX_HOME/packages/standalone/current/codex` management slot, even when the
+responsive app-server was launched from npm by Roundtable. Handshake liveness
+alone is not readiness. A daemon left running after a CLI upgrade fails closed
+until it is reloaded and revalidated.
 
 Future Codex releases are not accepted through an open-ended minimum version.
 The app-server is an experimental integration surface, so each release is added
@@ -157,14 +170,15 @@ is followed by the complete credentialed send-to-wake-to-drain/ack gate.
 | Codex distribution | CLI | App-server | Result |
 | --- | ---: | ---: | --- |
 | npm | `0.144.6` | isolated `0.144.6` | `initialize`, thread read/list, hooks list, and turn-history protocol smoke passed |
-| npm | `0.144.6` | existing default daemon `0.144.5` | rejected as stale; the development machine has not yet performed the coordinated cutover or live hook/E2E gate |
+| npm | `0.144.6` | Roundtable launchd `0.144.6` | live cold start passed; RC4 source proved launchd-to-socket-peer ownership after correcting the fixed standalone-slot metadata assumption; RC4 upgrade and wake E2E remain pending |
 | standalone | not installed | not installed | resolver and fixtures only; support is not yet claimed |
 | any future or unlisted release | any | any | rejected until explicitly validated |
 
-Before the Build Week release, npm `0.144.6` still needs the clean default
-daemon and real send-to-wake-to-drain/ack gate. Standalone support requires an
-official standalone installation followed by the same gate; an app-bundled
-internal Codex binary does not qualify as the standalone distribution.
+Before the Build Week release, npm `0.144.6` still needs the RC4 in-place
+upgrade plus the real SessionStart and send-to-wake-to-drain/ack gate.
+Standalone support requires an official standalone installation followed by
+the same gate; an app-bundled internal Codex binary does not qualify as the
+standalone distribution.
 
 ## Terminal acceptance matrix
 
@@ -204,3 +218,10 @@ under `~/.local/bin` on macOS and Linux. The public CLI supports `--remote` with
 Unix-socket endpoints. OpenAI currently labels `codex app-server` experimental,
 so Roundtable intentionally keeps an exact compatibility matrix instead of
 assuming semver compatibility.
+
+For the pinned 0.144.6 implementation, Codex constructs
+[`managedCodexPath` from the fixed standalone slot](https://github.com/openai/codex/blob/5d1fbf26c43abc65a203928b2e31561cb039e06d/codex-rs/app-server-daemon/src/managed_install.rs#L19-L64)
+and [probes `managedCodexVersion` from that path](https://github.com/openai/codex/blob/5d1fbf26c43abc65a203928b2e31561cb039e06d/codex-rs/app-server-daemon/src/lib.rs#L443-L454)
+independently of the socket-serving process. Roundtable therefore treats those
+fields as management-slot metadata and authenticates its externally managed
+server through launchd plus Darwin's Unix-socket peer PID.

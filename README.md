@@ -7,8 +7,10 @@ harnesses through native mechanisms instead of injecting keystrokes.
 > Build status: the source installer and deterministic offline release archive
 > pass automated clean-home install, setup, core smoke, and uninstall
 > tests. The result is a release candidate, not yet a public support claim: the
-> Codex SessionStart identity spike has not run, and real credentialed harness
-> wake tests plus the mainstream terminal matrix remain promotion gates.
+> npm Codex cold start and the corrected launchd-to-socket-peer identity check
+> have passed on the development machine. The SessionStart identity spike,
+> real credentialed harness wake tests, and the mainstream terminal matrix
+> remain promotion gates.
 
 ## Why it exists
 
@@ -60,7 +62,7 @@ All productization work begun in this public repository is GPT-5.6/Codex-led.
 | Terminal.app, iTerm2, and Ghostty | One first-class terminal baseline; automated core smoke passes, full harness wake UX matrix remains a release gate |
 | Claude Code | Owned global skill links plus SessionStart and Stop hooks are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
 | Hermes | Owned global skill and plugin links are packaged and configuration-tested; real clean-account wake E2E remains a release gate |
-| npm Codex CLI `0.144.6` | Exact-release protocol smoke and automated service/auto-bind coverage pass; live hook identity, coordinated cutover, and full wake E2E remain release gates |
+| npm Codex CLI `0.144.6` | Exact-release protocol smoke, live cold start, launchd-to-socket-peer identity, and automated service/auto-bind coverage pass; RC4 upgrade, live hook identity, and full wake E2E remain release gates |
 | Codex standalone | Canonical resolver path implemented; not yet claimed as supported because no standalone install has completed the live gate |
 | cmux | The same baseline plus optional project/workspace topology, diagnostics, and notifications |
 | tmux and cross-host SSH | Not yet supported |

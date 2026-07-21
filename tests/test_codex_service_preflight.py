@@ -50,11 +50,17 @@ def test_ready_probe_is_structured_and_requires_no_output(monkeypatch, capsys):
     daemon = {
         "status": "running",
         "socketPath": str(socket_path),
-        "managedCodexPath": str(selected_codex),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": None,
         "cliVersion": "0.144.6",
         "appServerVersion": "0.144.6",
     }
     monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
     monkeypatch.setattr(_rtcodex, "daemon_version", lambda _path: (daemon, ""))
     monkeypatch.setattr(
         _rtcodex,
@@ -109,14 +115,15 @@ def test_installed_pre_hook_manifest_fails_closed_before_service_probe(
     assert probes == []
 
 
-@pytest.mark.parametrize("reported", [None, "/tmp/roundtable-other-codex"])
-def test_responsive_daemon_requires_selected_managed_codex_path(
+@pytest.mark.parametrize("managed_version", [None, "0.143.0"])
+def test_responsive_npm_daemon_uses_launchd_owner_not_managed_slot(
     monkeypatch,
-    reported,
+    managed_version,
 ):
     socket_path = Path("/tmp/roundtable-managed-path.sock")
-    selected_codex = Path("/tmp/roundtable-current-codex")
+    selected_codex = Path("/tmp/npm/bin/codex")
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setattr(_rtcodex, "INSTALL_PREFIX", None)
     monkeypatch.setattr(_rtcodex, "require_default_socket", lambda _path: None)
     monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
     monkeypatch.setattr(_rtcodex, "_setup_manifest", lambda: {})
@@ -137,22 +144,109 @@ def test_responsive_daemon_requires_selected_managed_codex_path(
     daemon = {
         "status": "running",
         "socketPath": str(socket_path),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": managed_version,
         "cliVersion": "0.144.6",
         "appServerVersion": "0.144.6",
     }
-    if reported is not None:
-        daemon["managedCodexPath"] = reported
     monkeypatch.setattr(_rtcodex, "daemon_version", lambda _path: (daemon, ""))
-    monkeypatch.setattr(_rtcodex, "inspect_host_harness_seats", lambda _h: [])
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "wake_bridge_health",
+        lambda *_a, **_k: (True, "healthy"),
+    )
 
     observed = _rtcodex.inspect_codex_services(socket_path)
 
-    if reported is None:
-        assert observed.state == _rtcodex.SERVICE_UNSAFE
-        assert "managedCodexPath is missing" in observed.detail
-    else:
-        assert observed.state == _rtcodex.SERVICE_RELOAD_REQUIRED_IDLE
-        assert "managed Codex path mismatch" in observed.detail
+    assert observed.state == _rtcodex.SERVICE_READY
+    assert observed.daemon == daemon
+
+
+def test_responsive_codex_pid_backend_is_unsafe(monkeypatch):
+    socket_path = Path("/tmp/roundtable-foreign-backend.sock")
+    selected_codex = Path("/tmp/npm/bin/codex")
+    monkeypatch.setattr(_rtcodex, "INSTALL_PREFIX", None)
+    monkeypatch.setattr(_rtcodex, "require_default_socket", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "_setup_manifest", lambda: {})
+    monkeypatch.setattr(_rtcodex, "app_server_plist", lambda *_a, **_k: {})
+    monkeypatch.setattr(_rtcodex, "wake_plist", lambda *_a, **_k: {})
+    monkeypatch.setattr(_rtcodex, "_plist_state", lambda *_a, **_k: "current")
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "codex_version",
+        lambda: ((0, 144, 6), "codex-cli 0.144.6"),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "probe_handshake_detailed",
+        lambda *_a, **_k: (True, "ready", None),
+    )
+    daemon = {
+        "status": "running",
+        "backend": "pid",
+        "socketPath": str(socket_path),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": "0.144.6",
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    monkeypatch.setattr(_rtcodex, "daemon_version", lambda _path: (daemon, ""))
+
+    observed = _rtcodex.inspect_codex_services(socket_path)
+
+    assert observed.state == _rtcodex.SERVICE_UNSAFE
+    assert "Codex pid backend daemon" in observed.detail
+
+
+def test_stale_foreign_daemon_is_unsafe_before_reload_classification(monkeypatch):
+    socket_path = Path("/tmp/roundtable-foreign-stale.sock")
+    selected_codex = Path("/tmp/npm/bin/codex")
+    monkeypatch.setattr(_rtcodex, "INSTALL_PREFIX", None)
+    monkeypatch.setattr(_rtcodex, "require_default_socket", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "_setup_manifest", lambda: {})
+    monkeypatch.setattr(_rtcodex, "app_server_plist", lambda *_a, **_k: {})
+    monkeypatch.setattr(_rtcodex, "wake_plist", lambda *_a, **_k: {})
+    monkeypatch.setattr(_rtcodex, "_plist_state", lambda *_a, **_k: "current")
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "codex_version",
+        lambda: ((0, 144, 6), "codex-cli 0.144.6"),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "probe_handshake_detailed",
+        lambda *_a, **_k: (True, "ready", None),
+    )
+    daemon = {
+        "status": "running",
+        "socketPath": str(socket_path),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": None,
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.5",
+    }
+    monkeypatch.setattr(_rtcodex, "daemon_version", lambda _path: (daemon, ""))
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (_ for _ in ()).throw(
+            _rtcodex.CodexRuntimeError("foreign socket peer")
+        ),
+    )
+
+    observed = _rtcodex.inspect_codex_services(socket_path)
+
+    assert observed.state == _rtcodex.SERVICE_UNSAFE
+    assert observed.detail == "foreign socket peer"
 
 
 @pytest.mark.parametrize("reported_build", [None, "sha256:stale"])
@@ -322,10 +416,16 @@ def test_same_version_responsive_daemon_honors_persistent_reload_marker(
         "status": "running",
         "socketPath": str(socket_path),
         "managedCodexPath": str(selected_codex),
+        "managedCodexVersion": "0.144.6",
         "cliVersion": "0.144.6",
         "appServerVersion": "0.144.6",
     }
     monkeypatch.setattr(_rtcodex, "daemon_version", lambda _path: (daemon, ""))
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
     monkeypatch.setattr(_rtcodex, "inspect_host_harness_seats", lambda _h: [])
     monkeypatch.setattr(
         _rtcodex,

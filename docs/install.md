@@ -304,11 +304,13 @@ digests are proven by the setup manifest; foreign drift still fails closed. A
 running Codex app-server does not change executable in place.
 
 On the next `roundtable` Codex launch, the service preflight compares the
-selected CLI, running app-server, socket, wake bridge heartbeat, current plist
-payloads, and every host-local Codex lease. It offers a coordinated reload only
-when that snapshot is idle and asks before disruption. When any consumer may
-still be live, it defers the reload and tells the user to close or resolve those
-sessions first. `rt-doctor` remains the read-only diagnostic view.
+selected CLI, running app-server, current plist payloads, live LaunchAgent
+program and arguments, kernel-reported Unix-socket peer process lineage, wake
+bridge heartbeat, and every host-local Codex lease. It offers a coordinated
+reload only when that snapshot is idle and asks before disruption. When any
+consumer may still be live, it defers the reload and tells the user to close or
+resolve those sessions first. `rt-doctor` remains the read-only diagnostic
+view.
 
 ## Uninstall
 

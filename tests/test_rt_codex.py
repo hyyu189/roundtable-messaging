@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 from argparse import Namespace
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1893,12 +1894,18 @@ def test_daemon_version_mismatch_fails_closed(monkeypatch):
     monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
     monkeypatch.setattr(
         _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
         "daemon_version",
         lambda _path: (
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
                 "managedCodexPath": str(selected_codex),
+                "managedCodexVersion": "0.144.6",
                 "cliVersion": "0.144.6",
                 "appServerVersion": "0.144.5",
             },
@@ -1910,6 +1917,21 @@ def test_daemon_version_mismatch_fails_closed(monkeypatch):
         _rtcodex.require_validated_daemon()
 
 
+@pytest.mark.parametrize("payload", ["[]", '"running"', "7"])
+def test_daemon_version_rejects_non_object_json(monkeypatch, payload):
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: Path("/tmp/codex"))
+    monkeypatch.setattr(
+        _rtcodex.subprocess,
+        "run",
+        lambda *_a, **_k: subprocess.CompletedProcess([], 0, payload, ""),
+    )
+
+    daemon, detail = _rtcodex.daemon_version(_rtcodex.DEFAULT_SOCKET)
+
+    assert daemon is None
+    assert detail == payload
+
+
 def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
     selected_codex = Path("/tmp/roundtable-current-codex")
     monkeypatch.setattr(
@@ -1918,12 +1940,18 @@ def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
     monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
     monkeypatch.setattr(
         _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
         "daemon_version",
         lambda _path: (
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
                 "managedCodexPath": str(selected_codex),
+                "managedCodexVersion": "0.144.6",
                 "cliVersion": "0.144.5",
                 "appServerVersion": "0.144.6",
             },
@@ -1935,12 +1963,18 @@ def test_daemon_cli_version_mismatch_fails_closed(monkeypatch):
         _rtcodex.require_validated_daemon()
 
 
-def test_daemon_managed_codex_path_mismatch_fails_closed(monkeypatch):
-    selected_codex = Path("/tmp/roundtable-current-codex")
+def test_external_daemon_ignores_standalone_management_slot(monkeypatch):
+    selected_codex = Path("/tmp/npm/bin/codex")
+    managed_codex = Path("/tmp/standalone/current/codex")
     monkeypatch.setattr(
         _rtcodex, "codex_version", lambda: ((0, 144, 6), "codex-cli 0.144.6")
     )
     monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
     monkeypatch.setattr(
         _rtcodex,
         "daemon_version",
@@ -1948,7 +1982,10 @@ def test_daemon_managed_codex_path_mismatch_fails_closed(monkeypatch):
             {
                 "status": "running",
                 "socketPath": str(_rtcodex.DEFAULT_SOCKET),
-                "managedCodexPath": "/tmp/roundtable-other-codex",
+                "managedCodexPath": str(managed_codex),
+                # A separate standalone install may exist and may be a
+                # different version; neither field identifies this socket.
+                "managedCodexVersion": "0.143.0",
                 "cliVersion": "0.144.6",
                 "appServerVersion": "0.144.6",
             },
@@ -1956,8 +1993,305 @@ def test_daemon_managed_codex_path_mismatch_fails_closed(monkeypatch):
         ),
     )
 
-    with pytest.raises(_rtcodex.CodexRuntimeError, match="managed Codex path mismatch"):
-        _rtcodex.require_validated_daemon()
+    daemon = _rtcodex.require_validated_daemon()
+
+    assert daemon["managedCodexPath"] == str(managed_codex)
+
+
+def test_standalone_managed_version_mismatch_fails_closed(monkeypatch):
+    selected_codex = Path("/tmp/standalone/current/codex")
+    daemon = {
+        "status": "running",
+        "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+        "managedCodexPath": str(selected_codex),
+        "managedCodexVersion": "0.144.5",
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
+
+    with pytest.raises(
+        _rtcodex.CodexDaemonReloadRequired,
+        match="standalone/managed Codex version mismatch",
+    ):
+        _rtcodex.require_daemon_identity(
+            daemon,
+            _rtcodex.DEFAULT_SOCKET,
+            (0, 144, 6),
+        )
+
+
+@pytest.mark.parametrize("backend", [None, "pid", "future", 7])
+def test_daemon_backend_field_fails_closed(monkeypatch, backend):
+    selected_codex = Path("/tmp/npm/bin/codex")
+    daemon = {
+        "status": "running",
+        "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+        "backend": backend,
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": None,
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: selected_codex)
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="backend"):
+        _rtcodex.require_daemon_identity(
+            daemon,
+            _rtcodex.DEFAULT_SOCKET,
+            (0, 144, 6),
+        )
+
+
+@pytest.mark.parametrize(
+    "managed_version",
+    [pytest.param("missing", id="missing"), "", "   ", 7],
+)
+def test_daemon_managed_version_schema_fails_closed(monkeypatch, managed_version):
+    daemon = {
+        "status": "running",
+        "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    if managed_version != "missing":
+        daemon["managedCodexVersion"] = managed_version
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: Path("/tmp/npm/bin/codex"))
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="managedCodexVersion"):
+        _rtcodex.require_daemon_identity(
+            daemon,
+            _rtcodex.DEFAULT_SOCKET,
+            (0, 144, 6),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cliVersion", None),
+        ("cliVersion", []),
+        ("appServerVersion", None),
+        ("appServerVersion", 7),
+    ],
+)
+def test_daemon_version_field_schema_is_unsafe_not_reloadable(
+    monkeypatch,
+    field,
+    value,
+):
+    daemon = {
+        "status": "running",
+        "socketPath": str(_rtcodex.DEFAULT_SOCKET),
+        "managedCodexPath": "/tmp/standalone/current/codex",
+        "managedCodexVersion": None,
+        "cliVersion": "0.144.6",
+        "appServerVersion": "0.144.6",
+    }
+    daemon[field] = value
+    monkeypatch.setattr(_rtcodex, "codex_bin", lambda: Path("/tmp/npm/bin/codex"))
+    monkeypatch.setattr(
+        _rtcodex,
+        "require_roundtable_daemon_owner",
+        lambda _path: (101, 102),
+    )
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match=field) as observed:
+        _rtcodex.require_daemon_identity(
+            daemon,
+            _rtcodex.DEFAULT_SOCKET,
+            (0, 144, 6),
+        )
+
+    assert type(observed.value) is _rtcodex.CodexRuntimeError
+
+
+def test_launchd_job_snapshot_uses_only_top_level_fields(monkeypatch):
+    output = """gui/501/com.roundtable.codex-app-server = {
+\tpath = /tmp/com.roundtable.codex-app-server.plist
+\tstate = running
+\tprogram = /tmp/npm/bin/codex
+\targuments = {
+\t\t/tmp/npm/bin/codex
+\t\tapp-server
+\t\t--listen
+\t\tunix:///tmp/app.sock
+\t}
+\tworking directory = /tmp
+\tenvironment = {
+\t\tHOME => /tmp
+\t\tRT_CODEX_BIN => /tmp/npm/bin/codex
+\t}
+\tpid = 101
+\tresource coalition = {
+\t\tstate = active
+\t}
+}
+"""
+    monkeypatch.setattr(
+        _rtcodex,
+        "_launchd_print",
+        lambda _label: subprocess.CompletedProcess([], 0, output, ""),
+    )
+
+    observed = _rtcodex.launchd_job_snapshot(_rtcodex.APP_SERVER_LABEL)
+
+    assert observed.state == "running"
+    assert observed.pid == 101
+    assert observed.program == Path("/tmp/npm/bin/codex")
+    assert observed.arguments[-1] == "unix:///tmp/app.sock"
+    assert dict(observed.environment)["RT_CODEX_BIN"] == "/tmp/npm/bin/codex"
+
+
+def _owner_snapshot(tmp_path: Path, app_payload: dict, *, pid: int = 101):
+    return _rtcodex.LaunchdJobSnapshot(
+        path=tmp_path / f"{_rtcodex.APP_SERVER_LABEL}.plist",
+        state="running",
+        program=Path(app_payload["ProgramArguments"][0]),
+        arguments=tuple(app_payload["ProgramArguments"]),
+        environment=tuple(sorted(app_payload["EnvironmentVariables"].items())),
+        working_directory=Path(app_payload["WorkingDirectory"]),
+        pid=pid,
+    )
+
+
+@contextmanager
+def _fake_authenticated_peer(pid: int):
+    yield pid
+
+
+def test_roundtable_daemon_owner_accepts_node_child_lineage(tmp_path, monkeypatch):
+    socket_path = tmp_path / "app.sock"
+    app_payload = {
+        "ProgramArguments": [
+            "/tmp/npm/bin/codex",
+            "app-server",
+            "--listen",
+            f"unix://{socket_path}",
+        ],
+        "WorkingDirectory": "/tmp",
+        "EnvironmentVariables": {"RT_CODEX_BIN": "/tmp/npm/bin/codex"},
+    }
+    snapshot = _owner_snapshot(tmp_path, app_payload)
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(
+        _rtcodex,
+        "launch_agent_path",
+        lambda _label: snapshot.path,
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "app_server_plist",
+        lambda *_a, **_k: app_payload,
+    )
+    monkeypatch.setattr(_rtcodex, "launchd_job_snapshot", lambda _label: snapshot)
+    monkeypatch.setattr(
+        _rtcodex,
+        "authenticated_socket_peer",
+        lambda _path: _fake_authenticated_peer(102),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "_process_parent_and_uid",
+        lambda pid: (101, os.getuid()) if pid == 102 else (1, os.getuid()),
+    )
+
+    assert _rtcodex.require_roundtable_daemon_owner(socket_path) == (101, 102)
+
+
+def test_roundtable_daemon_owner_rejects_foreign_socket_peer(tmp_path, monkeypatch):
+    socket_path = tmp_path / "app.sock"
+    app_payload = {
+        "ProgramArguments": ["/tmp/npm/bin/codex", "app-server"],
+        "WorkingDirectory": "/tmp",
+        "EnvironmentVariables": {"RT_CODEX_BIN": "/tmp/npm/bin/codex"},
+    }
+    snapshot = _owner_snapshot(tmp_path, app_payload)
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "launch_agent_path", lambda _label: snapshot.path)
+    monkeypatch.setattr(_rtcodex, "app_server_plist", lambda *_a, **_k: app_payload)
+    monkeypatch.setattr(_rtcodex, "launchd_job_snapshot", lambda _label: snapshot)
+    monkeypatch.setattr(
+        _rtcodex,
+        "authenticated_socket_peer",
+        lambda _path: _fake_authenticated_peer(202),
+    )
+    monkeypatch.setattr(
+        _rtcodex,
+        "_process_parent_and_uid",
+        lambda _pid: (0, os.getuid()),
+    )
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="not owned"):
+        _rtcodex.require_roundtable_daemon_owner(socket_path)
+
+
+def test_roundtable_daemon_owner_rejects_launchd_pid_race(tmp_path, monkeypatch):
+    socket_path = tmp_path / "app.sock"
+    app_payload = {
+        "ProgramArguments": ["/tmp/npm/bin/codex", "app-server"],
+        "WorkingDirectory": "/tmp",
+        "EnvironmentVariables": {"RT_CODEX_BIN": "/tmp/npm/bin/codex"},
+    }
+    before = _owner_snapshot(tmp_path, app_payload, pid=101)
+    after = _owner_snapshot(tmp_path, app_payload, pid=103)
+    snapshots = iter((before, after))
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "app_server_plist", lambda *_a, **_k: app_payload)
+    monkeypatch.setattr(_rtcodex, "launchd_job_snapshot", lambda _label: next(snapshots))
+    monkeypatch.setattr(
+        _rtcodex,
+        "authenticated_socket_peer",
+        lambda _path: _fake_authenticated_peer(102),
+    )
+    monkeypatch.setattr(_rtcodex, "require_pid_lineage", lambda *_args: None)
+
+    with pytest.raises(_rtcodex.CodexRuntimeError, match="changed during"):
+        _rtcodex.require_roundtable_daemon_owner(socket_path)
+
+
+def test_roundtable_daemon_owner_rejects_unmanaged_environment(
+    tmp_path,
+    monkeypatch,
+):
+    socket_path = tmp_path / "app.sock"
+    app_payload = {
+        "ProgramArguments": ["/tmp/npm/bin/codex", "app-server"],
+        "WorkingDirectory": "/tmp",
+        "EnvironmentVariables": {"RT_CODEX_BIN": "/tmp/npm/bin/codex"},
+    }
+    expected = _owner_snapshot(tmp_path, app_payload)
+    injected = _rtcodex.LaunchdJobSnapshot(
+        path=expected.path,
+        state=expected.state,
+        program=expected.program,
+        arguments=expected.arguments,
+        environment=tuple(sorted((*expected.environment, ("NODE_OPTIONS", "--require=/tmp/x")))),
+        working_directory=expected.working_directory,
+        pid=expected.pid,
+    )
+    monkeypatch.setattr(_rtcodex, "_validate_service_paths", lambda _path: None)
+    monkeypatch.setattr(_rtcodex, "launch_agent_path", lambda _label: expected.path)
+    monkeypatch.setattr(_rtcodex, "app_server_plist", lambda *_a, **_k: app_payload)
+    monkeypatch.setattr(_rtcodex, "launchd_job_snapshot", lambda _label: injected)
+    monkeypatch.setattr(
+        _rtcodex,
+        "authenticated_socket_peer",
+        lambda _path: _fake_authenticated_peer(102),
+    )
+    monkeypatch.setattr(_rtcodex, "require_pid_lineage", lambda *_args: None)
+
+    with pytest.raises(
+        _rtcodex.CodexDaemonReloadRequired,
+        match="NODE_OPTIONS",
+    ):
+        _rtcodex.require_roundtable_daemon_owner(socket_path)
 
 
 def test_launchd_payloads_are_persistent_and_explicit(tmp_path, monkeypatch):

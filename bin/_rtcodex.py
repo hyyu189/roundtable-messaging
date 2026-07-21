@@ -20,12 +20,13 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from _rtruntime import (
     RuntimeStateError,
@@ -43,6 +44,12 @@ class RpcError(CodexRuntimeError):
 
 
 class UnsupportedVersion(CodexRuntimeError):
+    pass
+
+
+class CodexDaemonReloadRequired(CodexRuntimeError):
+    """The live Roundtable job is proven, but its loaded definition is stale."""
+
     pass
 
 
@@ -75,6 +82,7 @@ WAKE_BRIDGE_BUILD_COMPONENTS = (
 CODEX_RELOAD_MARKER_SCHEMA = "roundtable.codex-app-server-reload-required.v1"
 CODEX_RELOAD_MARKER_NAME = "codex-app-server-reload-required.json"
 CODEX_RELOAD_MARKER_MAX_BYTES = 16 * 1024
+LAUNCHD_APP_SERVER_ENV_ALLOWLIST = frozenset({"OSLogRateLimit", "XPC_SERVICE_NAME"})
 
 SERVICE_READY = "ready"
 SERVICE_COLD = "cold"
@@ -97,6 +105,31 @@ class CodexServiceStatus:
     app_plist: str = "unknown"
     wake_plist: str = "unknown"
     bridge_detail: str = "not checked"
+
+
+@dataclass(frozen=True)
+class CodexDaemonIdentity:
+    """Evidence tying one responsive app-server to the Roundtable LaunchAgent."""
+
+    selected_codex: Path
+    distribution: str
+    managed_codex_hint: Path
+    managed_codex_version: str | None
+    launchd_pid: int
+    peer_pid: int
+
+
+@dataclass(frozen=True)
+class LaunchdJobSnapshot:
+    """Security-relevant fields from one ``launchctl print`` snapshot."""
+
+    path: Path
+    state: str
+    program: Path
+    arguments: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    working_directory: Path
+    pid: int
 
 
 def ensure_private_runtime_dir(path: Path | None = None) -> Path:
@@ -319,13 +352,96 @@ def _launchd_print(label: str) -> subprocess.CompletedProcess[str]:
     return proc
 
 
+def _launchd_scalar(output: str, key: str) -> str:
+    """Read one top-level scalar from Darwin's ``launchctl print`` format."""
+
+    prefix = f"\t{key} = "
+    values = [line[len(prefix) :] for line in output.splitlines() if line.startswith(prefix)]
+    if len(values) != 1 or not values[0]:
+        raise CodexRuntimeError(
+            f"launchctl output has {len(values)} top-level {key!r} values"
+        )
+    return values[0]
+
+
+def _launchd_block(output: str, key: str) -> tuple[str, ...]:
+    """Read one flat top-level block from Darwin's ``launchctl print`` format."""
+
+    lines = output.splitlines()
+    header = f"\t{key} = {{"
+    starts = [index for index, line in enumerate(lines) if line == header]
+    if len(starts) != 1:
+        raise CodexRuntimeError(
+            f"launchctl output has {len(starts)} top-level {key!r} blocks"
+        )
+    values: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if line == "\t}":
+            return tuple(values)
+        if not line.startswith("\t\t") or line == "\t\t":
+            raise CodexRuntimeError(f"launchctl {key} block is malformed")
+        values.append(line[2:])
+    raise CodexRuntimeError(f"launchctl {key} block is unterminated")
+
+
+def launchd_job_snapshot(label: str) -> LaunchdJobSnapshot:
+    """Return the live, top-level identity of a running user LaunchAgent."""
+
+    proc = _launchd_print(label)
+    if proc.returncode != 0:
+        raise CodexRuntimeError(f"LaunchAgent is not loaded: {label}")
+    state = _launchd_scalar(proc.stdout, "state")
+    if state != "running":
+        raise CodexRuntimeError(f"LaunchAgent is not running: {label} state={state}")
+    pid_value = _launchd_scalar(proc.stdout, "pid")
+    try:
+        pid = int(pid_value)
+    except ValueError as error:
+        raise CodexRuntimeError(
+            f"LaunchAgent has an invalid pid: {label} pid={pid_value!r}"
+        ) from error
+    if pid <= 0:
+        raise CodexRuntimeError(f"LaunchAgent has a non-positive pid: {label} pid={pid}")
+
+    path = Path(_launchd_scalar(proc.stdout, "path")).expanduser()
+    program = Path(_launchd_scalar(proc.stdout, "program")).expanduser()
+    working_directory = Path(
+        _launchd_scalar(proc.stdout, "working directory")
+    ).expanduser()
+    if not path.is_absolute() or not program.is_absolute() or not working_directory.is_absolute():
+        raise CodexRuntimeError(f"LaunchAgent reports a non-absolute path: {label}")
+
+    arguments = _launchd_block(proc.stdout, "arguments")
+    if not arguments:
+        raise CodexRuntimeError(f"LaunchAgent has no arguments: {label}")
+    environment_values: list[tuple[str, str]] = []
+    for entry in _launchd_block(proc.stdout, "environment"):
+        if " => " not in entry:
+            raise CodexRuntimeError(f"LaunchAgent environment entry is malformed: {entry!r}")
+        name, value = entry.split(" => ", 1)
+        if not name or not value or any(existing == name for existing, _ in environment_values):
+            raise CodexRuntimeError(
+                f"LaunchAgent environment entry is missing or duplicated: {name!r}"
+            )
+        environment_values.append((name, value))
+    return LaunchdJobSnapshot(
+        path=Path(os.path.normpath(str(path))),
+        state=state,
+        program=Path(os.path.normpath(str(program))),
+        arguments=arguments,
+        environment=tuple(sorted(environment_values)),
+        working_directory=Path(os.path.normpath(str(working_directory))),
+        pid=pid,
+    )
+
+
 def launchd_loaded(label: str) -> bool:
     return _launchd_print(label).returncode == 0
 
 
 def launchd_running(label: str) -> bool:
     proc = _launchd_print(label)
-    return proc.returncode == 0 and "state = running" in proc.stdout
+    return proc.returncode == 0 and _launchd_scalar(proc.stdout, "state") == "running"
 
 
 def install_launch_agent(label: str, payload: dict, *, reload: bool = False) -> Path:
@@ -976,18 +1092,16 @@ def inspect_codex_services(
             app_plist=app_state,
             wake_plist=wake_state,
         )
-    expected_socket = str(socket_path)
-    if daemon.get("socketPath") != expected_socket:
-        return CodexServiceStatus(
-            SERVICE_UNSAFE,
-            f"daemon socket mismatch: {daemon.get('socketPath')!r} != {expected_socket!r}",
-            cli_version,
-            daemon,
-            app_state,
-            wake_state,
-        )
     try:
-        selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
+        require_daemon_identity(daemon, socket_path, cli_version)
+    except CodexDaemonReloadRequired as error:
+        return _reload_status(
+            str(error),
+            cli_version=cli_version,
+            daemon=daemon,
+            app_plist=app_state,
+            wake_plist=wake_state,
+        )
     except CodexRuntimeError as error:
         return CodexServiceStatus(
             SERVICE_UNSAFE,
@@ -996,29 +1110,6 @@ def inspect_codex_services(
             daemon,
             app_state,
             wake_state,
-        )
-    if managed_codex != selected_codex:
-        return _reload_status(
-            "selected CLI/daemon managed Codex path mismatch: "
-            f"selected={selected_codex} daemon={managed_codex}",
-            cli_version=cli_version,
-            daemon=daemon,
-            app_plist=app_state,
-            wake_plist=wake_state,
-        )
-    rendered_cli = ".".join(str(part) for part in cli_version)
-    if (
-        daemon.get("cliVersion") != rendered_cli
-        or daemon.get("appServerVersion") != rendered_cli
-    ):
-        return _reload_status(
-            "Codex CLI/app-server version mismatch: "
-            f"selected={rendered_cli} daemon-cli={daemon.get('cliVersion')} "
-            f"app-server={daemon.get('appServerVersion')}",
-            cli_version=cli_version,
-            daemon=daemon,
-            app_plist=app_state,
-            wake_plist=wake_state,
         )
     if reload_pending:
         return _reload_status(
@@ -1673,31 +1764,258 @@ def daemon_version(socket_path: Path = DEFAULT_SOCKET) -> tuple[dict | None, str
     if start < 0:
         return None, output
     try:
-        return json.loads(output[start:]), output
+        value = json.loads(output[start:])
     except json.JSONDecodeError:
         return None, output
+    if not isinstance(value, dict):
+        return None, output
+    return value, output
 
 
-def daemon_managed_codex_paths(daemon: dict) -> tuple[Path, Path]:
-    """Return lexical selected/reported executable identities or fail closed."""
+@contextmanager
+def authenticated_socket_peer(
+    socket_path: Path,
+    *,
+    timeout: float = 1.0,
+) -> Iterator[int]:
+    """Hold a Darwin Unix-socket connection while yielding its peer PID."""
 
-    selected = codex_bin().expanduser()
-    if not selected.is_absolute():
-        raise CodexRuntimeError(f"selected Codex path is not absolute: {selected}")
-    reported_value = daemon.get("managedCodexPath")
-    if not isinstance(reported_value, str) or not reported_value:
+    if sys.platform != "darwin":
+        raise CodexRuntimeError("Unix socket peer PID validation requires macOS")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        # Darwin exposes LOCAL_PEERPID as SOL_LOCAL(0), option 2.  Python does
+        # not currently publish symbolic constants for either value.
+        raw = client.getsockopt(0, 2, struct.calcsize("i"))
+    except OSError as error:
+        client.close()
         raise CodexRuntimeError(
-            "daemon managedCodexPath is missing or invalid; "
-            "the running daemon cannot be tied to the selected Codex resolver"
-        )
-    reported = Path(reported_value).expanduser()
-    if not reported.is_absolute():
+            f"cannot authenticate Unix socket peer {socket_path}: {error}"
+        ) from error
+    if len(raw) != struct.calcsize("i"):
+        client.close()
         raise CodexRuntimeError(
-            f"daemon managedCodexPath is not absolute: {reported_value!r}"
+            f"Unix socket peer PID has invalid size {len(raw)}: {socket_path}"
         )
-    return (
-        Path(os.path.normpath(str(selected))),
-        Path(os.path.normpath(str(reported))),
+    peer_pid = struct.unpack("i", raw)[0]
+    if peer_pid <= 0:
+        client.close()
+        raise CodexRuntimeError(
+            f"Unix socket peer PID is not positive: {socket_path} pid={peer_pid}"
+        )
+    try:
+        yield peer_pid
+    finally:
+        client.close()
+
+
+def socket_peer_pid(socket_path: Path, *, timeout: float = 1.0) -> int:
+    """Return a point-in-time kernel-authenticated Darwin Unix-socket peer PID."""
+
+    with authenticated_socket_peer(socket_path, timeout=timeout) as peer_pid:
+        return peer_pid
+
+
+def _process_parent_and_uid(pid: int) -> tuple[int, int]:
+    proc = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "ppid=", "-o", "uid="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    parts = proc.stdout.split()
+    if proc.returncode != 0 or len(parts) != 2:
+        detail = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+        raise CodexRuntimeError(f"cannot inspect process {pid}: {detail}")
+    try:
+        parent_pid, uid = (int(value) for value in parts)
+    except ValueError as error:
+        raise CodexRuntimeError(
+            f"process {pid} has invalid parent/uid data: {proc.stdout.strip()!r}"
+        ) from error
+    if parent_pid < 0 or uid < 0:
+        raise CodexRuntimeError(
+            f"process {pid} has negative parent/uid data: {parent_pid}/{uid}"
+        )
+    return parent_pid, uid
+
+
+def require_pid_lineage(peer_pid: int, launchd_pid: int) -> None:
+    """Require a same-user socket peer to descend from one launchd job PID."""
+
+    current = peer_pid
+    seen: set[int] = set()
+    for _depth in range(128):
+        if current in seen:
+            raise CodexRuntimeError(f"process parent cycle while inspecting pid {current}")
+        seen.add(current)
+        parent, uid = _process_parent_and_uid(current)
+        if uid != os.getuid():
+            raise CodexRuntimeError(
+                f"app-server process uid {uid} != {os.getuid()}: pid={current}"
+            )
+        if current == launchd_pid:
+            return
+        if parent <= 0:
+            break
+        current = parent
+    raise CodexRuntimeError(
+        "Unix socket peer is not owned by the Roundtable LaunchAgent process tree: "
+        f"peer-pid={peer_pid} launchd-pid={launchd_pid}"
+    )
+
+
+def require_roundtable_daemon_owner(socket_path: Path) -> tuple[int, int]:
+    """Tie the live socket peer to the exact loaded Roundtable LaunchAgent."""
+
+    _validate_service_paths(socket_path)
+    expected = app_server_plist(socket_path, ensure_runtime=False)
+    before = launchd_job_snapshot(APP_SERVER_LABEL)
+    with authenticated_socket_peer(socket_path) as peer_pid:
+        require_pid_lineage(peer_pid, before.pid)
+        after = launchd_job_snapshot(APP_SERVER_LABEL)
+    if after != before:
+        raise CodexRuntimeError(
+            "Roundtable app-server LaunchAgent changed during socket ownership validation"
+        )
+
+    expected_path = Path(
+        os.path.normpath(str(launch_agent_path(APP_SERVER_LABEL).expanduser()))
+    )
+    expected_args = tuple(str(value) for value in expected["ProgramArguments"])
+    expected_program = Path(os.path.normpath(expected_args[0]))
+    expected_working_directory = Path(
+        os.path.normpath(str(Path(expected["WorkingDirectory"]).expanduser()))
+    )
+    live_environment = dict(before.environment)
+    mismatches: list[str] = []
+    if before.path != expected_path:
+        mismatches.append(f"plist-path={before.path} expected={expected_path}")
+    if before.program != expected_program:
+        mismatches.append(f"program={before.program} expected={expected_program}")
+    if before.arguments != expected_args:
+        mismatches.append("ProgramArguments differ from the current managed plist")
+    if before.working_directory != expected_working_directory:
+        mismatches.append(
+            f"working-directory={before.working_directory} "
+            f"expected={expected_working_directory}"
+        )
+    for name, value in expected["EnvironmentVariables"].items():
+        if live_environment.get(name) != str(value):
+            mismatches.append(
+                f"environment {name}={live_environment.get(name)!r} expected={str(value)!r}"
+            )
+    unexpected_environment = sorted(
+        set(live_environment)
+        - set(expected["EnvironmentVariables"])
+        - LAUNCHD_APP_SERVER_ENV_ALLOWLIST
+    )
+    if unexpected_environment:
+        mismatches.append(
+            "unexpected explicit environment keys="
+            + ",".join(unexpected_environment)
+        )
+    if mismatches:
+        raise CodexDaemonReloadRequired(
+            "loaded Roundtable app-server definition is stale: " + "; ".join(mismatches)
+        )
+    return before.pid, peer_pid
+
+
+def require_daemon_identity(
+    daemon: dict,
+    socket_path: Path,
+    cli_version: tuple[int, int, int],
+) -> CodexDaemonIdentity:
+    """Validate protocol shape, versions, and Roundtable lifecycle ownership.
+
+    Codex 0.144.6 reports ``managedCodexPath`` as a fixed standalone update
+    slot, not as the executable serving the socket.  The actual identity proof
+    therefore comes from the Roundtable launchd job and the kernel-reported
+    Unix-socket peer PID.
+    """
+
+    if daemon.get("status") != "running":
+        raise CodexRuntimeError(f"app-server daemon is not running: {daemon.get('status')!r}")
+    reported_socket = daemon.get("socketPath")
+    if not isinstance(reported_socket, str) or reported_socket != str(socket_path):
+        raise CodexRuntimeError(
+            f"daemon socket mismatch: {reported_socket!r} != {str(socket_path)!r}"
+        )
+    if "backend" in daemon:
+        backend = daemon.get("backend")
+        if backend == "pid":
+            raise CodexRuntimeError(
+                "app-server is owned by the Codex pid backend daemon, not the "
+                "Roundtable LaunchAgent"
+            )
+        raise CodexRuntimeError(f"daemon backend is invalid or unsupported: {backend!r}")
+
+    managed_value = daemon.get("managedCodexPath")
+    if (
+        not isinstance(managed_value, str)
+        or not managed_value
+        or any(character in managed_value for character in "\0\r\n")
+    ):
+        raise CodexRuntimeError("daemon managedCodexPath is missing or invalid")
+    managed_codex = Path(managed_value).expanduser()
+    if not managed_codex.is_absolute():
+        raise CodexRuntimeError(
+            f"daemon managedCodexPath is not absolute: {managed_value!r}"
+        )
+    managed_codex = Path(os.path.normpath(str(managed_codex)))
+    if "managedCodexVersion" not in daemon:
+        raise CodexRuntimeError("daemon managedCodexVersion field is missing")
+    managed_version = daemon["managedCodexVersion"]
+    if managed_version is not None and (
+        not isinstance(managed_version, str) or not managed_version.strip()
+    ):
+        raise CodexRuntimeError("daemon managedCodexVersion is invalid")
+
+    selected_codex = codex_bin().expanduser()
+    if not selected_codex.is_absolute():
+        raise CodexRuntimeError(f"selected Codex path is not absolute: {selected_codex}")
+    selected_codex = Path(os.path.normpath(str(selected_codex)))
+    distribution = "standalone" if selected_codex == managed_codex else "external"
+    rendered_cli = ".".join(str(part) for part in cli_version)
+    daemon_cli_version = daemon.get("cliVersion")
+    app_server_version = daemon.get("appServerVersion")
+    if not isinstance(daemon_cli_version, str) or not daemon_cli_version:
+        raise CodexRuntimeError("daemon cliVersion is missing or invalid")
+    if not isinstance(app_server_version, str) or not app_server_version:
+        raise CodexRuntimeError("daemon appServerVersion is missing or invalid")
+
+    # Establish lifecycle/process ownership before classifying any mismatch as
+    # safely reloadable.  A responsive foreign socket must remain unsafe even
+    # when its versions happen to look stale in an otherwise familiar way.
+    launchd_pid, peer_pid = require_roundtable_daemon_owner(socket_path)
+
+    if daemon_cli_version != rendered_cli:
+        raise CodexDaemonReloadRequired(
+            "selected CLI/daemon CLI version mismatch: "
+            f"{rendered_cli} != {daemon_cli_version}"
+        )
+    if app_server_version != rendered_cli:
+        raise CodexDaemonReloadRequired(
+            f"CLI/app-server version mismatch: {rendered_cli} != {app_server_version}"
+        )
+
+    if distribution == "standalone":
+        if managed_version != rendered_cli:
+            raise CodexDaemonReloadRequired(
+                "selected standalone/managed Codex version mismatch: "
+                f"{rendered_cli} != {managed_version}"
+            )
+    return CodexDaemonIdentity(
+        selected_codex=selected_codex,
+        distribution=distribution,
+        managed_codex_hint=managed_codex,
+        managed_codex_version=managed_version,
+        launchd_pid=launchd_pid,
+        peer_pid=peer_pid,
     )
 
 
@@ -1732,29 +2050,7 @@ def require_validated_daemon(socket_path: Path = DEFAULT_SOCKET) -> dict:
     daemon, detail = daemon_version(socket_path)
     if not daemon or daemon.get("status") != "running":
         raise CodexRuntimeError(f"could not validate app-server version: {detail}")
-    reported_socket = daemon.get("socketPath")
-    if reported_socket != str(socket_path):
-        raise CodexRuntimeError(
-            f"daemon socket mismatch: {reported_socket!r} != {str(socket_path)!r}"
-        )
-    selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
-    if managed_codex != selected_codex:
-        raise CodexRuntimeError(
-            "selected CLI/daemon managed Codex path mismatch: "
-            f"{selected_codex} != {managed_codex}"
-        )
-    daemon_cli_version = daemon.get("cliVersion")
-    app_version = daemon.get("appServerVersion")
-    cli_rendered = ".".join(str(part) for part in cli)
-    if daemon_cli_version != cli_rendered:
-        raise CodexRuntimeError(
-            f"selected CLI/daemon CLI version mismatch: "
-            f"{cli_rendered} != {daemon_cli_version}"
-        )
-    if app_version != cli_rendered:
-        raise CodexRuntimeError(
-            f"CLI/app-server version mismatch: {cli_rendered} != {app_version}"
-        )
+    require_daemon_identity(daemon, socket_path, cli)
     return daemon
 
 

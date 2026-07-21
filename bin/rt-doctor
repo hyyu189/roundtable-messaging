@@ -22,11 +22,11 @@ from _rtcodex import (
     RUNTIME_DIR,
     WAKE_LABEL,
     codex_version,
-    daemon_managed_codex_paths,
     daemon_version,
     launchd_loaded,
     pid_is_running,
     probe_handshake,
+    require_daemon_identity,
     validated_releases_text,
     version_is_validated,
     wake_bridge_build_fingerprint,
@@ -1346,22 +1346,27 @@ def main() -> int:
             daemon, daemon_output = daemon_version(args.socket)
         except (OSError, RuntimeError) as error:
             daemon_output = f"cannot inspect app-server daemon: {error}"
+        reported_daemon_socket = daemon.get("socketPath") if daemon else None
         daemon_socket_matches = bool(
-            daemon
-            and Path(daemon.get("socketPath") or "").expanduser()
-            == args.socket.expanduser()
+            isinstance(reported_daemon_socket, str)
+            and reported_daemon_socket == str(args.socket)
         )
+        daemon_identity = None
         daemon_identity_detail = None
         if daemon and daemon.get("status") == "running" and daemon_socket_matches:
-            try:
-                selected_codex, managed_codex = daemon_managed_codex_paths(daemon)
-                if managed_codex != selected_codex:
-                    daemon_identity_detail = (
-                        "selected CLI/daemon managed Codex path mismatch: "
-                        f"selected={selected_codex} daemon={managed_codex}"
+            if cli_version is None:
+                daemon_identity_detail = (
+                    "cannot validate daemon ownership without a parsed selected CLI version"
+                )
+            else:
+                try:
+                    daemon_identity = require_daemon_identity(
+                        daemon,
+                        args.socket,
+                        cli_version,
                     )
-            except (OSError, RuntimeError) as error:
-                daemon_identity_detail = str(error)
+                except (OSError, RuntimeError) as error:
+                    daemon_identity_detail = str(error)
         if (
             daemon
             and daemon.get("status") == "running"
@@ -1373,14 +1378,22 @@ def main() -> int:
                 "daemon",
                 f"running app-server={daemon.get('appServerVersion')} "
                 f"socket={daemon.get('socketPath')} "
-                f"managed-codex={daemon.get('managedCodexPath')}",
+                f"owner=roundtable-launchd distribution={daemon_identity.distribution} "
+                f"selected={daemon_identity.selected_codex} "
+                f"launchd-pid={daemon_identity.launchd_pid} "
+                f"peer-pid={daemon_identity.peer_pid}",
             )
         else:
             if daemon_identity_detail is not None:
                 daemon_output = daemon_identity_detail
             elif daemon and daemon.get("status") == "running" and not daemon_socket_matches:
+                rendered_socket = (
+                    reported_daemon_socket
+                    if isinstance(reported_daemon_socket, str)
+                    else repr(reported_daemon_socket)
+                )
                 daemon_output = (
-                    f"reported socket {daemon.get('socketPath')} != requested {args.socket}"
+                    f"reported socket {rendered_socket} != requested {args.socket}"
                 )
             report.item(
                 "FAIL",
